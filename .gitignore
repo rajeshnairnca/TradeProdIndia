@@ -1,0 +1,10 @@
+/.env
+/_candidates
+/alphas
+/candidate_1756738092_walkforward_performance.png
+/data
+/ensemble_history.json
+/run_history.json
+/runs
+/temp_model.zip
+/vec_normalize_temp.pkl

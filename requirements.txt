@@ -1,0 +1,19 @@
+# requirements.txt
+
+# Core machine learning and data handling
+numpy
+pandas
+torch
+matplotlib
+
+# Reinforcement learning suite from Stable Baselines3
+gymnasium
+stable-baselines3[extra]
+sb3-contrib
+optuna
+
+# For reading the parquet data file
+pyarrow
+
+# The NEW, correct Google AI library
+google-genaisb3-contrib
