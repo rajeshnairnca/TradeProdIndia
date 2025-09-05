@@ -133,7 +133,7 @@ def main():
         print(f"\n--- Training candidate alpha: {candidate_name} ---")
         # The output of the training is the alpha directory, which is inside the candidate_dir
         output_alpha_dir = os.path.join(candidate_dir, candidate_name)
-        train_cmd = [PYTHON_EXEC, TRAIN_SCRIPT, "--alpha-name", candidate_name, "--description", description, "--output-dir", candidate_dir, "--timesteps", "10000"]
+        train_cmd = [PYTHON_EXEC, TRAIN_SCRIPT, "--alpha-name", candidate_name, "--description", description, "--output-dir", candidate_dir]
         try:
             env = os.environ.copy()
             env["PYTHONPATH"] = PROJECT_ROOT

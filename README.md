@@ -67,7 +67,7 @@ You can train or retrain a single alpha strategy using the `train_alpha.py` scri
 ```bash
 # Example of retraining the base alpha
 caffeinate -i python3 scripts/training/train_alpha.py --alpha-name alpha_base --timesteps 350000 --description "Base alpha strategy."
-```
+
 
 ### 3. Backtesting an Ensemble
 
@@ -78,8 +78,13 @@ You can evaluate the performance of any combination of trained alphas using the 
 caffeinate -i python3 scripts/backtesting/backtester.py --alphas my_first_alpha
 
 # Backtest an ensemble of multiple alphas
-caffeinate -i python3 scripts/backtesting/backtester.py --alphas alpha_base candidate_1756738092
+caffeinate -i python3 scripts/backtesting/backtester.py --alphas alpha_base candidate_1756738092 candidate_1756780384 candidate_1756818712
 ```
+
+
+### 3. Walkforward analysis for an alpha
+caffeinate -i python3 src/walkforward.py --alpha-name candidate_1756780384
+
 
 ### 4. Evolving the Ensemble with the Orchestrator
 

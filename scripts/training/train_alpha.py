@@ -19,7 +19,7 @@ import torch
 from sb3_contrib import RecurrentPPO
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize, VecFrameStack
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, StopTrainingOnNoModelImprovement
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
 
@@ -111,13 +111,28 @@ def main():
         **config.PPO_PARAMS
     )
 
+    # --- COMPILE MODEL FOR SPEEDUP (PYTORCH 2.0+) ---
+    if int(torch.__version__.split('.')[0]) >= 2:
+        print("PyTorch version >= 2.0 detected. Compiling model policy for performance boost...")
+        model.policy = torch.compile(model.policy)
+
     eval_env = SubprocVecEnv([make_env(config.N_ENVS, config.SEED, df=full_data)])
     eval_env = VecFrameStack(eval_env, n_stack=config.LSTM_N_STACK)
     eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.)
     eval_env.obs_rms = train_env.obs_rms
 
+    # Stop training if there is no improvement after a given number of evaluations
+    stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=55, min_evals=20, verbose=1)
+    
     checkpoint_callback = CheckpointCallback(save_freq=max(config.PPO_PARAMS['n_steps'] * 5 // config.N_ENVS, 1), save_path=log_dir, name_prefix="rl_model", save_vecnormalize=True)
-    eval_callback = EvalCallback(eval_env, best_model_save_path=model_dir, log_path=log_dir, eval_freq=max(config.PPO_PARAMS['n_steps'] * 5 // config.N_ENVS, 1), deterministic=True, render=False)
+    # The EvalCallback will save the best model and trigger the stop callback
+    eval_callback = EvalCallback(eval_env, 
+                                 best_model_save_path=model_dir, 
+                                 log_path=log_dir, 
+                                 eval_freq=max(config.PPO_PARAMS['n_steps'] * 5 // config.N_ENVS, 1), 
+                                 deterministic=True, 
+                                 render=False, 
+                                 callback_after_eval=stop_train_callback)
 
     print(f"--- Training alpha '{args.alpha_name}' for {args.timesteps} timesteps ---")
     model.learn(total_timesteps=args.timesteps, callback=[eval_callback, checkpoint_callback], progress_bar=True)
