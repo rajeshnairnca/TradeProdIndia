@@ -244,10 +244,17 @@ class DailyCrossSectionalEnv(gym.Env):
         else:
             cash_weight = max(0.0, 1.0 - np.sum(stock_weights))
 
+        prev_positions = self.positions.copy()
         target_alloc_dollars = stock_weights * self.net_worth
         current_prices = np.nan_to_num(prices)
+        # Round target allocation to whole shares
+        desired_shares = np.round(target_alloc_dollars / (current_prices + 1e-9))
+        desired_shares = np.nan_to_num(desired_shares, nan=0.0, posinf=0.0, neginf=0.0)
+        desired_shares = desired_shares.astype(np.int64)
+        desired_alloc_dollars = desired_shares * current_prices
         current_holdings_dollars = self.positions * current_prices
-        trade_dollars = target_alloc_dollars - current_holdings_dollars
+        trade_dollars = desired_alloc_dollars - current_holdings_dollars
+        trade_shares = desired_shares - prev_positions
         
         safe_adv_dollars = np.nan_to_num(adv * current_prices, nan=1e9)
         trade_frac_adv = np.abs(trade_dollars) / (safe_adv_dollars + 1e-9)
@@ -256,7 +263,7 @@ class DailyCrossSectionalEnv(gym.Env):
         total_costs = slippage_costs + brokerage_costs
         
         self.cash -= np.sum(trade_dollars) + total_costs
-        self.positions = np.nan_to_num(target_alloc_dollars / (current_prices + 1e-9))
+        self.positions = desired_shares
         
         portfolio_value = np.sum(self.positions * current_prices)
         self.net_worth = self.cash + portfolio_value
@@ -322,6 +329,7 @@ class DailyCrossSectionalEnv(gym.Env):
             "turnover": turnover,
             "reward": reward,
             "trade_dollars": trade_dollars,
+            "trade_shares": trade_shares,
             "prices": current_prices
         }
         

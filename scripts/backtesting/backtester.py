@@ -259,6 +259,7 @@ class EnsembleBacktester:
                 
                 # Log transactions
                 trade_dollars = info_dict.get('trade_dollars', [])
+                trade_shares = info_dict.get('trade_shares', [])
                 prices = info_dict.get('prices', [])
                 net_worth = info_dict.get('net_worth')
                 cash_balance = info_dict.get('cash')
@@ -268,11 +269,16 @@ class EnsembleBacktester:
                 turnover = info_dict.get('turnover')
                 for i in range(len(trade_dollars)):
                     if abs(trade_dollars[i]) > 1.0: # Log only trades over $1
+                        shares = None
+                        if isinstance(trade_shares, (list, tuple, np.ndarray)) and len(trade_shares) > i:
+                            shares = trade_shares[i]
+                        else:
+                            shares = trade_dollars[i] / prices[i] if prices[i] > 0 else 0
                         transaction_log.append({
                             "date": info_dict['date'],
                             "ticker": universe[i],
                             "action": "BUY" if trade_dollars[i] > 0 else "SELL",
-                            "shares": trade_dollars[i] / prices[i] if prices[i] > 0 else 0,
+                            "shares": shares,
                             "price_usd": prices[i],
                             "value_usd": trade_dollars[i],
                             "net_worth_usd": net_worth,
