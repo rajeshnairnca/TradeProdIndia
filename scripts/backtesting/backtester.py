@@ -194,7 +194,7 @@ class EnsembleBacktester:
                     feature_keys=expected_features,
                     is_backtest=True,
                     regime_table=self.regime_table,
-                    apply_regime_top_k=True
+                    apply_regime_top_k=config.USE_REGIME_SYSTEM
                 )
             ])
             env = VecFrameStack(env, n_stack=config.LSTM_N_STACK)

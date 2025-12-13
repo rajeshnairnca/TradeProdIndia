@@ -47,6 +47,7 @@ TOP_K = 9
 ADV_LOOKBACK = 21
 ROLLING_WINDOW_FOR_VOL = 21
 USE_VOL_PARITY = True
+USE_REGIME_SYSTEM = True
 
 # ---- Penalties & Costs ----
 # From empirical analysis of Indian market brokerage charges

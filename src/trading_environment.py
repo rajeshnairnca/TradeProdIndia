@@ -23,26 +23,31 @@ class DailyCrossSectionalEnv(gym.Env):
 
     def __init__(self, df: pd.DataFrame, symbol_to_sector_id: dict, num_sectors: int, universe: list, feature_keys: list, is_backtest=False, regime_table: pd.DataFrame | None = None, apply_regime_top_k: bool = False):
         super().__init__()
+        self.use_regime_system = config.USE_REGIME_SYSTEM and apply_regime_top_k
         
         # --- REGIME CALCULATION ---
-        if regime_table is not None and "trend_up" in regime_table.columns and "vol_high" in regime_table.columns:
-            rt = regime_table.copy()
-            if "combined_regime" not in rt.columns:
-                rt["combined_regime"] = 2 * rt["trend_up"].astype(float) + rt["vol_high"].astype(float)
-            market_proxy = rt[["combined_regime"]]
+        if self.use_regime_system:
+            if regime_table is not None and "trend_up" in regime_table.columns and "vol_high" in regime_table.columns:
+                rt = regime_table.copy()
+                if "combined_regime" not in rt.columns:
+                    rt["combined_regime"] = 2 * rt["trend_up"].astype(float) + rt["vol_high"].astype(float)
+                market_proxy = rt[["combined_regime"]]
+            else:
+                market_proxy = df.groupby(level='date')['Close'].mean().to_frame(name='market_close')
+                market_proxy['sma_50'] = market_proxy['market_close'].rolling(window=50, min_periods=50).mean()
+                market_proxy['sma_200'] = market_proxy['market_close'].rolling(window=200, min_periods=200).mean()
+                market_proxy['bull_regime'] = (market_proxy['sma_50'] > market_proxy['sma_200']).astype(float)
+                market_proxy['returns'] = market_proxy['market_close'].pct_change()
+                market_proxy['volatility'] = market_proxy['returns'].rolling(window=config.ROLLING_WINDOW_FOR_VOL, min_periods=config.ROLLING_WINDOW_FOR_VOL).std()
+                vol_threshold = market_proxy['volatility'].expanding(min_periods=config.ROLLING_WINDOW_FOR_VOL).quantile(0.75)
+                market_proxy['vol_regime'] = (market_proxy['volatility'] > vol_threshold).astype(float)
+                market_proxy['combined_regime'] = 2 * market_proxy['bull_regime'] + market_proxy['vol_regime']
+            self.data = df.join(market_proxy[['combined_regime']])
+            self.data['combined_regime'] = self.data['combined_regime'].bfill()
+            self.data['combined_regime'] = self.data['combined_regime'].ffill()
         else:
-            market_proxy = df.groupby(level='date')['Close'].mean().to_frame(name='market_close')
-            market_proxy['sma_50'] = market_proxy['market_close'].rolling(window=50, min_periods=50).mean()
-            market_proxy['sma_200'] = market_proxy['market_close'].rolling(window=200, min_periods=200).mean()
-            market_proxy['bull_regime'] = (market_proxy['sma_50'] > market_proxy['sma_200']).astype(float)
-            market_proxy['returns'] = market_proxy['market_close'].pct_change()
-            market_proxy['volatility'] = market_proxy['returns'].rolling(window=config.ROLLING_WINDOW_FOR_VOL, min_periods=config.ROLLING_WINDOW_FOR_VOL).std()
-            vol_threshold = market_proxy['volatility'].expanding(min_periods=config.ROLLING_WINDOW_FOR_VOL).quantile(0.75)
-            market_proxy['vol_regime'] = (market_proxy['volatility'] > vol_threshold).astype(float)
-            market_proxy['combined_regime'] = 2 * market_proxy['bull_regime'] + market_proxy['vol_regime']
-        self.data = df.join(market_proxy[['combined_regime']])
-        self.data['combined_regime'] = self.data['combined_regime'].bfill()
-        self.data['combined_regime'] = self.data['combined_regime'].ffill()
+            self.data = df.copy()
+            self.data['combined_regime'] = 0.0
 
         self.dates = self.data.index.get_level_values('date').unique().sort_values().to_pydatetime()
         self.universe = universe
@@ -129,6 +134,8 @@ class DailyCrossSectionalEnv(gym.Env):
 
     def _get_regime_flags(self, current_date):
         """Lookup precomputed regime flags if available."""
+        if not self.use_regime_system:
+            return {"vol_high": False, "dispersion_high": False, "dispersion_low": False, "breadth_low": False, "breadth_high": False}
         if self.regime_table is None or current_date not in self.regime_table.index:
             return {"vol_high": False, "dispersion_high": False, "dispersion_low": False, "breadth_low": False, "breadth_high": False}
         row = self.regime_table.loc[current_date]
@@ -156,6 +163,8 @@ class DailyCrossSectionalEnv(gym.Env):
         return self.top_k
 
     def _regime_gross_target(self, current_date, trend_up):
+        if not self.use_regime_system:
+            return 1.0
         flags = self._get_regime_flags(current_date)
         gross = 0.85
         # Bear + high vol
@@ -211,7 +220,7 @@ class DailyCrossSectionalEnv(gym.Env):
             dynamic_top_k = self.top_k  # Use the default in normal markets
 
         # Apply optional regime-table-based top_k
-        if self.apply_regime_top_k:
+        if self.use_regime_system and self.apply_regime_top_k:
             current_date = self.dates[self.current_idx]
             dynamic_top_k = min(dynamic_top_k, self._regime_top_k(current_date))
 
@@ -226,7 +235,7 @@ class DailyCrossSectionalEnv(gym.Env):
             else:
                 stock_weights = np.zeros_like(stock_weights)
         # Regime-aware gross exposure
-        if self.apply_regime_top_k:
+        if self.use_regime_system and self.apply_regime_top_k:
             current_date = self.dates[self.current_idx]
             trend_flag = regime_feature in [2.0, 3.0]  # combined_regime 2/3 are bull; 0/1 bear
             gross_target = self._regime_gross_target(current_date, trend_flag)

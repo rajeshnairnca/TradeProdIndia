@@ -143,7 +143,7 @@ def main():
                 universe=universe,
                 feature_keys=feature_keys,
                 regime_table=regime_table,
-                apply_regime_top_k=True,
+                apply_regime_top_k=config.USE_REGIME_SYSTEM,
                 is_backtest=is_backtest
             )
             env = Monitor(env, filename=os.path.join(log_dir, f"{rank}.monitor.csv"))
@@ -159,7 +159,7 @@ def main():
         universe=universe,
         feature_keys=feature_keys,
         regime_table=regime_table,
-        apply_regime_top_k=True,
+        apply_regime_top_k=config.USE_REGIME_SYSTEM,
         is_backtest=True,
     )
     obs, _ = sanity_env.reset()

@@ -89,7 +89,7 @@ def run_walk_forward(alpha_name: str):
                 universe=universe,
                 feature_keys=feature_keys,
                 regime_table=regime_table,
-                apply_regime_top_k=True,
+                apply_regime_top_k=config.USE_REGIME_SYSTEM,
                 is_backtest=is_backtest,
             )
             return env
@@ -143,7 +143,7 @@ def run_walk_forward(alpha_name: str):
             train_df = fold_full_train_df
 
         # 4. Train Model for this fold
-        train_env_raw = DailyCrossSectionalEnv(train_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=False, regime_table=fold_regime_table, apply_regime_top_k=True)
+        train_env_raw = DailyCrossSectionalEnv(train_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=False, regime_table=fold_regime_table, apply_regime_top_k=config.USE_REGIME_SYSTEM)
         train_env = DummyVecEnv([lambda: train_env_raw])
         train_env = VecFrameStack(train_env, n_stack=config.LSTM_N_STACK)
         train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
@@ -167,7 +167,7 @@ def run_walk_forward(alpha_name: str):
         callbacks = []
         if eval_df is not None:
             print("Setting up early stopping for this fold.")
-            eval_env_raw = DailyCrossSectionalEnv(eval_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=True)
+            eval_env_raw = DailyCrossSectionalEnv(eval_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=config.USE_REGIME_SYSTEM)
             eval_env = DummyVecEnv([lambda: eval_env_raw])
             eval_env = VecFrameStack(eval_env, n_stack=config.LSTM_N_STACK)
             eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.)
@@ -189,7 +189,7 @@ def run_walk_forward(alpha_name: str):
         train_env.save("vec_normalize_temp.pkl")
 
         # 5. Evaluate Model on the validation fold
-        validation_env_raw = DailyCrossSectionalEnv(fold_validation_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=True)
+        validation_env_raw = DailyCrossSectionalEnv(fold_validation_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=config.USE_REGIME_SYSTEM)
         validation_env = DummyVecEnv([lambda: validation_env_raw])
         validation_env = VecFrameStack(validation_env, n_stack=config.LSTM_N_STACK)
         validation_env = VecNormalize.load("vec_normalize_temp.pkl", validation_env)
