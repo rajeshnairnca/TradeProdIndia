@@ -21,6 +21,7 @@ from src.trading_environment import DailyCrossSectionalEnv
 from src.models import TransformerFeatureExtractor
 from src import config
 from src.utils import calculate_performance_metrics
+from src.regime import compute_market_regime_table
 
 def run_walk_forward(alpha_name: str):
     """
@@ -33,6 +34,23 @@ def run_walk_forward(alpha_name: str):
 
     # 1. Load Data
     df = pd.read_parquet(os.path.join(PROJECT_ROOT, config.DATA_FILE))
+
+    # Apply alpha-specific feature engineering if available
+    alpha_dir = os.path.join(PROJECT_ROOT, 'alphas', alpha_name)
+    fe_path = os.path.join(alpha_dir, 'feature_engineering.py')
+    if os.path.exists(fe_path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(f"{alpha_name}.feature_engineering", fe_path)
+        fe_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fe_module)
+        if hasattr(fe_module, "feature_engineering"):
+            df = fe_module.feature_engineering(df)
+        else:
+            print(f"Warning: feature_engineering not found in {fe_path}, proceeding without applying.")
+    else:
+        print(f"Warning: feature_engineering.py not found for {alpha_name}; proceeding without applying.")
+
+    feature_keys = sorted([c for c in df.columns if c.endswith('_z')])
     
     # --- Robust Sector Mapping ---
     with open(os.path.join(PROJECT_ROOT, config.SECTOR_MAP_FILE), 'r') as f:
@@ -62,9 +80,18 @@ def run_walk_forward(alpha_name: str):
     all_fold_results = {}
 
     # --- Env Maker ---
-    def make_env(rank, seed=0, df=None, is_backtest=False):
+    def make_env(rank, seed=0, df=None, regime_table=None, is_backtest=False):
         def _init():
-            env = DailyCrossSectionalEnv(df=df, symbol_to_sector_id=symbol_to_sector_id, num_sectors=num_sectors)
+            env = DailyCrossSectionalEnv(
+                df=df,
+                symbol_to_sector_id=symbol_to_sector_id,
+                num_sectors=num_sectors,
+                universe=universe,
+                feature_keys=feature_keys,
+                regime_table=regime_table,
+                apply_regime_top_k=True,
+                is_backtest=is_backtest,
+            )
             return env
         set_random_seed(seed)
         return _init
@@ -91,6 +118,10 @@ def run_walk_forward(alpha_name: str):
         fold_full_train_df = df[(df.index.get_level_values('date') >= train_start_date) & (df.index.get_level_values('date') < train_end_date)]
         fold_validation_df = df[(df.index.get_level_values('date') >= validation_start_date) & (df.index.get_level_values('date') < validation_end_date)]
 
+        # Compute regime table only on data available through validation end (no lookahead)
+        fold_regime_df = pd.concat([fold_full_train_df, fold_validation_df])
+        fold_regime_table = compute_market_regime_table(fold_regime_df)
+
         fold_train_dates = fold_full_train_df.index.get_level_values('date').unique().sort_values()
         
         eval_df = None
@@ -112,7 +143,7 @@ def run_walk_forward(alpha_name: str):
             train_df = fold_full_train_df
 
         # 4. Train Model for this fold
-        train_env_raw = DailyCrossSectionalEnv(train_df, symbol_to_sector_id, num_sectors, is_backtest=False)
+        train_env_raw = DailyCrossSectionalEnv(train_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=False, regime_table=fold_regime_table, apply_regime_top_k=True)
         train_env = DummyVecEnv([lambda: train_env_raw])
         train_env = VecFrameStack(train_env, n_stack=config.LSTM_N_STACK)
         train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
@@ -136,7 +167,7 @@ def run_walk_forward(alpha_name: str):
         callbacks = []
         if eval_df is not None:
             print("Setting up early stopping for this fold.")
-            eval_env_raw = DailyCrossSectionalEnv(eval_df, symbol_to_sector_id, num_sectors, is_backtest=True)
+            eval_env_raw = DailyCrossSectionalEnv(eval_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=True)
             eval_env = DummyVecEnv([lambda: eval_env_raw])
             eval_env = VecFrameStack(eval_env, n_stack=config.LSTM_N_STACK)
             eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.)
@@ -158,7 +189,7 @@ def run_walk_forward(alpha_name: str):
         train_env.save("vec_normalize_temp.pkl")
 
         # 5. Evaluate Model on the validation fold
-        validation_env_raw = DailyCrossSectionalEnv(fold_validation_df, symbol_to_sector_id, num_sectors, is_backtest=True)
+        validation_env_raw = DailyCrossSectionalEnv(fold_validation_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=True)
         validation_env = DummyVecEnv([lambda: validation_env_raw])
         validation_env = VecFrameStack(validation_env, n_stack=config.LSTM_N_STACK)
         validation_env = VecNormalize.load("vec_normalize_temp.pkl", validation_env)
@@ -168,12 +199,33 @@ def run_walk_forward(alpha_name: str):
         obs = validation_env.reset()
         done, lstm_states = False, None
         fold_net_worths = [config.INITIAL_CAPITAL]
+        steps_this_fold = 0
 
         while not done:
             action, lstm_states = model.predict(obs, state=lstm_states, deterministic=True)
-            obs, _, done, info = validation_env.step(action)
+            # Regime-aware sizing now handled inside the environment
+            obs, _, dones, info = validation_env.step(action)
+            done = bool(dones[0])
             net_worth = info[0]['net_worth']
             fold_net_worths.append(net_worth)
+            steps_this_fold += 1
+
+        # Basic diagnostics for the fold
+        fold_min = min(fold_net_worths)
+        fold_max = max(fold_net_worths)
+        fold_final = fold_net_worths[-1]
+        # Log diagnostics
+        print(f"Fold {i+1} diagnostics: steps={steps_this_fold}, min_worth={fold_min:,.2f}, max_worth={fold_max:,.2f}, final_worth={fold_final:,.2f}")
+        diag_path = os.path.join(PROJECT_ROOT, 'alphas', alpha_name, f"fold_{i+1}_diagnostics.json")
+        os.makedirs(os.path.dirname(diag_path), exist_ok=True)
+        with open(diag_path, 'w') as f:
+            json.dump({
+                "fold": i + 1,
+                "steps": steps_this_fold,
+                "min_worth": float(fold_min),
+                "max_worth": float(fold_max),
+                "final_worth": float(fold_final),
+            }, f, indent=2)
 
         # 6. Store results for the fold
         fold_cagr = calculate_performance_metrics(pd.Series(fold_net_worths), len(fold_validation_df.index.get_level_values('date').unique()))["CAGR"]
@@ -205,7 +257,9 @@ def run_walk_forward(alpha_name: str):
     print(f"Overall Max Drawdown: {final_metrics['Max Drawdown']:.2f}%")
 
     # --- SAVE WALK-FORWARD PLOT ---
-    plot_path = os.path.join(PROJECT_ROOT, 'alphas', alpha_name, f"{alpha_name}_walkforward_performance.png")
+    plot_dir = os.path.join(PROJECT_ROOT, 'alphas', alpha_name)
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{alpha_name}_walkforward_performance.png")
     plt.figure(figsize=(12, 6))
     plt.plot(overall_net_worths)
     plt.title(f'Walk-Forward Validation Equity Curve for "{alpha_name}"')
@@ -216,7 +270,7 @@ def run_walk_forward(alpha_name: str):
     print(f"Saved walk-forward performance chart to {plot_path}")
 
     # --- SAVE WALK-FORWARD RESULTS ---
-    output_path = os.path.join(PROJECT_ROOT, 'alphas', alpha_name, 'walk_forward_results.json')
+    output_path = os.path.join(plot_dir, 'walk_forward_results.json')
     print(f'Saving walk-forward validation results to {output_path}')
     final_metrics_serializable = {k: (v.item() if isinstance(v, np.generic) else v) for k, v in final_metrics.items()}
     with open(output_path, 'w') as f:
@@ -228,6 +282,11 @@ def run_walk_forward(alpha_name: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run walk-forward validation for a single alpha.")
     parser.add_argument("--alpha-name", type=str, required=True, help="Name of the alpha to validate.")
+    parser.add_argument("--timesteps", type=int, help="Override config.TRAINING_TIMESTEPS for quick tests.")
     args = parser.parse_args()
+    
+    # Allow quick override of training timesteps for walk-forward
+    if args.timesteps:
+        config.TRAINING_TIMESTEPS = args.timesteps
     
     run_walk_forward(args.alpha_name)

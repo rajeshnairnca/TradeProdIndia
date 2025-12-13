@@ -6,6 +6,7 @@ import shutil
 import time
 import pandas as pd
 import inspect
+import hashlib
 
 # --- Path Setup ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +25,18 @@ PYTHON_EXEC = sys.executable
 BACKTESTER_SCRIPT = os.path.join(PROJECT_ROOT, "scripts/backtesting/backtester.py")
 TRAIN_SCRIPT = os.path.join(PROJECT_ROOT, "scripts/training/train_alpha.py")
 
+def make_ensemble_dirname(alpha_names: list[str]) -> str:
+    """Generate a short, stable ensemble folder name with a hash suffix."""
+    sorted_names = sorted(alpha_names)
+    if len(sorted_names) == 1:
+        return sorted_names[0]
+
+    digest = hashlib.sha1("::".join(sorted_names).encode("utf-8")).hexdigest()[:8]
+    preview_parts = [name[:12] for name in sorted_names[:3]]
+    preview = "_vs_".join(preview_parts)
+    if len(sorted_names) > 3:
+        preview += f"_plus{len(sorted_names) - 3}"
+    return f"{preview}__{digest}"
 
 def get_existing_alphas(alphas_dir):
     """Gets a summary of existing alphas."""
@@ -50,19 +63,28 @@ def run_backtest(alpha_list):
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=PROJECT_ROOT)
         print(result.stdout)
-        # A bit of a hack to get the ensemble name. This should be made more robust.
-        ensemble_name = "_vs_".join(sorted(alpha_list))
+        ensemble_name = make_ensemble_dirname(alpha_list)
+        results_candidates = [
+            os.path.join(ALPHAS_DIR, "_ensembles", ensemble_name, "results.json")
+        ]
         if len(alpha_list) == 1:
-            ensemble_name = alpha_list[0]
+            results_candidates.append(os.path.join(ALPHAS_DIR, ensemble_name, "results.json"))
+        else:
+            legacy_name = "_vs_".join(sorted(alpha_list))
+            results_candidates.append(os.path.join(ALPHAS_DIR, "_ensembles", legacy_name, "results.json"))
 
-        results_path = os.path.join(ALPHAS_DIR, "_ensembles", ensemble_name, "results.json")
-        if not os.path.exists(results_path):
-             # try another path for single alpha
-             results_path = os.path.join(ALPHAS_DIR, ensemble_name, "results.json")
-
-        with open(results_path, 'r') as f:
-            results = json.load(f)
-            return results.get("cagr", -float('inf'))
+        for results_path in results_candidates:
+            if not os.path.exists(results_path):
+                continue
+            try:
+                with open(results_path, 'r') as f:
+                    results = json.load(f)
+                    return results.get("cagr", -float('inf'))
+            except json.JSONDecodeError:
+                print(f"Warning: Could not decode JSON from {results_path}.")
+                continue
+        print(f"Backtest finished but results.json not found in: {results_candidates}")
+        return -float('inf')
     except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
         print(f"Backtest failed for {alpha_list}. Error: {e}")
         if isinstance(e, subprocess.CalledProcessError):
@@ -104,8 +126,12 @@ def main():
             failed_attempts_summary = "No failed attempts yet."
         
         print("\n--- Consulting LLM for new alpha strategy ---")
-        prompt, new_script_raw = get_new_alpha_idea(alpha_summary, baseline_cagr, failed_attempts_summary, data_schema)
-        new_script = clean_llm_code(new_script_raw)
+        try:
+            prompt, new_script_raw = get_new_alpha_idea(alpha_summary, baseline_cagr, failed_attempts_summary, data_schema)
+            new_script = clean_llm_code(new_script_raw)
+        except Exception as e:
+            print(f"LLM call failed (network or auth issue): {e}")
+            break
         
         if not new_script:
             print("LLM did not return a valid script. Skipping iteration.")
@@ -158,8 +184,9 @@ def main():
             print(f"--- Evaluating candidate via Walk-Forward Validation: {candidate_name} ---")
             metrics = run_walk_forward(candidate_name)
             if metrics and 'CAGR' in metrics:
-                new_cagr = metrics['CAGR']
-                print(f"Walk-Forward CAGR for {candidate_name}: {new_cagr:.2f}%")
+                # run_walk_forward returns CAGR in percent; convert to decimal for fair comparison
+                new_cagr = metrics['CAGR'] / 100.0
+                print(f"Walk-Forward CAGR for {candidate_name}: {new_cagr:.2%}")
             else:
                 print(f"Walk-forward validation failed for {candidate_name}.")
         else:
@@ -174,14 +201,13 @@ def main():
             # The trained model is in the ALPHAS_DIR. We can keep the candidate dir for reference
             pass
         else:
-            print(f"\n--- 😔 FAILURE: Candidate {candidate_name} did not improve performance. Discarding.---")
+            print(f"\n--- 😔 FAILURE: Candidate {candidate_name} did not improve performance. Keeping artifacts for inspection. ---")
             history.append({"summary": description, "code": new_script})
             with open(ENSEMBLE_HISTORY_FILE, 'w') as f:
                 json.dump(history, f, indent=2)
-            shutil.rmtree(os.path.join(ALPHAS_DIR, candidate_name))
+            # Leave alphas/candidate and candidate_dir for debugging
         
-        # Clean up the empty top-level candidate directory
-        shutil.rmtree(candidate_dir)
+        # Do not delete candidate_dir; keep for inspection
 
     print(f"\n{'='*30} Orchestration Finished {'='*30}")
 

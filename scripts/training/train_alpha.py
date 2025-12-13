@@ -27,6 +27,21 @@ from src import config
 from src.trading_environment import DailyCrossSectionalEnv
 from src.models import TransformerFeatureExtractor
 from src.utils import calculate_cagr
+from src.regime import compute_market_regime_table
+
+
+def validate_feature_file_safe(path: str):
+    """Best-effort guardrail: reject obvious future-peeking constructs in feature scripts."""
+    with open(path, "r") as f:
+        content = f.read()
+    patterns = [
+        r"center\s*=\s*True",      # centered rolling windows
+        r"shift\s*\(\s*-\s*\d",    # negative shifts (lookahead)
+        r"lead\s*\(",              # lead/lag forward-looking
+    ]
+    for pat in patterns:
+        if re.search(pat, content):
+            raise RuntimeError(f"Feature file '{path}' appears to use future-looking operation: pattern '{pat}'")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -57,21 +72,56 @@ def main():
     data_file_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
     if not os.path.exists(data_file_path): raise FileNotFoundError(f"Data file not found: {data_file_path}")
     full_data = pd.read_parquet(data_file_path)
+    all_dates = full_data.index.get_level_values('date').unique().sort_values()
+    split_index = int(len(all_dates) * config.TRAIN_RATIO)
+    train_dates, test_dates = all_dates[:split_index], all_dates[split_index:]
+    if len(test_dates) == 0:
+        raise RuntimeError("Dataset too small to create a holdout set; adjust config.TRAIN_RATIO or provide more data.")
 
     # --- Load and apply feature engineering ---
     if args.features_file and os.path.exists(args.features_file):
         print(f"Loading feature engineering from {args.features_file}")
+        validate_feature_file_safe(args.features_file)
+
+        # Save a copy of the features file to the alpha directory for reproducibility
+        try:
+            dest_path = os.path.join(alpha_dir, 'feature_engineering.py')
+            if os.path.abspath(args.features_file) != os.path.abspath(dest_path):
+                with open(args.features_file, 'r') as src:
+                    with open(dest_path, 'w') as dst:
+                        dst.write(src.read())
+                print(f"Copied feature engineering file to {dest_path}")
+            else:
+                print("Source and destination feature files are the same; skipping copy.")
+        except IOError as e:
+            print(f"Error: Could not copy feature file: {e}", file=sys.stderr)
+
         spec = importlib.util.spec_from_file_location("feature_engineering", args.features_file)
         feature_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(feature_module)
-        feature_engineering = feature_module.feature_engineering
-        full_data = feature_engineering(full_data)
-        print("Feature engineering applied.")
+        feature_engineering = getattr(feature_module, "feature_engineering", None)
+        if feature_engineering:
+            full_data = feature_engineering(full_data)
+            print("Feature engineering applied.")
+        else:
+            print("Warning: feature_engineering not found; proceeding without applying.")
+
+    # Recreate splits after potential feature engineering
+    train_df = full_data[full_data.index.get_level_values('date').isin(train_dates)]
+    test_df = full_data[full_data.index.get_level_values('date').isin(test_dates)]
+
+    # Use full history for regime table so test dates have coverage, but computations are still backward-looking.
+    regime_table = compute_market_regime_table(pd.concat([train_df, test_df]))
 
     # Save the feature keys used for this alpha
     feature_keys = sorted([c for c in full_data.columns if c.endswith('_z')])
     with open(os.path.join(alpha_dir, "feature_keys.json"), "w") as f:
         json.dump(feature_keys, f)
+
+    # Sanity check: warn if feature keys reference missing columns in base data before FE
+    missing_base = [k for k in feature_keys if k not in full_data.columns]
+    if missing_base:
+        print(f"Warning: missing engineered features in data after applying feature file: {missing_base}")
 
     # --- True Sector Loading ---
     with open(os.path.join(PROJECT_ROOT, config.SECTOR_MAP_FILE), 'r') as f:
@@ -86,13 +136,45 @@ def main():
 
     def make_env(rank, seed=0, df=None, is_backtest=False):
         def _init():
-            env = DailyCrossSectionalEnv(df=df, symbol_to_sector_id=symbol_to_sector_id, num_sectors=NUM_SECTORS)
+            env = DailyCrossSectionalEnv(
+                df=df,
+                symbol_to_sector_id=symbol_to_sector_id,
+                num_sectors=NUM_SECTORS,
+                universe=universe,
+                feature_keys=feature_keys,
+                regime_table=regime_table,
+                apply_regime_top_k=True,
+                is_backtest=is_backtest
+            )
             env = Monitor(env, filename=os.path.join(log_dir, f"{rank}.monitor.csv"))
             return env
         set_random_seed(seed)
         return _init
 
-    train_env = SubprocVecEnv([make_env(i, config.SEED + i, df=full_data) for i in range(config.N_ENVS)])
+    # --- SANITY CHECK FOR FINITE OBS/REGIME ---
+    sanity_env = DailyCrossSectionalEnv(
+        df=train_df,
+        symbol_to_sector_id=symbol_to_sector_id,
+        num_sectors=NUM_SECTORS,
+        universe=universe,
+        feature_keys=feature_keys,
+        regime_table=regime_table,
+        apply_regime_top_k=True,
+        is_backtest=True,
+    )
+    obs, _ = sanity_env.reset()
+    for k in ("stock_features", "global_features", "mask", "sector_ids"):
+        arr = np.asarray(obs[k])
+        if not np.all(np.isfinite(arr)):
+            raise RuntimeError(f"Non-finite values detected in observation key '{k}' during sanity check.")
+    dummy_action = np.zeros(len(universe) + 1, dtype=np.float32)
+    if len(universe) > 0:
+        dummy_action[:-1] = 1.0 / len(universe)
+    _, _, _, _, info = sanity_env.step(dummy_action)
+    if not np.isfinite(info.get("net_worth", 0.0)):
+        raise RuntimeError("Non-finite net_worth detected during sanity step.")
+
+    train_env = SubprocVecEnv([make_env(i, config.SEED + i, df=train_df) for i in range(config.N_ENVS)])
     train_env = VecFrameStack(train_env, n_stack=config.LSTM_N_STACK)
     train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
 
@@ -111,12 +193,9 @@ def main():
         **config.PPO_PARAMS
     )
 
-    # --- COMPILE MODEL FOR SPEEDUP (PYTORCH 2.0+) ---
-    if int(torch.__version__.split('.')[0]) >= 2:
-        print("PyTorch version >= 2.0 detected. Compiling model policy for performance boost...")
-        model.policy = torch.compile(model.policy)
+    
 
-    eval_env = SubprocVecEnv([make_env(config.N_ENVS, config.SEED, df=full_data)])
+    eval_env = SubprocVecEnv([make_env(config.N_ENVS, config.SEED, df=train_df)])
     eval_env = VecFrameStack(eval_env, n_stack=config.LSTM_N_STACK)
     eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.)
     eval_env.obs_rms = train_env.obs_rms
@@ -145,8 +224,8 @@ def main():
     # --- BACKTESTING ---
     print("\n--- Backtesting on Unseen Test Data ---")
     model = RecurrentPPO.load(os.path.join(model_dir, "best_model.zip"), device=config.DEVICE)
-    
-    test_env_raw = DummyVecEnv([make_env(0, config.SEED, df=full_data, is_backtest=True)])
+
+    test_env_raw = DummyVecEnv([make_env(0, config.SEED, df=test_df, is_backtest=True)])
     test_env = VecFrameStack(test_env_raw, n_stack=config.LSTM_N_STACK)
     test_env = VecNormalize.load(os.path.join(model_dir, "vec_normalize.pkl"), test_env)
     test_env.training = False

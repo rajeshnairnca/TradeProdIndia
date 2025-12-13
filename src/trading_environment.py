@@ -21,25 +21,31 @@ def vectorized_brokerage_calculator(trade_dollars: np.ndarray) -> np.ndarray:
 class DailyCrossSectionalEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, df: pd.DataFrame, symbol_to_sector_id: dict, num_sectors: int, is_backtest=False):
+    def __init__(self, df: pd.DataFrame, symbol_to_sector_id: dict, num_sectors: int, universe: list, feature_keys: list, is_backtest=False, regime_table: pd.DataFrame | None = None, apply_regime_top_k: bool = False):
         super().__init__()
         
         # --- REGIME CALCULATION ---
-        market_proxy = df.groupby(level='date')['Close'].mean().to_frame(name='market_close')
-        market_proxy['sma_50'] = market_proxy['market_close'].rolling(window=50, min_periods=50).mean()
-        market_proxy['sma_200'] = market_proxy['market_close'].rolling(window=200, min_periods=200).mean()
-        market_proxy['bull_regime'] = (market_proxy['sma_50'] > market_proxy['sma_200']).astype(float)
-        market_proxy['returns'] = market_proxy['market_close'].pct_change()
-        market_proxy['volatility'] = market_proxy['returns'].rolling(window=config.ROLLING_WINDOW_FOR_VOL, min_periods=config.ROLLING_WINDOW_FOR_VOL).std()
-        vol_threshold = market_proxy['volatility'].quantile(0.75)
-        market_proxy['vol_regime'] = (market_proxy['volatility'] > vol_threshold).astype(float)
-        market_proxy['combined_regime'] = 2 * market_proxy['bull_regime'] + market_proxy['vol_regime']
+        if regime_table is not None and "trend_up" in regime_table.columns and "vol_high" in regime_table.columns:
+            rt = regime_table.copy()
+            if "combined_regime" not in rt.columns:
+                rt["combined_regime"] = 2 * rt["trend_up"].astype(float) + rt["vol_high"].astype(float)
+            market_proxy = rt[["combined_regime"]]
+        else:
+            market_proxy = df.groupby(level='date')['Close'].mean().to_frame(name='market_close')
+            market_proxy['sma_50'] = market_proxy['market_close'].rolling(window=50, min_periods=50).mean()
+            market_proxy['sma_200'] = market_proxy['market_close'].rolling(window=200, min_periods=200).mean()
+            market_proxy['bull_regime'] = (market_proxy['sma_50'] > market_proxy['sma_200']).astype(float)
+            market_proxy['returns'] = market_proxy['market_close'].pct_change()
+            market_proxy['volatility'] = market_proxy['returns'].rolling(window=config.ROLLING_WINDOW_FOR_VOL, min_periods=config.ROLLING_WINDOW_FOR_VOL).std()
+            vol_threshold = market_proxy['volatility'].expanding(min_periods=config.ROLLING_WINDOW_FOR_VOL).quantile(0.75)
+            market_proxy['vol_regime'] = (market_proxy['volatility'] > vol_threshold).astype(float)
+            market_proxy['combined_regime'] = 2 * market_proxy['bull_regime'] + market_proxy['vol_regime']
         self.data = df.join(market_proxy[['combined_regime']])
         self.data['combined_regime'] = self.data['combined_regime'].bfill()
         self.data['combined_regime'] = self.data['combined_regime'].ffill()
 
         self.dates = self.data.index.get_level_values('date').unique().sort_values().to_pydatetime()
-        self.universe = self.data.index.get_level_values('ticker').unique().tolist()
+        self.universe = universe
         if len(self.dates) < 200: raise RuntimeError("Not enough dates for 200-day moving average.")
         
         self.n_stocks = len(self.universe)
@@ -47,13 +53,16 @@ class DailyCrossSectionalEnv(gym.Env):
         self.num_sectors = num_sectors
         self.is_backtest = is_backtest
         self.top_k = config.TOP_K # Added for dynamic portfolio sizing
+        self.regime_table = regime_table
+        self.apply_regime_top_k = apply_regime_top_k
         
-        self._feature_keys = sorted([c for c in self.data.columns if c.endswith('_z')])
+        provided_feature_keys = feature_keys if feature_keys is not None else []
+        self._feature_keys = sorted(provided_feature_keys) if provided_feature_keys else sorted([c for c in self.data.columns if c.endswith('_z')])
         num_stock_features = len(self._feature_keys)
         num_global_features = 2  # For VIX and Market Regime
 
-        # Action space is now the target weights themselves
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(self.n_stocks,), dtype=np.float32)
+        # Action space: target weights for each stock plus a cash slot (last element)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(self.n_stocks + 1,), dtype=np.float32)
         
         self.observation_space = spaces.Dict({
             "stock_features": spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_stocks, num_stock_features), dtype=np.float32),
@@ -92,13 +101,19 @@ class DailyCrossSectionalEnv(gym.Env):
             day_data = self.data.loc[current_date]
         except KeyError:
             day_data = pd.DataFrame(columns=self.data.columns)
-        
+
         day_data = day_data.reindex(self.universe)
+        # Ensure all expected feature columns exist
+        for col in self._feature_keys:
+            if col not in day_data.columns:
+                day_data[col] = 0.0
         stock_features = day_data[self._feature_keys].fillna(0).to_numpy(dtype=np.float32)
         mask = (~day_data['Close'].isna()).to_numpy(dtype=np.float32)
         sector_ids = np.array([self.symbol_to_sector_id.get(ticker, 0) for ticker in self.universe], dtype=np.int64)
         
-        vix_feature = day_data['VIX_z'].fillna(0).iloc[0] if 'VIX_z' in day_data and not day_data.empty else 0.0
+        if 'VIX_z' not in day_data.columns:
+            day_data['VIX_z'] = 0.0
+        vix_feature = day_data['VIX_z'].fillna(0).iloc[0] if not day_data.empty else 0.0
         regime_feature = day_data['combined_regime'].iloc[0] if not day_data.empty and 'combined_regime' in day_data.columns else 0.0
         global_features = np.array([vix_feature, regime_feature], dtype=np.float32)
 
@@ -112,14 +127,79 @@ class DailyCrossSectionalEnv(gym.Env):
         vol = day_data['vol_21'].to_numpy(dtype=np.float32)
         return prices, adv, vol
 
+    def _get_regime_flags(self, current_date):
+        """Lookup precomputed regime flags if available."""
+        if self.regime_table is None or current_date not in self.regime_table.index:
+            return {"vol_high": False, "dispersion_high": False, "dispersion_low": False, "breadth_low": False, "breadth_high": False}
+        row = self.regime_table.loc[current_date]
+        return {
+            "vol_high": bool(row.get("vol_high", False)),
+            "dispersion_high": bool(row.get("dispersion_high", False)),
+            "dispersion_low": bool(row.get("dispersion_low", False)),
+            "breadth_low": bool(row.get("breadth_low", False)),
+            "breadth_high": bool(row.get("breadth_high", False)),
+        }
+
+    def _regime_top_k(self, current_date):
+        flags = self._get_regime_flags(current_date)
+        # Concentrate more in choppy, weak-signal regimes; broaden when signals are clean.
+        if flags["vol_high"] and flags["dispersion_low"] and flags["breadth_low"]:
+            return 5
+        if flags["vol_high"] and flags["dispersion_high"]:
+            return 7
+        if (not flags["vol_high"]) and flags["dispersion_high"] and flags["breadth_high"]:
+            return 12
+        if (not flags["vol_high"]) and flags["dispersion_high"]:
+            return 10
+        if flags["vol_high"]:
+            return 6
+        return self.top_k
+
+    def _regime_gross_target(self, current_date, trend_up):
+        flags = self._get_regime_flags(current_date)
+        gross = 0.85
+        # Bear + high vol
+        if (not trend_up) and flags["vol_high"]:
+            gross = 0.6
+        # Bear + low vol
+        elif (not trend_up) and (not flags["vol_high"]):
+            gross = 0.75
+        # High vol + low dispersion + low breadth (choppy)
+        elif flags["vol_high"] and flags["dispersion_low"] and flags["breadth_low"]:
+            gross = 0.6
+        # High vol + high dispersion (volatile but some winners)
+        elif flags["vol_high"] and flags["dispersion_high"]:
+            gross = 0.8
+        # Low vol + high dispersion + high breadth (clean trend/momentum)
+        elif (not flags["vol_high"]) and flags["dispersion_high"] and flags["breadth_high"]:
+            gross = 1.05  # slightly more aggressive in the best regimes
+        # Low vol + high dispersion (but breadth not strong)
+        elif (not flags["vol_high"]) and flags["dispersion_high"]:
+            gross = 0.95
+        # Low vol + low dispersion (quiet, low signal differentiation)
+        elif (not flags["vol_high"]) and flags["dispersion_low"]:
+            gross = 0.85
+        return max(0.0, min(1.1, gross))
+
     def step(self, target_weights: np.ndarray):
-        # The action is now the target portfolio weights, not raw scores.
-        # The portfolio construction logic is now external to the environment.
+        # The action is the target portfolio weights (per stock) plus cash weight in the last slot.
+        target_weights = np.asarray(target_weights, dtype=np.float32).reshape(-1)
         obs, (prices, adv, vol) = self._assemble_observation(self.current_idx)
-        
-        # Normalize weights to ensure they sum to 1
-        if np.sum(target_weights) > 1e-9:
-            target_weights = target_weights / np.sum(target_weights)
+
+        # Apply the mask from the observation to prevent trading unavailable assets.
+        mask = obs['mask']
+        stock_weights = target_weights[:-1] * mask
+        cash_weight = float(target_weights[-1])
+
+        cash_weight = min(max(cash_weight, 0.0), 1.0)
+
+        # Normalize stock weights to sum to (1 - cash_weight)
+        stock_sum = np.sum(stock_weights)
+        if stock_sum > 1e-9:
+            stock_weights = stock_weights / stock_sum
+            stock_weights = stock_weights * max(0.0, 1.0 - cash_weight)
+        else:
+            stock_weights = np.zeros_like(stock_weights)
 
         # Dynamically adjust portfolio size based on market regime
         # Use a more concentrated portfolio in high-volatility markets to focus on best ideas.
@@ -130,22 +210,32 @@ class DailyCrossSectionalEnv(gym.Env):
         else:
             dynamic_top_k = self.top_k  # Use the default in normal markets
 
+        # Apply optional regime-table-based top_k
+        if self.apply_regime_top_k:
+            current_date = self.dates[self.current_idx]
+            dynamic_top_k = min(dynamic_top_k, self._regime_top_k(current_date))
+
         # Apply concentration: keep only dynamic_top_k largest weights, set others to zero
         if dynamic_top_k < self.n_stocks:
-            # Get indices of top_k largest weights
-            top_k_indices = np.argpartition(target_weights, -dynamic_top_k)[-dynamic_top_k:]
-            
-            # Create a new array for concentrated weights
-            concentrated_weights = np.zeros_like(target_weights)
-            concentrated_weights[top_k_indices] = target_weights[top_k_indices]
-            
-            # Re-normalize the concentrated weights
+            top_k_indices = np.argpartition(stock_weights, -dynamic_top_k)[-dynamic_top_k:]
+            concentrated_weights = np.zeros_like(stock_weights)
+            concentrated_weights[top_k_indices] = stock_weights[top_k_indices]
             if np.sum(concentrated_weights) > 1e-9:
-                target_weights = concentrated_weights / np.sum(concentrated_weights)
+                stock_weights = concentrated_weights / np.sum(concentrated_weights)
+                stock_weights = stock_weights * max(0.0, 1.0 - cash_weight)
             else:
-                target_weights = np.zeros_like(target_weights) # All weights were zero, keep them zero
-        
-        target_alloc_dollars = target_weights * self.net_worth
+                stock_weights = np.zeros_like(stock_weights)
+        # Regime-aware gross exposure
+        if self.apply_regime_top_k:
+            current_date = self.dates[self.current_idx]
+            trend_flag = regime_feature in [2.0, 3.0]  # combined_regime 2/3 are bull; 0/1 bear
+            gross_target = self._regime_gross_target(current_date, trend_flag)
+            stock_weights = stock_weights * gross_target
+            cash_weight = 1.0 - np.sum(stock_weights)
+        else:
+            cash_weight = max(0.0, 1.0 - np.sum(stock_weights))
+
+        target_alloc_dollars = stock_weights * self.net_worth
         current_prices = np.nan_to_num(prices)
         current_holdings_dollars = self.positions * current_prices
         trade_dollars = target_alloc_dollars - current_holdings_dollars
@@ -192,7 +282,13 @@ class DailyCrossSectionalEnv(gym.Env):
                 downside_deviation = np.std(downside_returns)
                 risk_penalty = risk_coeff * downside_deviation
         
-        reward = log_return - turnover_pen - leverage_pen - risk_penalty
+        # Apply cash drag only when gross target is reasonably high; avoid penalizing defensive stances
+        if 'gross_exposure' in locals():
+            drag_active = gross_exposure >= 0.75
+        else:
+            drag_active = True
+        cash_drag_pen = config.CASH_DRAG_COEFF * cash_weight if drag_active else 0.0
+        reward = log_return - turnover_pen - leverage_pen - risk_penalty - cash_drag_pen
         
         done = False
         if self.net_worth <= 0:
@@ -205,6 +301,19 @@ class DailyCrossSectionalEnv(gym.Env):
         self.current_idx += 1
         
         next_obs, _ = self._assemble_observation(self.current_idx if not done else self.current_idx - 1)
-        info = {"date": self.dates[self.current_idx - 1].strftime('%Y-%m-%d'), "net_worth": self.net_worth, "reward": reward}
+        gross_exposure = np.sum(np.abs(target_alloc_dollars)) / (self.net_worth + epsilon)
+        info = {
+            "date": self.dates[self.current_idx - 1].strftime('%Y-%m-%d'),
+            "net_worth": self.net_worth,
+            "cash": self.cash,
+            "portfolio_value": portfolio_value,
+            "gross_exposure": gross_exposure,
+            "cash_weight": cash_weight,
+            "leverage": leverage,
+            "turnover": turnover,
+            "reward": reward,
+            "trade_dollars": trade_dollars,
+            "prices": current_prices
+        }
         
         return next_obs, float(reward), bool(done), False, info

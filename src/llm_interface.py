@@ -49,7 +49,8 @@ def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, faile
     - All new engineered features that should be used by the model must have names ending in `_z`.
     """
     response = client.models.generate_content(
-        model="gemini-2.5-pro",
+        # model="gemini-2.5-pro",
+        model="gemini-3-pro-preview",
         contents=prompt
     )
     suggested_code = response.text

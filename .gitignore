@@ -1,4 +1,7 @@
 /.env
+/__pycache__
+*.pyc
+.DS_Store
 /_candidates
 /alphas
 /candidate_1756738092_walkforward_performance.png
