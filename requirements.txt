@@ -15,5 +15,8 @@ optuna
 # For reading the parquet data file
 pyarrow
 
+# Gradient-boosted trees for tabular signals
+xgboost
+
 # The NEW, correct Google AI library
 google-genaisb3-contrib

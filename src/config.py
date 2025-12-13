@@ -47,7 +47,13 @@ TOP_K = 9
 ADV_LOOKBACK = 21
 ROLLING_WINDOW_FOR_VOL = 21
 USE_VOL_PARITY = True
-USE_REGIME_SYSTEM = True
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", True)
 
 # ---- Penalties & Costs ----
 # From empirical analysis of Indian market brokerage charges
