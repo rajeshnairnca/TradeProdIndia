@@ -43,7 +43,7 @@ NUM_SECTORS = 11
 INITIAL_CAPITAL = 1_000_000.0
 TRAIN_RATIO = 0.7
 VALIDATION_RATIO = 0.15
-TOP_K = 9
+TOP_K = 10
 ADV_LOOKBACK = 21
 ROLLING_WINDOW_FOR_VOL = 21
 USE_VOL_PARITY = True
@@ -61,7 +61,9 @@ TURNOVER_PENALTY = 0.000718
 LEVERAGE_PENALTY = 1e-4
 RISK_PENALTY_COEFF = 0.5021
 SLIPPAGE_COEFF = 0.005
-CASH_DRAG_COEFF = 5e-5  # per-step penalty scaled by cash_weight to discourage idle cash
+CASH_DRAG_COEFF = 8e-5  # per-step penalty scaled by cash_weight to discourage idle cash
+WEIGHT_CHANGE_PENALTY = 0.0005  # penalize large day-over-day weight changes (swing-friendly)
+WEIGHT_SMOOTHING = 0.2  # blend factor for previous weights vs new weights (higher = smoother)
 
 # ---- Model Architecture ----
 FEATURES_DIM = _maybe_override("FEATURES_DIM", 256)

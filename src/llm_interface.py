@@ -19,8 +19,9 @@ def clean_llm_code(llm_response: str) -> str:
         cleaned_code = cleaned_code[:-len("```")].strip()
     return cleaned_code
 
-def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, failed_attempts_summary: str, data_schema: str) -> tuple[str, str]:
-    """Asks the Gemini model to generate a new, diverse alpha strategy."""
+def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, failed_attempts_summary: str, data_schema: str, guidance: str = "") -> tuple[str, str]:
+    """Asks the Gemini model to generate a new, diverse alpha strategy. Optional guidance can steer the idea."""
+    guidance_text = f"\n\nADDITIONAL GUIDANCE FROM USER:\n{guidance}\n" if guidance else ""
     prompt = f"""
     You are an expert quantitative researcher tasked with designing a portfolio of diverse alpha strategies.
 
@@ -31,6 +32,8 @@ def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, faile
 
     To avoid repeating past mistakes, here is a summary of previously attempted strategies that FAILED to improve the ensemble and were discarded. Do not suggest these ideas again:
     {failed_attempts_summary}
+
+    {guidance_text}
 
     Your task is to propose a NEW, CREATIVE alpha strategy that is likely to be UNCORRELATED with the existing successful ones and different from the failed attempts.
 

@@ -6,6 +6,7 @@ import shutil
 import time
 import pandas as pd
 import inspect
+import argparse
 import hashlib
 
 # --- Path Setup ---
@@ -18,8 +19,10 @@ from src.walkforward import run_walk_forward
 
 # --- CONFIGURATION ---
 MAX_ITERATIONS = 10
-ALPHAS_DIR = os.path.join(PROJECT_ROOT, "alphas")
-CANDIDATES_DIR = os.path.join(PROJECT_ROOT, "_candidates")
+ALPHAS_ROOT = os.getenv("ALPHAS_ROOT", "alphas")
+CANDIDATES_ROOT = os.getenv("CANDIDATES_ROOT", "_candidates")
+ALPHAS_DIR = os.path.join(PROJECT_ROOT, ALPHAS_ROOT)
+CANDIDATES_DIR = os.path.join(PROJECT_ROOT, CANDIDATES_ROOT)
 ENSEMBLE_HISTORY_FILE = os.path.join(PROJECT_ROOT, "ensemble_history.json")
 PYTHON_EXEC = sys.executable
 BACKTESTER_SCRIPT = os.path.join(PROJECT_ROOT, "scripts/backtesting/backtester.py")
@@ -58,7 +61,7 @@ def run_backtest(alpha_list):
         print("No alphas to backtest. Returning baseline CAGR of -inf.")
         return -float('inf')
 
-    cmd = [PYTHON_EXEC, BACKTESTER_SCRIPT, "--alphas"] + alpha_list
+    cmd = [PYTHON_EXEC, BACKTESTER_SCRIPT, "--alphas"] + alpha_list + ["--alphas-dir", ALPHAS_ROOT]
     print(f"\n--- Running backtest for: {alpha_list} ---")
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=PROJECT_ROOT)
@@ -92,6 +95,11 @@ def run_backtest(alpha_list):
         return -float('inf')
 
 def main():
+    parser = argparse.ArgumentParser(description="Orchestrate alpha generation/training/backtesting.")
+    parser.add_argument("--llm-guidance", help="Optional extra guidance to pass to the LLM when proposing new alphas.")
+    args = parser.parse_args()
+
+    llm_guidance = args.llm_guidance or os.getenv("LLM_GUIDANCE", "")
     os.makedirs(ALPHAS_DIR, exist_ok=True)
     os.makedirs(CANDIDATES_DIR, exist_ok=True)
 
@@ -127,7 +135,7 @@ def main():
         
         print("\n--- Consulting LLM for new alpha strategy ---")
         try:
-            prompt, new_script_raw = get_new_alpha_idea(alpha_summary, baseline_cagr, failed_attempts_summary, data_schema)
+            prompt, new_script_raw = get_new_alpha_idea(alpha_summary, baseline_cagr, failed_attempts_summary, data_schema, guidance=llm_guidance)
             new_script = clean_llm_code(new_script_raw)
         except Exception as e:
             print(f"LLM call failed (network or auth issue): {e}")

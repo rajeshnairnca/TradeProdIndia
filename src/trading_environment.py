@@ -80,6 +80,7 @@ class DailyCrossSectionalEnv(gym.Env):
     def _reset_account_state(self):
         self.cash = float(config.INITIAL_CAPITAL)
         self.positions = np.zeros(self.n_stocks, dtype=np.float32)
+        self.prev_target_weights = np.zeros(self.n_stocks, dtype=np.float32)
         self.net_worth = float(config.INITIAL_CAPITAL)
         self.prev_net_worth = float(config.INITIAL_CAPITAL)
         self.current_step = 0
@@ -210,6 +211,18 @@ class DailyCrossSectionalEnv(gym.Env):
         else:
             stock_weights = np.zeros_like(stock_weights)
 
+        # Smooth weights to encourage holding periods
+        if np.any(self.prev_target_weights):
+            stock_weights = (1.0 - config.WEIGHT_SMOOTHING) * stock_weights + config.WEIGHT_SMOOTHING * self.prev_target_weights
+            # Renormalize after smoothing
+            stock_sum = np.sum(stock_weights)
+            if stock_sum > 1e-9:
+                stock_weights = stock_weights / stock_sum
+                stock_weights = stock_weights * max(0.0, 1.0 - cash_weight)
+            else:
+                stock_weights = np.zeros_like(stock_weights)
+        self.prev_target_weights = stock_weights.copy()
+
         # Dynamically adjust portfolio size based on market regime
         # Use a more concentrated portfolio in high-volatility markets to focus on best ideas.
         regime_feature = obs["global_features"][1]  # [VIX_z, combined_regime]
@@ -273,6 +286,9 @@ class DailyCrossSectionalEnv(gym.Env):
         
         turnover = np.sum(np.abs(trade_dollars)) / self.prev_net_worth if self.prev_net_worth > 0 else 0
         turnover_pen = config.TURNOVER_PENALTY * turnover
+        # Penalize weight changes to reduce churn (swing-friendly)
+        weight_change = np.sum(np.abs(stock_weights - self.prev_target_weights))
+        weight_change_pen = config.WEIGHT_CHANGE_PENALTY * weight_change
         
         leverage = portfolio_value / self.net_worth if self.net_worth > 0 else 1.0
         leverage_pen = config.LEVERAGE_PENALTY * max(0, leverage - 1.0)
@@ -304,7 +320,7 @@ class DailyCrossSectionalEnv(gym.Env):
         else:
             drag_active = True
         cash_drag_pen = config.CASH_DRAG_COEFF * cash_weight if drag_active else 0.0
-        reward = log_return - turnover_pen - leverage_pen - risk_penalty - cash_drag_pen
+        reward = log_return - turnover_pen - leverage_pen - risk_penalty - cash_drag_pen - weight_change_pen
         
         done = False
         if self.net_worth <= 0:
