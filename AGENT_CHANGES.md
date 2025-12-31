@@ -1,0 +1,25 @@
+# Agent Change Log
+
+This file tracks code changes made by the assistant so they can be reviewed or reverted.
+
+## 2025-12-31
+- Removed liquidity filter gating in `src/rule_backtester.py` (ADV now used only for slippage scaling).
+- Added region-aware data file selection in `src/config.py` (`TRADING_REGION` -> `data/daily_data_us.parquet` or `data/daily_data_india.parquet`), with `DATA_FILE` override.
+- Defaulted `UNIVERSE_FILTER` to `all` in `src/config.py`.
+- Routed ensemble/sweep outputs by region:
+  - `scripts/backtesting/backtester.py` -> `alphas/_ensembles/<region>/...`
+  - `scripts/backtesting/strategy_sweep.py` -> `alphas/_ensembles/<region>/_sweeps/...`
+  - `scripts/xgboost/backtest_xgb_alpha.py` -> `alphas/_ensembles/<region>/...`
+  - `src/walkforward.py` -> `alphas/_ensembles/<region>/...` for multi-strategy runs
+  - `scripts/orchestration/orchestrator.py` now reads ensemble results from `alphas/_ensembles/<region>/...`
+- Scoped orchestration history to region in `scripts/orchestration/orchestrator.py` (`ensemble_history_<region>.json`).
+- Added `regime` and `strategies` columns to each transaction row in `src/rule_backtester.py`.
+- Changed strategy selection in `src/rule_backtester.py` to apply only one strategy per day (first matching tag); if no tags match, no strategy is applied and the day stays in cash.
+- Added EMA smoothing option for regime calculation in `src/regime.py` with `REGIME_EMA_SPAN` in `src/config.py` (defaults to 10).
+- Increased regime smoothing windows and made them configurable in `src/config.py`:
+  - `REGIME_EMA_SPAN = 20`
+  - `ROLLING_WINDOW_FOR_VOL = 42`
+  - `REGIME_TREND_SHORT_WINDOW = 100`, `REGIME_TREND_LONG_WINDOW = 200`
+  - `REGIME_DISPERSION_MIN_PERIODS = 60`
+  - `src/regime.py` now uses these settings.
+- Reverted the single-strategy-per-day selection and regime smoothing/window changes, restoring the prior behavior and defaults.

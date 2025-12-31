@@ -138,6 +138,7 @@ class RuleBasedBacktester:
 
             state = get_regime_state(self.regime_table, current_date)
             active_strategies = self._select_strategies(state["regime_label"])
+            active_strategy_names = [strategy.name for strategy in active_strategies]
             combined_scores = self._combine_scores(active_strategies, current_date)
 
             dynamic_top_k = config.TOP_K
@@ -216,6 +217,8 @@ class RuleBasedBacktester:
                         "cash_usd": float(cash),
                         "portfolio_value_usd": float(np.sum(positions * prices)),
                         "cash_weight": float(cash_weight),
+                        "regime": state.get("regime_label", "unknown"),
+                        "strategies": ",".join(active_strategy_names),
                     }
                 )
 
