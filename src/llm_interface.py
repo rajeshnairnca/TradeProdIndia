@@ -2,7 +2,6 @@ import os
 import google.genai as genai
 from dotenv import load_dotenv
 import difflib
-from google.genai.types import GenerationConfig
 
 load_dotenv()
 
@@ -20,7 +19,7 @@ def clean_llm_code(llm_response: str) -> str:
     return cleaned_code
 
 def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, failed_attempts_summary: str, data_schema: str, guidance: str = "") -> tuple[str, str]:
-    """Asks the Gemini model to generate a new, diverse alpha strategy. Optional guidance can steer the idea."""
+    """Asks the Gemini model to generate a new, diverse rule-based strategy. Optional guidance can steer the idea."""
     guidance_text = f"\n\nADDITIONAL GUIDANCE FROM USER:\n{guidance}\n" if guidance else ""
     prompt = f"""
     You are an expert quantitative researcher tasked with designing a portfolio of diverse alpha strategies.
@@ -35,21 +34,24 @@ def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, faile
 
     {guidance_text}
 
-    Your task is to propose a NEW, CREATIVE alpha strategy that is likely to be UNCORRELATED with the existing successful ones and different from the failed attempts.
+    Your task is to propose a NEW, CREATIVE, fully deterministic rule-based alpha strategy that is likely to be UNCORRELATED with the existing successful ones and different from the failed attempts.
 
-    You must provide your answer as a Python script containing two things:
-    1. A function `feature_engineering(df: pd.DataFrame) -> pd.DataFrame` that takes a pandas DataFrame, adds new feature columns, and returns the modified DataFrame.
+    You must provide your answer as a Python script containing three things:
+    1. A function `generate_scores(df: pd.DataFrame) -> pd.Series` that takes the full market DataFrame and returns a numeric score for every row (same index).
     2. A string variable `DESCRIPTION` containing a one-sentence summary of the new alpha's strategy.
+    3. A list variable `REGIME_TAGS` describing which regimes this strategy is intended for.
 
     **Data Schema Reference:**
     The pandas DataFrame `full_data` that you will be manipulating has the following columns. Use these exact names in your code:
     `{data_schema}`
+    The DataFrame index is a MultiIndex with levels: date, ticker.
 
     CRITICAL INSTRUCTIONS:
-    - Your response MUST be ONLY a Python script with the `feature_engineering` function and the `DESCRIPTION` variable.
+    - Your response MUST be ONLY a Python script with the `generate_scores` function, `DESCRIPTION`, and `REGIME_TAGS`.
     - DO NOT include any other code, explanations, or markdown.
-    - The `feature_engineering` function should be self-contained.
-    - All new engineered features that should be used by the model must have names ending in `_z`.
+    - The `generate_scores` function must be deterministic (no randomness) and return a `pd.Series` indexed exactly like `df`.
+    - Avoid look-ahead bias: do not use negative shifts, forward-looking rolling windows, or future data.
+    - `REGIME_TAGS` must be a list containing any of: bull_low_vol, bull_high_vol, bear_low_vol, bear_high_vol.
     """
     response = client.models.generate_content(
         # model="gemini-2.5-pro",

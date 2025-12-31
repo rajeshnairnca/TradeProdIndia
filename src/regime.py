@@ -73,3 +73,66 @@ def compute_market_regime_table(df: pd.DataFrame) -> pd.DataFrame:
             "combined_regime",
         ]
     ]
+
+
+def get_regime_state(regime_table: pd.DataFrame | None, current_date) -> dict:
+    if regime_table is None or current_date not in regime_table.index:
+        return {
+            "trend_up": False,
+            "vol_high": False,
+            "dispersion_high": False,
+            "dispersion_low": False,
+            "breadth_low": False,
+            "breadth_high": False,
+            "regime_label": "unknown",
+        }
+    row = regime_table.loc[current_date]
+    return {
+        "trend_up": bool(row.get("trend_up", False)),
+        "vol_high": bool(row.get("vol_high", False)),
+        "dispersion_high": bool(row.get("dispersion_high", False)),
+        "dispersion_low": bool(row.get("dispersion_low", False)),
+        "breadth_low": bool(row.get("breadth_low", False)),
+        "breadth_high": bool(row.get("breadth_high", False)),
+        "regime_label": str(row.get("regime_label", "unknown")),
+    }
+
+
+def regime_top_k(state: dict, default_top_k: int) -> int:
+    if state.get("vol_high") and state.get("dispersion_low") and state.get("breadth_low"):
+        return 5
+    if state.get("vol_high") and state.get("dispersion_high"):
+        return 7
+    if (not state.get("vol_high")) and state.get("dispersion_high") and state.get("breadth_high"):
+        return 12
+    if (not state.get("vol_high")) and state.get("dispersion_high"):
+        return 10
+    if state.get("vol_high"):
+        return 6
+    return default_top_k
+
+
+def regime_gross_target(state: dict) -> float:
+    trend_up = bool(state.get("trend_up", False))
+    vol_high = bool(state.get("vol_high", False))
+    dispersion_high = bool(state.get("dispersion_high", False))
+    dispersion_low = bool(state.get("dispersion_low", False))
+    breadth_low = bool(state.get("breadth_low", False))
+    breadth_high = bool(state.get("breadth_high", False))
+
+    gross = 0.85
+    if (not trend_up) and vol_high:
+        gross = 0.6
+    elif (not trend_up) and (not vol_high):
+        gross = 0.75
+    elif vol_high and dispersion_low and breadth_low:
+        gross = 0.6
+    elif vol_high and dispersion_high:
+        gross = 0.8
+    elif (not vol_high) and dispersion_high and breadth_high:
+        gross = 1.05
+    elif (not vol_high) and dispersion_high:
+        gross = 0.95
+    elif (not vol_high) and dispersion_low:
+        gross = 0.85
+    return max(0.0, min(1.1, gross))

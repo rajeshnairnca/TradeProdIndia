@@ -1,8 +1,8 @@
 import numpy as np
 from . import config
 
-def get_target_weights(scores: np.ndarray, vol: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Converts raw model scores into a final portfolio allocation.
+def get_target_weights(scores: np.ndarray, vol: np.ndarray, mask: np.ndarray, top_k: int | None = None) -> np.ndarray:
+    """Converts raw strategy scores into a final portfolio allocation.
 
     Args:
         scores (np.ndarray): The raw output scores from the RL agent for each stock.
@@ -16,7 +16,8 @@ def get_target_weights(scores: np.ndarray, vol: np.ndarray, mask: np.ndarray) ->
     masked_scores = np.where(mask > 0.5, scores, -np.inf)
     
     # Determine the number of stocks to select (top k).
-    k = min(config.TOP_K, int(np.sum(mask)))
+    desired_k = top_k if top_k is not None else config.TOP_K
+    k = min(desired_k, int(np.sum(mask)))
     
     target_weights = np.zeros_like(scores, dtype=np.float32)
     

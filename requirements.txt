@@ -1,16 +1,10 @@
 # requirements.txt
 
-# Core machine learning and data handling
+# Core data handling
 numpy
 pandas
-torch
 matplotlib
-
-# Reinforcement learning suite from Stable Baselines3
-gymnasium
-stable-baselines3[extra]
-sb3-contrib
-optuna
+tqdm
 
 # For reading the parquet data file
 pyarrow
@@ -18,5 +12,5 @@ pyarrow
 # Gradient-boosted trees for tabular signals
 xgboost
 
-# The NEW, correct Google AI library
-google-genaisb3-contrib
+# Google AI library for LLM orchestration
+google-genai

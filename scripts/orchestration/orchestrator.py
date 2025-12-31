@@ -5,9 +5,10 @@ import subprocess
 import shutil
 import time
 import pandas as pd
-import inspect
 import argparse
 import hashlib
+import re
+import numpy as np
 
 # --- Path Setup ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,7 +16,8 @@ sys.path.append(PROJECT_ROOT)
 
 from src import config
 from src.llm_interface import get_new_alpha_idea, clean_llm_code
-from src.walkforward import run_walk_forward
+from src.strategy import load_strategies
+from src.strategy_sweep import sweep_strategy_combinations
 
 # --- CONFIGURATION ---
 MAX_ITERATIONS = 10
@@ -23,10 +25,14 @@ ALPHAS_ROOT = os.getenv("ALPHAS_ROOT", "alphas")
 CANDIDATES_ROOT = os.getenv("CANDIDATES_ROOT", "_candidates")
 ALPHAS_DIR = os.path.join(PROJECT_ROOT, ALPHAS_ROOT)
 CANDIDATES_DIR = os.path.join(PROJECT_ROOT, CANDIDATES_ROOT)
-ENSEMBLE_HISTORY_FILE = os.path.join(PROJECT_ROOT, "ensemble_history.json")
+ENSEMBLE_HISTORY_FILE = os.path.join(
+    PROJECT_ROOT,
+    f"ensemble_history_{config.TRADING_REGION}.json",
+)
+# TODO: Consider adding a supervised triple-barrier pathway (profit/stop/time labels) to generate swing-friendly signals, then feed those as features or signals into the allocator.
 PYTHON_EXEC = sys.executable
 BACKTESTER_SCRIPT = os.path.join(PROJECT_ROOT, "scripts/backtesting/backtester.py")
-TRAIN_SCRIPT = os.path.join(PROJECT_ROOT, "scripts/training/train_alpha.py")
+STRATEGY_FILE = "strategy.py"
 
 def make_ensemble_dirname(alpha_names: list[str]) -> str:
     """Generate a short, stable ensemble folder name with a hash suffix."""
@@ -42,10 +48,16 @@ def make_ensemble_dirname(alpha_names: list[str]) -> str:
     return f"{preview}__{digest}"
 
 def get_existing_alphas(alphas_dir):
-    """Gets a summary of existing alphas."""
+    """Gets a summary of existing rule-based strategies."""
     if not os.path.exists(alphas_dir):
         return "No alphas exist yet.", []
-    alpha_names = [d for d in os.listdir(alphas_dir) if os.path.isdir(os.path.join(alphas_dir, d)) and not d.startswith("_")]
+    alpha_names = [
+        d
+        for d in os.listdir(alphas_dir)
+        if os.path.isdir(os.path.join(alphas_dir, d))
+        and not d.startswith("_")
+        and os.path.exists(os.path.join(alphas_dir, d, STRATEGY_FILE))
+    ]
     summary_lines = []
     for name in alpha_names:
         desc_path = os.path.join(alphas_dir, name, "description.txt")
@@ -55,26 +67,23 @@ def get_existing_alphas(alphas_dir):
                 summary_lines.append(f"- {name}: {description}")
     return "\n".join(summary_lines) if summary_lines else "No alphas exist yet.", alpha_names
 
-def run_backtest(alpha_list):
-    """Runs the backtester for a given list of alphas and returns the CAGR."""
+def run_backtest(alpha_list, strategy_roots=None):
+    """Runs the backtester for a given list of strategies and returns the CAGR."""
     if not alpha_list:
-        print("No alphas to backtest. Returning baseline CAGR of -inf.")
-        return -float('inf')
+        print("No strategies to backtest. Returning baseline CAGR of -inf.")
+        return -float("inf")
 
-    cmd = [PYTHON_EXEC, BACKTESTER_SCRIPT, "--alphas"] + alpha_list + ["--alphas-dir", ALPHAS_ROOT]
+    cmd = [PYTHON_EXEC, BACKTESTER_SCRIPT, "--strategies"] + alpha_list
+    roots = strategy_roots or [ALPHAS_ROOT]
+    for root in roots:
+        cmd.extend(["--strategy-roots", root])
     print(f"\n--- Running backtest for: {alpha_list} ---")
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=PROJECT_ROOT)
         print(result.stdout)
         ensemble_name = make_ensemble_dirname(alpha_list)
-        results_candidates = [
-            os.path.join(ALPHAS_DIR, "_ensembles", ensemble_name, "results.json")
-        ]
-        if len(alpha_list) == 1:
-            results_candidates.append(os.path.join(ALPHAS_DIR, ensemble_name, "results.json"))
-        else:
-            legacy_name = "_vs_".join(sorted(alpha_list))
-            results_candidates.append(os.path.join(ALPHAS_DIR, "_ensembles", legacy_name, "results.json"))
+        region = config.TRADING_REGION
+        results_candidates = [os.path.join(ALPHAS_DIR, "_ensembles", region, ensemble_name, "results.json")]
 
         for results_path in results_candidates:
             if not os.path.exists(results_path):
@@ -94,9 +103,55 @@ def run_backtest(alpha_list):
             print(f"Stderr: {e.stderr}")
         return -float('inf')
 
+
+def validate_llm_strategy(script_text: str, sample_df: pd.DataFrame) -> tuple[bool, str]:
+    lookahead_patterns = [
+        r"center\s*=\s*True",
+        r"shift\s*\(\s*-\s*\d",
+        r"\blead\s*\(",
+        r"\bshift\s*\(\s*-\s*1",
+    ]
+    for pat in lookahead_patterns:
+        if re.search(pat, script_text):
+            return False, f"Lookahead-like pattern detected: {pat}"
+
+    script_globals = {}
+    try:
+        exec(script_text, script_globals)
+    except Exception as e:
+        return False, f"Script execution failed: {e}"
+
+    score_fn = script_globals.get("generate_scores")
+    if not callable(score_fn):
+        return False, "Missing generate_scores(df) function."
+
+    try:
+        scores = score_fn(sample_df)
+    except Exception as e:
+        return False, f"generate_scores failed on sample data: {e}"
+
+    if not isinstance(scores, pd.Series):
+        return False, "generate_scores must return a pandas Series."
+    if len(scores) != len(sample_df):
+        return False, "generate_scores returned wrong length."
+    if not scores.index.equals(sample_df.index):
+        return False, "generate_scores must return scores indexed like the input DataFrame."
+    numeric_scores = pd.to_numeric(scores, errors="coerce")
+    if numeric_scores.isna().all():
+        return False, "generate_scores returned all-NaN or non-numeric values."
+    if not np.isfinite(numeric_scores.fillna(0.0)).all():
+        return False, "generate_scores returned infinite values."
+
+    return True, "ok"
+
 def main():
     parser = argparse.ArgumentParser(description="Orchestrate alpha generation/training/backtesting.")
     parser.add_argument("--llm-guidance", help="Optional extra guidance to pass to the LLM when proposing new alphas.")
+    parser.add_argument("--sweep-baseline", action="store_true", help="Use a combination sweep to pick the best baseline ensemble.")
+    parser.add_argument("--sweep-min-size", type=int, default=1, help="Minimum strategy count for sweep combos.")
+    parser.add_argument("--sweep-max-size", type=int, default=None, help="Maximum strategy count for sweep combos.")
+    parser.add_argument("--sweep-max-combos", type=int, default=200, help="Maximum combinations to evaluate per sweep.")
+    parser.add_argument("--sweep-metric", default="cagr", choices=["cagr", "sharpe", "max_drawdown"], help="Metric to optimize during sweeps.")
     args = parser.parse_args()
 
     llm_guidance = args.llm_guidance or os.getenv("LLM_GUIDANCE", "")
@@ -126,7 +181,24 @@ def main():
         alpha_summary, existing_alpha_names = get_existing_alphas(ALPHAS_DIR)
         print("Current Ensemble:")
         print(alpha_summary)
-        baseline_cagr = run_backtest(existing_alpha_names)
+        baseline_combo = existing_alpha_names
+        if args.sweep_baseline and existing_alpha_names:
+            base_strategies = load_strategies(existing_alpha_names, [ALPHAS_ROOT])
+            strategies_by_name = {s.name: s for s in base_strategies}
+            sweep = sweep_strategy_combinations(
+                df=df,
+                strategies_by_name=strategies_by_name,
+                min_size=args.sweep_min_size,
+                max_size=args.sweep_max_size,
+                max_combos=args.sweep_max_combos,
+                seed=config.SEED,
+                metric=args.sweep_metric,
+            )
+            baseline_combo = list(sweep.best_combo)
+            baseline_cagr = sweep.best_metrics.get("CAGR", 0.0) / 100.0
+            print(f"Best baseline combo: {baseline_combo}")
+        else:
+            baseline_cagr = run_backtest(existing_alpha_names, strategy_roots=[ALPHAS_ROOT])
         print(f"Baseline Ensemble CAGR: {baseline_cagr:.2%}")
 
         failed_attempts_summary = "\n".join([f"- {item['summary']}" for item in history])
@@ -148,10 +220,24 @@ def main():
         try:
             script_globals = {}
             exec(new_script, script_globals)
-            description = script_globals['DESCRIPTION']
+            description = script_globals.get("DESCRIPTION", "").strip() or "LLM response did not contain a valid DESCRIPTION."
+            if not callable(script_globals.get("generate_scores")):
+                print("LLM response missing generate_scores(df). Skipping iteration.")
+                continue
+            if not script_globals.get("REGIME_TAGS"):
+                print("LLM response missing REGIME_TAGS. Skipping iteration.")
+                continue
         except Exception as e:
-            print(f"Could not parse LLM response for description: {e}")
-            description = "LLM response did not contain a valid DESCRIPTION variable."
+            print(f"Could not parse LLM response: {e}")
+            continue
+
+        sample_df = df.dropna(subset=["Close"]).tail(5000)
+        if sample_df.empty:
+            sample_df = df.tail(5000)
+        ok, reason = validate_llm_strategy(new_script, sample_df)
+        if not ok:
+            print(f"LLM strategy validation failed: {reason}")
+            continue
 
         print(f"LLM proposed change: {description}")
 
@@ -159,61 +245,45 @@ def main():
         candidate_dir = os.path.join(CANDIDATES_DIR, candidate_name)
         os.makedirs(candidate_dir, exist_ok=True)
 
-        with open(os.path.join(candidate_dir, "feature_engineering.py"), "w") as f:
+        with open(os.path.join(candidate_dir, STRATEGY_FILE), "w") as f:
             f.write(new_script)
         with open(os.path.join(candidate_dir, "description.txt"), "w") as f:
             f.write(description)
 
-        print(f"\n--- Training candidate alpha: {candidate_name} ---")
-        # The output of the training is the alpha directory, which is inside the candidate_dir
-        output_alpha_dir = os.path.join(candidate_dir, candidate_name)
-        train_cmd = [PYTHON_EXEC, TRAIN_SCRIPT, "--alpha-name", candidate_name, "--description", description, "--output-dir", candidate_dir]
-        try:
-            env = os.environ.copy()
-            env["PYTHONPATH"] = PROJECT_ROOT
-            # We need to pass the feature engineering file to the training script
-            train_cmd.extend(["--features-file", os.path.join(candidate_dir, "feature_engineering.py")])
-            
-            # Stream the output by not capturing it, allowing the user to see the progress
-            print("Training progress will be displayed below:")
-            subprocess.run(train_cmd, check=True, env=env, cwd=PROJECT_ROOT)
-
-        except subprocess.CalledProcessError as e:
-            print(f"Candidate training failed. Review the output above. Error: {e}")
-            shutil.rmtree(candidate_dir)
-            continue
-
         print("\n--- Evaluating candidate's contribution to the ensemble ---")
-        # Move the trained alpha to the main alphas directory
-        shutil.move(output_alpha_dir, os.path.join(ALPHAS_DIR, candidate_name))
-        
         new_cagr = -float('inf')
-        if config.ENABLE_WALK_FORWARD_VALIDATION:
-            print(f"--- Evaluating candidate via Walk-Forward Validation: {candidate_name} ---")
-            metrics = run_walk_forward(candidate_name)
-            if metrics and 'CAGR' in metrics:
-                # run_walk_forward returns CAGR in percent; convert to decimal for fair comparison
-                new_cagr = metrics['CAGR'] / 100.0
-                print(f"Walk-Forward CAGR for {candidate_name}: {new_cagr:.2%}")
-            else:
-                print(f"Walk-forward validation failed for {candidate_name}.")
+        if args.sweep_baseline and existing_alpha_names:
+            print(f"--- Evaluating candidate via sweep: {candidate_name} ---")
+            candidate_list = existing_alpha_names + [candidate_name]
+            candidate_strategies = load_strategies(candidate_list, [ALPHAS_ROOT, CANDIDATES_ROOT])
+            strategies_by_name = {s.name: s for s in candidate_strategies}
+            sweep = sweep_strategy_combinations(
+                df=df,
+                strategies_by_name=strategies_by_name,
+                min_size=args.sweep_min_size,
+                max_size=args.sweep_max_size,
+                max_combos=args.sweep_max_combos,
+                seed=config.SEED,
+                metric=args.sweep_metric,
+            )
+            new_cagr = sweep.best_metrics.get("CAGR", 0.0) / 100.0
+            print(f"Best combo with candidate: {list(sweep.best_combo)}")
+            print(f"Sweep CAGR for ensemble with {candidate_name}: {new_cagr:.2%}")
         else:
             print(f"--- Evaluating candidate via Simple Backtest: {candidate_name} ---")
             new_ensemble_list = existing_alpha_names + [candidate_name]
-            new_cagr = run_backtest(new_ensemble_list)
+            new_cagr = run_backtest(new_ensemble_list, strategy_roots=[ALPHAS_ROOT, CANDIDATES_ROOT])
             print(f"New Ensemble CAGR (with candidate): {new_cagr:.2%}")
 
         if new_cagr > baseline_cagr:
             print(f"\n--- ✅ SUCCESS: Candidate {candidate_name} improved performance. Promoting. ---")
-            # The candidate dir is now empty, except for the feature_engineering.py and description.txt
-            # The trained model is in the ALPHAS_DIR. We can keep the candidate dir for reference
-            pass
+            shutil.move(candidate_dir, os.path.join(ALPHAS_DIR, candidate_name))
         else:
             print(f"\n--- 😔 FAILURE: Candidate {candidate_name} did not improve performance. Keeping artifacts for inspection. ---")
             history.append({"summary": description, "code": new_script})
             with open(ENSEMBLE_HISTORY_FILE, 'w') as f:
                 json.dump(history, f, indent=2)
-            # Leave alphas/candidate and candidate_dir for debugging
+            # Leave candidate_dir for debugging
         
         # Do not delete candidate_dir; keep for inspection
 

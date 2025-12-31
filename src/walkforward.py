@@ -2,104 +2,58 @@ import os
 import sys
 import argparse
 import json
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from sb3_contrib import RecurrentPPO
-from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecFrameStack, SubprocVecEnv
-from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.utils import set_random_seed
 
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # --- Path Setup ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 
-from src.trading_environment import DailyCrossSectionalEnv
-from src.models import TransformerFeatureExtractor
 from src import config
-from src.utils import calculate_performance_metrics
 from src.regime import compute_market_regime_table
+from src.rule_backtester import RuleBasedBacktester
+from src.strategy import load_strategies
+from src.utils import calculate_performance_metrics
 
-def run_walk_forward(alpha_name: str):
+
+def _make_ensemble_dirname(strategy_names: list[str]) -> str:
+    if len(strategy_names) == 1:
+        return strategy_names[0]
+    import hashlib
+
+    sorted_names = sorted(strategy_names)
+    digest = hashlib.sha1("::".join(sorted_names).encode("utf-8")).hexdigest()[:8]
+    preview = "_vs_".join(name[:12] for name in sorted_names[:3])
+    if len(sorted_names) > 3:
+        preview += f"_plus{len(sorted_names) - 3}"
+    return f"{preview}__{digest}"
+
+
+def run_walk_forward(strategy_names: list[str], strategy_roots: list[str] | None = None):
     """
-    Performs walk-forward validation for a given alpha strategy.
-
-    Args:
-        alpha_name: The name of the alpha to be evaluated.
+    Performs walk-forward validation for one or more rule-based strategies.
     """
-    print(f"--- Starting Walk-Forward Validation for: {alpha_name} ---")
+    roots = strategy_roots or ["alphas"]
+    print(f"--- Starting Walk-Forward Validation for: {strategy_names} ---")
 
-    # 1. Load Data
     df = pd.read_parquet(os.path.join(PROJECT_ROOT, config.DATA_FILE))
+    strategies = load_strategies(strategy_names, roots)
+    if not strategies:
+        raise ValueError("No strategies found for walk-forward validation.")
 
-    # Apply alpha-specific feature engineering if available
-    alpha_dir = os.path.join(PROJECT_ROOT, 'alphas', alpha_name)
-    fe_path = os.path.join(alpha_dir, 'feature_engineering.py')
-    if os.path.exists(fe_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(f"{alpha_name}.feature_engineering", fe_path)
-        fe_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fe_module)
-        if hasattr(fe_module, "feature_engineering"):
-            df = fe_module.feature_engineering(df)
-        else:
-            print(f"Warning: feature_engineering not found in {fe_path}, proceeding without applying.")
-    else:
-        print(f"Warning: feature_engineering.py not found for {alpha_name}; proceeding without applying.")
-
-    feature_keys = sorted([c for c in df.columns if c.endswith('_z')])
-    
-    # --- Robust Sector Mapping ---
-    with open(os.path.join(PROJECT_ROOT, config.SECTOR_MAP_FILE), 'r') as f:
-        symbol_to_sector_name = json.load(f)
-    
-    all_sectors = sorted(list(set(symbol_to_sector_name.values())))
-    if "Unknown" not in all_sectors:
-        all_sectors.append("Unknown")
-
-    sector_name_to_id = {name: i for i, name in enumerate(all_sectors)}
-    num_sectors = len(all_sectors)
-
-    universe = df.index.get_level_values('ticker').unique().tolist()
-    symbol_to_sector_id = {
-        sym: sector_name_to_id[symbol_to_sector_name.get(sym, "Unknown")]
-        for sym in universe
-    }
-
-    all_dates = df.index.get_level_values('date').unique().sort_values()
-    
-    # 2. Calculate Splits
+    all_dates = df.index.get_level_values("date").unique().sort_values()
     trading_days_per_year = 252
     train_window = config.TRAIN_YEARS * trading_days_per_year
     validation_window = config.VALIDATION_YEARS * trading_days_per_year
-    
+
     overall_net_worths = []
     all_fold_results = {}
 
-    # --- Env Maker ---
-    def make_env(rank, seed=0, df=None, regime_table=None, is_backtest=False):
-        def _init():
-            env = DailyCrossSectionalEnv(
-                df=df,
-                symbol_to_sector_id=symbol_to_sector_id,
-                num_sectors=num_sectors,
-                universe=universe,
-                feature_keys=feature_keys,
-                regime_table=regime_table,
-                apply_regime_top_k=config.USE_REGIME_SYSTEM,
-                is_backtest=is_backtest,
-            )
-            return env
-        set_random_seed(seed)
-        return _init
-
     for i in range(config.N_SPLITS):
         print(f"--- Running Fold {i+1}/{config.N_SPLITS} ---")
-        
-        train_start_idx = i * validation_window 
+
+        train_start_idx = i * validation_window
         train_end_idx = train_start_idx + train_window
         validation_start_idx = train_end_idx
         validation_end_idx = validation_start_idx + validation_window
@@ -114,179 +68,114 @@ def run_walk_forward(alpha_name: str):
         print(f"Train Period: {train_start_date.date()} to {train_end_date.date()}")
         print(f"Validation Period: {validation_start_date.date()} to {validation_end_date.date()}")
 
-        # --- Data Splitting for this Fold ---
-        fold_full_train_df = df[(df.index.get_level_values('date') >= train_start_date) & (df.index.get_level_values('date') < train_end_date)]
-        fold_validation_df = df[(df.index.get_level_values('date') >= validation_start_date) & (df.index.get_level_values('date') < validation_end_date)]
+        fold_df = df[
+            (df.index.get_level_values("date") >= train_start_date)
+            & (df.index.get_level_values("date") < validation_end_date)
+        ]
+        fold_regime_table = compute_market_regime_table(fold_df)
 
-        # Compute regime table only on data available through validation end (no lookahead)
-        fold_regime_df = pd.concat([fold_full_train_df, fold_validation_df])
-        fold_regime_table = compute_market_regime_table(fold_regime_df)
+        backtester = RuleBasedBacktester(fold_df, strategies, regime_table=fold_regime_table)
+        result = backtester.run(start_date=validation_start_date, end_date=validation_end_date)
 
-        fold_train_dates = fold_full_train_df.index.get_level_values('date').unique().sort_values()
-        
-        eval_df = None
-        if len(fold_train_dates) > 252: # Only use early stopping if fold is long enough
-            split_idx = int(len(fold_train_dates) * 0.9)
-            train_dates_for_fold = fold_train_dates[:split_idx]
-            eval_dates_for_fold = fold_train_dates[split_idx:]
-            
-            train_df = fold_full_train_df[fold_full_train_df.index.get_level_values('date').isin(train_dates_for_fold)]
+        fold_net_worths = result.equity_curve
+        if not fold_net_worths:
+            print(f"No results for fold {i+1}; skipping.")
+            continue
 
-            # For the eval_df, include preceding 200 days for lookback calculations
-            eval_start_date_in_fold = eval_dates_for_fold[0]
-            eval_start_index_in_fold = fold_train_dates.get_loc(eval_start_date_in_fold)
-            context_start_index = max(0, eval_start_index_in_fold - 200)
-            final_eval_dates = fold_train_dates[context_start_index:]
-            eval_df = fold_full_train_df[fold_full_train_df.index.get_level_values('date').isin(final_eval_dates)]
-        else:
-            print("Training fold too short for early stopping, training for full duration.")
-            train_df = fold_full_train_df
-
-        # 4. Train Model for this fold
-        train_env_raw = DailyCrossSectionalEnv(train_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=False, regime_table=fold_regime_table, apply_regime_top_k=config.USE_REGIME_SYSTEM)
-        train_env = DummyVecEnv([lambda: train_env_raw])
-        train_env = VecFrameStack(train_env, n_stack=config.LSTM_N_STACK)
-        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.)
-
-        policy_kwargs = {
-            "features_extractor_class": TransformerFeatureExtractor,
-            "features_extractor_kwargs": dict(features_dim=config.FEATURES_DIM, num_sectors=num_sectors, sector_embed_dim=config.SECTOR_EMBED_DIM)
-        }
-
-        model = RecurrentPPO(
-            RecurrentActorCriticPolicy,
-            train_env,
-            policy_kwargs=policy_kwargs,
-            **config.PPO_PARAMS,
-            tensorboard_log=None,
-            device=config.DEVICE,
-            seed=config.SEED
-        )
-
-        # --- Setup Early Stopping for the Fold ---
-        callbacks = []
-        if eval_df is not None:
-            print("Setting up early stopping for this fold.")
-            eval_env_raw = DailyCrossSectionalEnv(eval_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=config.USE_REGIME_SYSTEM)
-            eval_env = DummyVecEnv([lambda: eval_env_raw])
-            eval_env = VecFrameStack(eval_env, n_stack=config.LSTM_N_STACK)
-            eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.)
-            eval_env.obs_rms = train_env.obs_rms
-
-            stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=150, min_evals=40, verbose=0)
-            eval_callback = EvalCallback(eval_env, 
-                                         best_model_save_path=None, 
-                                         log_path=None, 
-                                         eval_freq=max(config.PPO_PARAMS['n_steps'] * 2 // config.N_ENVS, 1), 
-                                         deterministic=True, 
-                                         render=False, 
-                                         callback_after_eval=stop_train_callback)
-            callbacks.append(eval_callback)
-
-        print(f"Training fold {i+1} model...")
-        model.learn(total_timesteps=config.TRAINING_TIMESTEPS, callback=callbacks)
-
-        train_env.save("vec_normalize_temp.pkl")
-
-        # 5. Evaluate Model on the validation fold
-        validation_env_raw = DailyCrossSectionalEnv(fold_validation_df, symbol_to_sector_id, num_sectors, universe=universe, feature_keys=feature_keys, is_backtest=True, regime_table=fold_regime_table, apply_regime_top_k=config.USE_REGIME_SYSTEM)
-        validation_env = DummyVecEnv([lambda: validation_env_raw])
-        validation_env = VecFrameStack(validation_env, n_stack=config.LSTM_N_STACK)
-        validation_env = VecNormalize.load("vec_normalize_temp.pkl", validation_env)
-        validation_env.training = False
-        validation_env.norm_reward = False
-
-        obs = validation_env.reset()
-        done, lstm_states = False, None
-        fold_net_worths = [config.INITIAL_CAPITAL]
-        steps_this_fold = 0
-
-        while not done:
-            action, lstm_states = model.predict(obs, state=lstm_states, deterministic=True)
-            # Regime-aware sizing now handled inside the environment
-            obs, _, dones, info = validation_env.step(action)
-            done = bool(dones[0])
-            net_worth = info[0]['net_worth']
-            fold_net_worths.append(net_worth)
-            steps_this_fold += 1
-
-        # Basic diagnostics for the fold
         fold_min = min(fold_net_worths)
         fold_max = max(fold_net_worths)
         fold_final = fold_net_worths[-1]
-        # Log diagnostics
-        print(f"Fold {i+1} diagnostics: steps={steps_this_fold}, min_worth={fold_min:,.2f}, max_worth={fold_max:,.2f}, final_worth={fold_final:,.2f}")
-        diag_path = os.path.join(PROJECT_ROOT, 'alphas', alpha_name, f"fold_{i+1}_diagnostics.json")
-        os.makedirs(os.path.dirname(diag_path), exist_ok=True)
-        with open(diag_path, 'w') as f:
-            json.dump({
-                "fold": i + 1,
-                "steps": steps_this_fold,
-                "min_worth": float(fold_min),
-                "max_worth": float(fold_max),
-                "final_worth": float(fold_final),
-            }, f, indent=2)
+        print(f"Fold {i+1} diagnostics: min_worth={fold_min:,.2f}, max_worth={fold_max:,.2f}, final_worth={fold_final:,.2f}")
 
-        # 6. Store results for the fold
-        fold_cagr = calculate_performance_metrics(pd.Series(fold_net_worths), len(fold_validation_df.index.get_level_values('date').unique()))["CAGR"]
-        print(f"Fold {i+1} CAGR: {fold_cagr:.2f}%")
-        all_fold_results[f"Fold_{i+1}"] = {"CAGR": fold_cagr}
+        output_root = roots[0]
+        ensemble_dir = _make_ensemble_dirname(strategy_names)
+        if len(strategy_names) == 1:
+            diag_path = os.path.join(PROJECT_ROOT, output_root, strategy_names[0], f"fold_{i+1}_diagnostics.json")
+        else:
+            diag_path = os.path.join(
+                PROJECT_ROOT,
+                output_root,
+                "_ensembles",
+                config.TRADING_REGION,
+                ensemble_dir,
+                f"fold_{i+1}_diagnostics.json",
+            )
+        os.makedirs(os.path.dirname(diag_path), exist_ok=True)
+        with open(diag_path, "w") as f:
+            json.dump(
+                {
+                    "fold": i + 1,
+                    "min_worth": float(fold_min),
+                    "max_worth": float(fold_max),
+                    "final_worth": float(fold_final),
+                },
+                f,
+                indent=2,
+            )
+
+        fold_days = len(fold_net_worths)
+        fold_metrics = calculate_performance_metrics(pd.Series(fold_net_worths), fold_days)
+        print(f"Fold {i+1} CAGR: {fold_metrics['CAGR']:.2f}%")
+        all_fold_results[f"Fold_{i+1}"] = fold_metrics
 
         if not overall_net_worths:
             overall_net_worths.extend(fold_net_worths)
         else:
-            last_overall_worth = overall_net_worths[-1]
-            scaled_fold_worths = [w * (last_overall_worth / fold_net_worths[0]) for w in fold_net_worths[1:]]
-            overall_net_worths.extend(scaled_fold_worths)
+            last_overall = overall_net_worths[-1]
+            scaled_fold = [w * (last_overall / fold_net_worths[0]) for w in fold_net_worths[1:]]
+            overall_net_worths.extend(scaled_fold)
 
-    # 7. Aggregate and Report Final Results
     print("\n--- Walk-Forward Validation Summary ---")
-    
-    if os.path.exists("vec_normalize_temp.pkl"):
-        os.remove("vec_normalize_temp.pkl")
-
     if not overall_net_worths:
         print("Validation could not be completed. No results to show.")
         return None
 
-    total_days = config.N_SPLITS * validation_window
+    total_days = len(overall_net_worths)
     final_metrics = calculate_performance_metrics(pd.Series(overall_net_worths), total_days)
 
     print(f"Overall CAGR: {final_metrics['CAGR']:.2f}%")
     print(f"Overall Sharpe Ratio: {final_metrics['Sharpe Ratio']:.2f}")
     print(f"Overall Max Drawdown: {final_metrics['Max Drawdown']:.2f}%")
 
-    # --- SAVE WALK-FORWARD PLOT ---
-    plot_dir = os.path.join(PROJECT_ROOT, 'alphas', alpha_name)
+    output_root = roots[0]
+    ensemble_dir = _make_ensemble_dirname(strategy_names)
+    if len(strategy_names) == 1:
+        plot_dir = os.path.join(PROJECT_ROOT, output_root, strategy_names[0])
+    else:
+        plot_dir = os.path.join(PROJECT_ROOT, output_root, "_ensembles", config.TRADING_REGION, ensemble_dir)
     os.makedirs(plot_dir, exist_ok=True)
-    plot_path = os.path.join(plot_dir, f"{alpha_name}_walkforward_performance.png")
+    label = strategy_names[0] if len(strategy_names) == 1 else ensemble_dir
+    plot_path = os.path.join(plot_dir, f"{label}_walkforward_performance.png")
     plt.figure(figsize=(12, 6))
     plt.plot(overall_net_worths)
-    plt.title(f'Walk-Forward Validation Equity Curve for "{alpha_name}"')
+    plt.title(f'Walk-Forward Validation Equity Curve for "{label}"')
     plt.xlabel("Trading Days")
     plt.ylabel("Portfolio Value")
     plt.grid(True)
     plt.savefig(plot_path)
     print(f"Saved walk-forward performance chart to {plot_path}")
 
-    # --- SAVE WALK-FORWARD RESULTS ---
-    output_path = os.path.join(plot_dir, 'walk_forward_results.json')
-    print(f'Saving walk-forward validation results to {output_path}')
-    final_metrics_serializable = {k: (v.item() if isinstance(v, np.generic) else v) for k, v in final_metrics.items()}
-    with open(output_path, 'w') as f:
-        json.dump(final_metrics_serializable, f, indent=2)
-    
+    output_path = os.path.join(plot_dir, "walk_forward_results.json")
+    print(f"Saving walk-forward validation results to {output_path}")
+    with open(output_path, "w") as f:
+        json.dump(final_metrics, f, indent=2)
+
     return final_metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run walk-forward validation for a single alpha.")
-    parser.add_argument("--alpha-name", type=str, required=True, help="Name of the alpha to validate.")
-    parser.add_argument("--timesteps", type=int, help="Override config.TRAINING_TIMESTEPS for quick tests.")
+    parser = argparse.ArgumentParser(description="Run walk-forward validation for one or more strategies.")
+    parser.add_argument("--alpha-name", type=str, help="Name of a single strategy to validate.")
+    parser.add_argument("--strategies", nargs="+", help="List of strategies to validate together.")
+    parser.add_argument("--strategy-roots", action="append", default=[], help="Root folder containing strategies.")
     args = parser.parse_args()
-    
-    # Allow quick override of training timesteps for walk-forward
-    if args.timesteps:
-        config.TRAINING_TIMESTEPS = args.timesteps
-    
-    run_walk_forward(args.alpha_name)
+
+    roots = args.strategy_roots or ["alphas"]
+    if args.strategies:
+        names = args.strategies
+    elif args.alpha_name:
+        names = [args.alpha_name]
+    else:
+        raise SystemExit("Provide --alpha-name or --strategies.")
+
+    run_walk_forward(names, strategy_roots=roots)

@@ -16,7 +16,10 @@ def calculate_performance_metrics(net_worth_series: pd.Series, num_days: int):
     initial_value = net_worth_series.iloc[0]
     final_value = net_worth_series.iloc[-1]
     num_years = num_days / 252.0  # Assuming 252 trading days in a year
-    cagr = ((final_value / initial_value) ** (1 / num_years)) - 1 if num_years > 0 else 0
+    if num_years > 0 and initial_value > 0 and final_value > 0:
+        cagr = ((final_value / initial_value) ** (1 / num_years)) - 1
+    else:
+        cagr = 0
 
     # Sharpe Ratio
     returns = net_worth_series.pct_change().dropna()

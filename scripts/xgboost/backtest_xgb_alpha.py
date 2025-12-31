@@ -72,12 +72,13 @@ def compute_gross_target(past_returns: List[float], base_gross: float, target_vo
 def allocate_day(day_df: pd.DataFrame, preds: np.ndarray, top_k: int, gross_cap: float, max_weight: float, sector_cap: float, symbol_to_sector: Dict[str, str]) -> Dict:
     day_df = day_df.copy()
     day_df["pred"] = preds
-    # Attach sector info
-    if "ticker" in day_df.columns:
-        tickers = day_df["ticker"]
-    else:
-        tickers = [idx[1] if isinstance(idx, tuple) and len(idx) > 1 else "" for idx in day_df.index]
-    day_df["sector"] = [symbol_to_sector.get(t, "Unknown") for t in tickers]
+    use_sector_cap = bool(symbol_to_sector)
+    if use_sector_cap:
+        if "ticker" in day_df.columns:
+            tickers = day_df["ticker"]
+        else:
+            tickers = [idx[1] if isinstance(idx, tuple) and len(idx) > 1 else "" for idx in day_df.index]
+        day_df["sector"] = [symbol_to_sector.get(t, "Unknown") for t in tickers]
 
     day_df = day_df.sort_values("pred", ascending=False)
     selected = day_df.head(top_k)
@@ -88,16 +89,17 @@ def allocate_day(day_df: pd.DataFrame, preds: np.ndarray, top_k: int, gross_cap:
     weights = np.full(n, gross_cap / n if n > 0 else 0.0, dtype=np.float32)
     weights = np.minimum(weights, max_weight)
 
-    # Sector caps
-    sectors = selected["sector"].tolist()
-    sector_weights: Dict[str, float] = {}
-    for i, sec in enumerate(sectors):
-        sector_weights[sec] = sector_weights.get(sec, 0.0) + weights[i]
-    for i, sec in enumerate(sectors):
-        cap = sector_cap * gross_cap
-        if sector_weights[sec] > cap and sector_weights[sec] > 0:
-            scale = cap / sector_weights[sec]
-            weights[i] *= scale
+    # Sector caps (optional)
+    if use_sector_cap:
+        sectors = selected["sector"].tolist()
+        sector_weights: Dict[str, float] = {}
+        for i, sec in enumerate(sectors):
+            sector_weights[sec] = sector_weights.get(sec, 0.0) + weights[i]
+        for i, sec in enumerate(sectors):
+            cap = sector_cap * gross_cap
+            if sector_weights[sec] > cap and sector_weights[sec] > 0:
+                scale = cap / sector_weights[sec]
+                weights[i] *= scale
     total_w = np.sum(weights)
     if total_w > gross_cap and total_w > 0:
         weights = weights * (gross_cap / total_w)
@@ -113,9 +115,7 @@ def backtest(model, feature_cols: List[str], test_df: pd.DataFrame, top_k: int, 
     if test_df.empty:
         raise RuntimeError("No test data available for backtest.")
 
-    with open(os.path.join(PROJECT_ROOT, config.SECTOR_MAP_FILE), "r") as f:
-        symbol_to_sector_name = json.load(f)
-    symbol_to_sector = symbol_to_sector_name
+    symbol_to_sector: Dict[str, str] = {}
 
     dates = test_df.index.get_level_values("date").unique().sort_values()
     net_worth = config.INITIAL_CAPITAL
@@ -232,7 +232,13 @@ def main():
         max_gross=args.max_gross,
     )
 
-    ensemble_dir = os.path.join(PROJECT_ROOT, "alphas", "_ensembles", f"{args.alpha_name}_xgb_simple")
+    ensemble_dir = os.path.join(
+        PROJECT_ROOT,
+        "alphas",
+        "_ensembles",
+        config.TRADING_REGION,
+        f"{args.alpha_name}_xgb_simple",
+    )
     os.makedirs(ensemble_dir, exist_ok=True)
 
     pd.DataFrame(results["transactions"]).to_csv(os.path.join(ensemble_dir, "transactions.csv"), index=False)

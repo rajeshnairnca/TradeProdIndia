@@ -2,11 +2,9 @@
 # Produces a single parquet with indicators, rolling stats, VIX features, and cross-sectional z-scores.
 
 import argparse
-import json
 import os
 import shutil
 import sys
-import time
 
 import numpy as np
 import pandas as pd
@@ -16,18 +14,616 @@ from tqdm import tqdm
 
 # --- Defaults ---
 DEFAULT_DATA_FILENAME = os.path.join("data", "daily_data.parquet")
-DEFAULT_SECTOR_MAP_FILE = os.path.join("data", "symbol_to_sector_map.json")
-DEFAULT_STOCK_LIST = [
-    "ZS", "WDAY", "TXN", "TRI", "TEAM", "SNPS", "SHOP", "ROP", "QCOM", "PLTR", "PDD", "PANW", "ON",
-    "NXPI", "NVDA", "MU", "MSTR", "MSFT", "MRVL", "META", "MCHP", "LRCX", "KLAC", "INTU", "INTC",
-    "GOOGL", "GOOG", "GFS", "FTNT", "DDOG", "CRWD", "CDW", "CDNS", "AVGO", "ASML", "ARM", "APP",
-    "AMD", "AMAT", "ADSK", "ADI", "ADBE", "AAPL", "DASH", "MRNA", "ENPH", "REGN", "LCID", "ALGN",
-    "LULU", "BIIB", "KHC", "FANG", "KDP", "FISV", "ILMN", "CHTR", "ODFL", "MDLZ", "PEP", "VRTX",
-    "CMCSA", "SIRI", "AMGN", "SBUX", "CTSH", "CPRT", "ISRG", "PYPL", "VRSK", "ROST", "SMCI", "CTAS",
-    "PAYX", "AEP", "PCAR", "RIVN", "HON", "ABNB", "ADP", "COST", "EXC", "CSGP", "XEL", "EA", "DXCM",
-    "JD", "MELI", "MNST", "NFLX", "TMUS", "BKR", "IDXX", "ORLY", "FAST", "GILD", "BKNG", "DLTR", "BABA",
-    "DISCA", "CEG",
-]
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
+# from src.universe import NASDAQ100_TICKERS
+
+# DEFAULT_STOCK_LIST_NASDAQ100 = NASDAQ100_TICKERS
+
+DEFAULT_STOCK_LIST = ["ACC.NS", "APLAPOLLO.NS", "AUBANK.NS", "ADANIENSOL.NS", "ADANIENT.NS", "ADANIGREEN.NS", "ADANIPORTS.NS", "ADANIPOWER.NS", "ATGL.NS", "AWL.NS", "ABCAPITAL.NS", "ABFRL.NS", "ALKEM.NS", "AMBUJACEM.NS", "APOLLOHOSP.NS", "APOLLOTYRE.NS", "ASHOKLEY.NS", "ASIANPAINT.NS", "ASTRAL.NS", "AUROPHARMA.NS", "DMART.NS", "AXISBANK.NS", "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BAJAJHLDNG.NS", "BALKRISIND.NS", "BANDHANBNK.NS", "BANKBARODA.NS", "BANKINDIA.NS", "BATAINDIA.NS", "BERGEPAINT.NS", "BDL.NS", "BEL.NS", "BHARATFORG.NS", "BHEL.NS", "BPCL.NS", "BHARTIARTL.NS", "BIOCON.NS", "BOSCHLTD.NS", "BRITANNIA.NS", "CGPOWER.NS", "CANBK.NS", "CHOLAFIN.NS", "CIPLA.NS", "COALINDIA.NS", "COFORGE.NS", "COLPAL.NS", "CONCOR.NS", "COROMANDEL.NS", "CROMPTON.NS", "CUMMINSIND.NS", "DLF.NS", "DABUR.NS", "DALBHARAT.NS", "DEEPAKNTR.NS", "DELHIVERY.NS", "DEVYANI.NS", "DIVISLAB.NS", "DIXON.NS", "LALPATHLAB.NS", "DRREDDY.NS", "EICHERMOT.NS", "ESCORTS.NS", "NYKAA.NS", "FEDERALBNK.NS", "FACT.NS", "FORTIS.NS", "GAIL.NS", "GLAND.NS", "GODREJCP.NS", "GODREJPROP.NS", "GRASIM.NS", "FLUOROCHEM.NS", "GUJGASLTD.NS", "HCLTECH.NS", "HDFCAMC.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HAVELLS.NS", "HEROMOTOCO.NS", "HINDALCO.NS", "HAL.NS", "HINDPETRO.NS", "HINDUNILVR.NS", "ICICIBANK.NS", "ICICIGI.NS", "ICICIPRULI.NS", "IDFCFIRSTB.NS", "ITC.NS", "INDIANB.NS", "INDHOTEL.NS", "IOC.NS", "IRCTC.NS", "IRFC.NS", "IGL.NS", "INDUSTOWER.NS", "INDUSINDBK.NS", "NAUKRI.NS", "INFY.NS", "INDIGO.NS", "IPCALAB.NS", "JSWENERGY.NS", "JSWSTEEL.NS", "JINDALSTEL.NS", "JUBLFOOD.NS", "KPITTECH.NS", "KOTAKBANK.NS", "LTTS.NS", "LICHSGFIN.NS", "LTIM.NS", "LT.NS", "LAURUSLABS.NS", "LICI.NS", "LUPIN.NS", "MRF.NS", "LODHA.NS", "M&MFIN.NS", "M&M.NS", "MANKIND.NS", "MARICO.NS", "MARUTI.NS", "MFSL.NS", "MAXHEALTH.NS", "MAZDOCK.NS", "MSUMI.NS", "MPHASIS.NS", "MUTHOOTFIN.NS", "NHPC.NS", "NMDC.NS", "NTPC.NS", "NAVINFLUOR.NS", "NESTLEIND.NS", "OBEROIRLTY.NS", "ONGC.NS", "OIL.NS", "PAYTM.NS", "POLICYBZR.NS", "PIIND.NS", "PAGEIND.NS", "PATANJALI.NS", "PERSISTENT.NS", "PETRONET.NS", "PIDILITIND.NS", "PEL.NS", "POLYCAB.NS", "POONAWALLA.NS", "PFC.NS", "POWERGRID.NS", "PRESTIGE.NS", "PGHH.NS", "PNB.NS", "RECLTD.NS", "RVNL.NS", "RELIANCE.NS", "SBICARD.NS", "SBILIFE.NS", "SRF.NS", "MOTHERSON.NS", "SHREECEM.NS", "SHRIRAMFIN.NS", "SIEMENS.NS", "SONACOMS.NS", "SBIN.NS", "SAIL.NS", "SUNPHARMA.NS", "SUNTV.NS", "SYNGENE.NS", "TVSMOTOR.NS", "TATACHEM.NS", "TATACOMM.NS", "TCS.NS", "TATACONSUM.NS", "TATAELXSI.NS", "TATAMOTORS.NS", "TATAPOWER.NS", "TATASTEEL.NS", "TECHM.NS", "RAMCOCEM.NS", "TITAN.NS", "TORNTPHARM.NS", "TORNTPOWER.NS", "TRENT.NS", "TIINDIA.NS", "UPL.NS", "ULTRACEMCO.NS", "UNIONBANK.NS", "UBL.NS", "VBL.NS", "VEDL.NS", "IDEA.NS", "VOLTAS.NS", "WIPRO.NS", "YESBANK.NS", "ZEEL.NS", "ZYDUSLIFE.NS"]
+
+
+DEFAULT_STOCK_LIST_US = ["NVDA",
+"AAPL",
+"MSFT",
+"AMZN",
+"GOOGL",
+"GOOG",
+"META",
+"AVGO",
+"TSLA",
+"BRK.B",
+"LLY",
+"WMT",
+"JPM",
+"V",
+"ORCL",
+"MA",
+"XOM",
+"JNJ",
+"PLTR",
+"ABBV",
+"BAC",
+"NFLX",
+"COST",
+"AMD",
+"HD",
+"PG",
+"GE",
+"MU",
+"CSCO",
+"CVX",
+"KO",
+"UNH",
+"WFC",
+"MS",
+"IBM",
+"CAT",
+"GS",
+"MRK",
+"AXP",
+"PM",
+"CRM",
+"RTX",
+"APP",
+"TMUS",
+"ABT",
+"MCD",
+"TMO",
+"LRCX",
+"C",
+"AMAT",
+"DIS",
+"ISRG",
+"LIN",
+"PEP",
+"INTU",
+"QCOM",
+"INTC",
+"GEV",
+"SCHW",
+"AMGN",
+"T",
+"BKNG",
+"TJX",
+"VZ",
+"BA",
+"UBER",
+"NEE",
+"BLK",
+"APH",
+"ANET",
+"ACN",
+"KLAC",
+"DHR",
+"TXN",
+"NOW",
+"SPGI",
+"COF",
+"GILD",
+"ADBE",
+"BSX",
+"PFE",
+"UNP",
+"LOW",
+"SYK",
+"PGR",
+"ADI",
+"PANW",
+"WELL",
+"DE",
+"HON",
+"ETN",
+"MDT",
+"CB",
+"BX",
+"CRWD",
+"PLD",
+"COP",
+"VRTX",
+"KKR",
+"LMT",
+"PH",
+"CEG",
+"BMY",
+"NEM",
+"CMCSA",
+"HCA",
+"ADP",
+"HOOD",
+"MCK",
+"CVS",
+"CME",
+"DASH",
+"MO",
+"SBUX",
+"SO",
+"NKE",
+"ICE",
+"MMC",
+"GD",
+"DUK",
+"MCO",
+"SNPS",
+"WM",
+"TT",
+"CDNS",
+"MMM",
+"DELL",
+"UPS",
+"APO",
+"MAR",
+"USB",
+"CRH",
+"HWM",
+"PNC",
+"AMT",
+"ABNB",
+"NOC",
+"BK",
+"REGN",
+"SHW",
+"ORLY",
+"ELV",
+"RCL",
+"CTAS",
+"GM",
+"AON",
+"GLW",
+"EMR",
+"EQIX",
+"ECL",
+"MNST",
+"TDG",
+"JCI",
+"CI",
+"WMB",
+"FCX",
+"ITW",
+"WBD",
+"CMI",
+"MDLZ",
+"TEL",
+"FDX",
+"HLT",
+"CSX",
+"AJG",
+"RSG",
+"COR",
+"NSC",
+"TRV",
+"CL",
+"TFC",
+"MSI",
+"PWR",
+"ADSK",
+"COIN",
+"AEP",
+"KMI",
+"SPG",
+"STX",
+"CVNA",
+"WDC",
+"FTNT",
+"ROST",
+"SRE",
+"AFL",
+"PCAR",
+"SLB",
+"EOG",
+"WDAY",
+"AZO",
+"NDAQ",
+"BDX",
+"ZTS",
+"NXPI",
+"APD",
+"PYPL",
+"LHX",
+"VST",
+"ALL",
+"IDXX",
+"DLR",
+"F",
+"MET",
+"O",
+"PSX",
+"URI",
+"EA",
+"D",
+"VLO",
+"EW",
+"CAH",
+"MPC",
+"CMG",
+"GWW",
+"CBRE",
+"ROP",
+"DDOG",
+"TTWO",
+"AME",
+"FAST",
+"OKE",
+"AIG",
+"AMP",
+"PSA",
+"BKR",
+"CTVA",
+"DAL",
+"AXON",
+"CARR",
+"ROK",
+"EXC",
+"MPWR",
+"TGT",
+"XEL",
+"MSCI",
+"LVS",
+"FANG",
+"YUM",
+"ETR",
+"DHI",
+"FICO",
+"OXY",
+"PAYX",
+"CTSH",
+"CCL",
+"PEG",
+"TRGP",
+"PRU",
+"XYZ",
+"KR",
+"GRMN",
+"EBAY",
+"A",
+"IQV",
+"HIG",
+"CCI",
+"KDP",
+"MLM",
+"EL",
+"CPRT",
+"VMC",
+"GEHC",
+"NUE",
+"HSY",
+"WAB",
+"VTR",
+"STT",
+"FISV",
+"ED",
+"ARES",
+"UAL",
+"SYY",
+"PCG",
+"RMD",
+"KEYS",
+"SNDK",
+"ACGL",
+"EXPE",
+"MCHP",
+"FIS",
+"WEC",
+"OTIS",
+"EQT",
+"KMB",
+"XYL",
+"LYV",
+"FIX",
+"KVUE",
+"ODFL",
+"HPE",
+"RJF",
+"IR",
+"WTW",
+"HUM",
+"MTB",
+"VRSK",
+"TER",
+"FITB",
+"NRG",
+"SYF",
+"VICI",
+"DG",
+"ROL",
+"KHC",
+"IBKR",
+"MTD",
+"CSGP",
+"FSLR",
+"EXR",
+"ADM",
+"EME",
+"HBAN",
+"BRO",
+"AEE",
+"ATO",
+"CHTR",
+"DOV",
+"EFX",
+"ULTA",
+"DTE",
+"WRB",
+"EXE",
+"CBOE",
+"TSCO",
+"TPR",
+"NTRS",
+"AVB",
+"BR",
+"PPL",
+"DXCM",
+"FE",
+"LEN",
+"CINF",
+"AWK",
+"ES",
+"BIIB",
+"OMC",
+"CNP",
+"CFG",
+"VLTO",
+"STE",
+"GIS",
+"STLD",
+"LULU",
+"IRM",
+"JBL",
+"DLTR",
+"STZ",
+"EQR",
+"HAL",
+"TDY",
+"RF",
+"HUBB",
+"LDOS",
+"EIX",
+"PPG",
+"DVN",
+"PHM",
+"WAT",
+"VRSN",
+"TROW",
+"KEY",
+"L",
+"ON",
+"RL",
+"WSM",
+"NTAP",
+"CMS",
+"DRI",
+"LUV",
+"CPAY",
+"HPQ",
+"LH",
+"PTC",
+"IP",
+"TSN",
+"SBAC",
+"TPL",
+"CHD",
+"PODD",
+"SW",
+"CTRA",
+"CNC",
+"EXPD",
+"NVR",
+"NI",
+"WST",
+"TYL",
+"INCY",
+"PFG",
+"DGX",
+"AMCR",
+"CHRW",
+"PKG",
+"TRMB",
+"GPN",
+"JBHT",
+"TTD",
+"IT",
+"MKC",
+"SNA",
+"CDW",
+"ZBH",
+"FTV",
+"SMCI",
+"Q",
+"BG",
+"IFF",
+"GPC",
+"LII",
+"PNR",
+"WY",
+"ESS",
+"INVH",
+"DD",
+"GDDY",
+"GEN",
+"TKO",
+"EVRG",
+"ALB",
+"DOW",
+"LNT",
+"HOLX",
+"APTV",
+"MAA",
+"COO",
+"J",
+"TXT",
+"FOX",
+"FOXA",
+"DECK",
+"ERIE",
+"FFIV",
+"PSKY",
+"VTRS",
+"EG",
+"BALL",
+"AVY",
+"DPZ",
+"BBY",
+"UHS",
+"LYB",
+"ALLE",
+"KIM",
+"SOLV",
+"NDSN",
+"HII",
+"IEX",
+"MAS",
+"JKHY",
+"HRL",
+"REG",
+"AKAM",
+"WYNN",
+"BEN",
+"ZBRA",
+"CLX",
+"HST",
+"UDR",
+"BF.B",
+"AIZ",
+"CF",
+"MRNA",
+"CPT",
+"IVZ",
+"HAS",
+"SWK",
+"EPAM",
+"BLDR",
+"DOC",
+"ALGN",
+"GL",
+"DAY",
+"RVTY",
+"FDS",
+"BXP",
+"PNW",
+"SJM",
+"AES",
+"NCLH",
+"MGM",
+"BAX",
+"CRL",
+"NWSA",
+"SWKS",
+"AOS",
+"TECH",
+"TAP",
+"HSIC",
+"MOH",
+"FRT",
+"PAYC",
+"APA",
+"POOL",
+"ARE",
+"CPB",
+"CAG",
+"GNRC",
+"DVA",
+"MOS",
+"MTCH",
+"LW",
+"NWS",
+"ZS",
+ "WDAY",
+ "TXN",
+ "TRI",
+ "TEAM",
+ "SNPS",
+ "SHOP",
+ "ROP",
+ "QCOM",
+ "PLTR",
+ "PDD",
+ "PANW",
+ "ON",
+ "NVDA",
+ "MU",
+ "MSTR",
+ "MSFT",
+ "MRVL",
+ "META",
+ "MCHP",
+ "LRCX",
+ "KLAC",
+ "INTU",
+ "INTC",
+ "GOOG",
+ "GFS",
+ "FTNT",
+ "DDOG",
+ "CRWD",
+ "CDW",
+ "CDNS",
+ "AVGO",
+ "ASML",
+ "ARM",
+ "APP",
+ "AMAT",
+ "ADSK",
+ "ADI",
+ "ADBE",
+ "AAPL",
+ "DASH",
+ "MRNA",
+ "ENPH",
+ "REGN",
+ "LCID",
+ "ALGN",
+ "BIIB",
+ "KHC",
+ "FANG",
+ "KDP",
+ "FISV",
+ "ILMN",
+ "CHTR",
+ "ODFL",
+ "MDLZ",
+ "PEP",
+ "VRTX",
+ "SIRI",
+ "AMGN",
+ "SBUX",
+ "CTSH",
+ "CPRT",
+ "ISRG",
+ "PYPL",
+ "VRSK",
+ "ROST",
+ "SMCI",
+ "CTAS",
+ "AEP",
+ "PCAR",
+ "RIVN",
+ "HON",
+ "ABNB",
+ "ADP",
+ "COST",
+ "EXC",
+ "CSGP",
+ "XEL",
+ "EA",
+ "DXCM",
+"JD",
+ "MELI",
+ "MNST",
+ "NFLX",
+ "TMUS",
+ "BKR",
+ "IDXX",
+ "ORLY",
+ "FAST",
+ "GILD",
+ "BKNG",
+ "DLTR",
+ "BABA",
+"DISCA",
+ "CEG","IONQ",
+"QBTS",
+"RGTI",
+"QUBT",]
 
 DEFAULT_PERIOD = "20y"
 DEFAULT_INTERVAL = "1d"
@@ -40,7 +636,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Download market data, engineer features, and save a consolidated parquet.")
     parser.add_argument("--stocks-file", help="Path to a newline-delimited list of tickers. If omitted, the built-in list is used.")
     parser.add_argument("--output-file", default=DEFAULT_DATA_FILENAME, help="Path to parquet output (default: data/daily_data.parquet)")
-    parser.add_argument("--sector-map-file", default=DEFAULT_SECTOR_MAP_FILE, help="Path to sector map JSON (default: data/symbol_to_sector_map.json)")
     parser.add_argument("--period", default=DEFAULT_PERIOD, help="yfinance history period (default: 20y)")
     parser.add_argument("--interval", default=DEFAULT_INTERVAL, help="yfinance interval (default: 1d)")
     parser.add_argument("--min-trading-days", type=int, default=DEFAULT_MIN_TRADING_DAYS, help="Minimum days per ticker to keep (default: 50)")
@@ -83,6 +678,43 @@ def normalize_features_cross_sectional(df: pd.DataFrame, columns_to_normalize: l
             )
     return df
 
+def add_swing_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds swing-friendly features: distance-from-MA ratios, relative volume, and time embeddings."""
+    df = df.copy()
+    # One-period log return z-score per ticker (rolling)
+    if 'log_return' in df.columns:
+        df['log_return_z'] = df.groupby('ticker')['log_return'].transform(
+            lambda x: (x - x.rolling(window=21, min_periods=10).mean()) / (x.rolling(window=21, min_periods=10).std() + 1e-9)
+        )
+    if 'Close' in df.columns and 'SMA_50' in df.columns:
+        df['dist_sma50'] = (df['Close'] - df['SMA_50']) / (df['SMA_50'] + 1e-9)
+    if 'Close' in df.columns and 'SMA_20' in df.columns:
+        df['dist_sma20'] = (df['Close'] - df['SMA_20']) / (df['SMA_20'] + 1e-9)
+    if 'Volume' in df.columns and 'SMA20_Volume' in df.columns:
+        df['rvol_20'] = df['Volume'] / (df['SMA20_Volume'] + 1e-9)
+
+    # Cross-sectional z-scores for new ratios
+    for col in ['dist_sma50', 'dist_sma20', 'rvol_20']:
+        if col in df.columns:
+            df[f"{col}_z"] = df.groupby("date")[col].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
+
+    # Time embeddings
+    if isinstance(df.index, pd.MultiIndex) and 'date' in df.index.names:
+        dates = pd.to_datetime(df.index.get_level_values('date'))
+    elif 'date' in df.columns:
+        dates = pd.to_datetime(df['date'])
+    else:
+        dates = None
+    if dates is not None:
+        dow = dates.dt.dayofweek
+        month = dates.dt.month
+        df['dow_sin'] = np.sin(2 * np.pi * dow / 7)
+        df['dow_cos'] = np.cos(2 * np.pi * dow / 7)
+        df['month_sin'] = np.sin(2 * np.pi * month / 12)
+        df['month_cos'] = np.cos(2 * np.pi * month / 12)
+
+    return df
+
 
 def compute_rolling_vix_z(vix_df: pd.DataFrame, rolling_window: int) -> pd.DataFrame:
     """Compute VIX and its rolling z-score using only past data."""
@@ -113,26 +745,7 @@ def main():
 
     print("Starting optimized data preparation for RL model...")
 
-    # --- 1. Fetch and Save Sector Information ---
-    print(f"\nFetching sector data for {len(stock_list)} stocks...")
-    symbol_to_sector_map = {}
-    for ticker_str in tqdm(stock_list, desc="Fetching Sectors"):
-        try:
-            ticker_obj = yf.Ticker(ticker_str)
-            info = ticker_obj.info
-            sector = info.get('sector', 'Unknown')
-            symbol_to_sector_map[ticker_str] = sector
-            time.sleep(0.05)
-        except Exception as e:
-            print(f"\nCould not fetch info for {ticker_str}. Setting to 'Unknown'. Error: {e}")
-            symbol_to_sector_map[ticker_str] = "Unknown"
-
-    os.makedirs(os.path.dirname(args.sector_map_file), exist_ok=True)
-    with open(args.sector_map_file, 'w') as f:
-        json.dump(symbol_to_sector_map, f, indent=4)
-    print(f"Sector map saved to '{args.sector_map_file}'")
-
-    # --- 2. Data Download ---
+    # --- 1. Data Download ---
     all_stock_data = {}
     print(f"\nDownloading data from yfinance for {len(stock_list)} stocks ({args.period} period)...")
     for ticker in tqdm(stock_list, desc="Downloading Stocks"):
@@ -150,7 +763,7 @@ def main():
     if vix_df.empty:
         print(f"WARNING: No data for VIX {args.vix_ticker}. VIX features will be missing.")
 
-    # --- 3. Indicator Calculation ---
+    # --- 2. Indicator Calculation ---
     print("\nCalculating technical indicators...")
     processed_stock_data = {}
     for ticker, df in tqdm(all_stock_data.items(), desc="Calculating Indicators"):
@@ -161,7 +774,7 @@ def main():
     if not vix_df.empty:
         vix_indicators = calculate_indicators(vix_df.copy())
 
-    # --- 4. Stock History Analysis & Filtering ---
+    # --- 3. Stock History Analysis & Filtering ---
     print("\nFiltering stocks by history length and NaNs in required features...")
     required_cols = [
         'RSI_14', 'SMA_20', 'SMA_50', 'SMA_250', 'ROC_10', 'ROC_50',
@@ -169,6 +782,9 @@ def main():
     ]
     full_history_stocks = {}
     for ticker, df in processed_stock_data.items():
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = np.nan
         cleaned = df.dropna(subset=required_cols)
         if len(cleaned) >= args.min_trading_days:
             full_history_stocks[ticker] = cleaned
@@ -178,7 +794,7 @@ def main():
     if not full_history_stocks:
         print("\nFATAL: No stocks had sufficient data. Exiting."); sys.exit(1)
 
-    # --- 5. Consolidate, Pre-calculate, and Merge ---
+    # --- 4. Consolidate, Pre-calculate, and Merge ---
     print("\nConsolidating all data into a single DataFrame...")
     all_data_list = []
     for ticker, stock_df in tqdm(full_history_stocks.items(), desc="Consolidating"):
@@ -229,12 +845,14 @@ def main():
 
     # Cross-sectional z-score per date (no lookahead)
     master_df = normalize_features_cross_sectional(master_df, required_cols)
+    # Add swing-friendly features (distance from MAs, relative volume, time embeddings)
+    master_df = add_swing_features(master_df)
 
     # Set final index
     master_df.set_index(['date', 'ticker'], inplace=True)
     master_df.sort_index(inplace=True)
 
-    # --- 6. Save to a Single High-Performance File ---
+    # --- 5. Save to a Single High-Performance File ---
     print(f"\nSaving consolidated data to '{args.output_file}'...")
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
     if os.path.exists('daily_data'):
