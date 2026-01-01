@@ -23,3 +23,11 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - `REGIME_DISPERSION_MIN_PERIODS = 60`
   - `src/regime.py` now uses these settings.
 - Reverted the single-strategy-per-day selection and regime smoothing/window changes, restoring the prior behavior and defaults.
+- Added `scripts/ml_regime/ml_strategy_selector.py` to train an ML selector that predicts the best strategy per day and reports a stitched backtest (no switching costs).
+- Updated `scripts/ml_regime/ml_strategy_selector.py` to label by forward-window returns, add `--label-horizon`, and report majority/random/top-k accuracy.
+- Added ML-driven hybrid backtest support:
+  - `src/rule_backtester.py` accepts an optional `strategy_selector` hook.
+  - `scripts/ml_regime/ml_strategy_selector.py` now runs a hybrid backtest and writes `transactions.csv` and `results.json`.
+- Updated ML selector to enforce a minimum hold period (`--hold-days`, defaults to `--label-horizon`) and evaluate decision accuracy at switch points.
+- Replaced fixed hold with dynamic switching: the ML selector now switches only after `--confirm-days` consecutive predictions for a new strategy.
+- Reworked `scripts/ml_regime/ml_strategy_selector.py` into a supervised regime classifier and hybrid backtest using predicted regimes to choose strategies.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,8 @@ class RuleBasedBacktester:
         regime_table: pd.DataFrame | None = None,
         initial_capital: float | None = None,
         apply_regime_overlays: bool = True,
+        strategy_selector: Callable[[pd.Timestamp, dict, list[StrategySpec]], list[StrategySpec] | None]
+        | None = None,
     ):
         self.df = df
         universe_filter = config.UNIVERSE_FILTER
@@ -46,6 +48,7 @@ class RuleBasedBacktester:
         self.regime_table = regime_table
         self.initial_capital = initial_capital if initial_capital is not None else config.INITIAL_CAPITAL
         self.apply_regime_overlays = apply_regime_overlays and config.USE_REGIME_SYSTEM
+        self.strategy_selector = strategy_selector
 
         self.strategies = list(strategies)
         if not self.strategies:
@@ -137,7 +140,13 @@ class RuleBasedBacktester:
             adv = np.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
 
             state = get_regime_state(self.regime_table, current_date)
-            active_strategies = self._select_strategies(state["regime_label"])
+            selected = None
+            if self.strategy_selector is not None:
+                selected = self.strategy_selector(current_date, state, self.strategies)
+            if selected is None:
+                active_strategies = self._select_strategies(state["regime_label"])
+            else:
+                active_strategies = list(selected)
             active_strategy_names = [strategy.name for strategy in active_strategies]
             combined_scores = self._combine_scores(active_strategies, current_date)
 
