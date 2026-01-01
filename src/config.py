@@ -28,9 +28,27 @@ def _env_str(name: str, default: str) -> str:
         return default
     return val.strip()
 
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
 # ---- Portfolio Configuration ----
 INITIAL_CAPITAL = 1_000_000.0
-TRAIN_RATIO = 0.7
+TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.15
 TOP_K = 10
 ADV_LOOKBACK = 21
@@ -74,3 +92,9 @@ N_SPLITS = 1  # Number of chronological splits
 TRAIN_YEARS = 3  # Number of years for each training set
 VALIDATION_YEARS = 1  # Number of years for each validation set
 SEED = 42
+
+# ---- Regime Detection Configuration ----
+REGIME_MODE = _env_str("REGIME_MODE", "heuristic").lower()
+HMM_N_COMPONENTS = _env_int("HMM_N_COMPONENTS", 4)
+HMM_WARMUP_PERIOD = _env_int("HMM_WARMUP_PERIOD", 2520)  # ~10 years
+HMM_STEP_SIZE = _env_int("HMM_STEP_SIZE", 21)  # ~1 month

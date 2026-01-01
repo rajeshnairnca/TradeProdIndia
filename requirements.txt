@@ -14,3 +14,4 @@ xgboost
 
 # Google AI library for LLM orchestration
 google-genai
+hmmlearn

@@ -1,5 +1,7 @@
 import argparse
+import itertools
 import json
+import math
 import os
 import sys
 from datetime import datetime
@@ -7,6 +9,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from concurrent.futures import ProcessPoolExecutor
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(PROJECT_ROOT)
@@ -15,6 +18,78 @@ from src import config
 from src.regime import compute_market_regime_table
 from src.rule_backtester import RuleBasedBacktester
 from src.strategy import list_strategy_names, load_strategies
+
+_WORK_DF = None
+_WORK_REGIME_TABLE = None
+_WORK_STRATEGIES_BY_NAME = None
+_WORK_STRATEGIES = None
+_WORK_PRED_BY_DATE = None
+_WORK_HYBRID_START = None
+_WORK_HYBRID_END = None
+
+
+def _init_mapping_worker(data_path, strategy_names, strategy_roots, pred_by_date, hybrid_start, hybrid_end):
+    global _WORK_DF
+    global _WORK_REGIME_TABLE
+    global _WORK_STRATEGIES_BY_NAME
+    global _WORK_STRATEGIES
+    global _WORK_PRED_BY_DATE
+    global _WORK_HYBRID_START
+    global _WORK_HYBRID_END
+
+    df = pd.read_parquet(data_path)
+    regime_table = compute_market_regime_table(df)
+    strategies = load_strategies(strategy_names, strategy_roots)
+    strategies_by_name = {strategy.name: strategy for strategy in strategies}
+
+    _WORK_DF = df
+    _WORK_REGIME_TABLE = regime_table
+    _WORK_STRATEGIES = strategies
+    _WORK_STRATEGIES_BY_NAME = strategies_by_name
+    _WORK_PRED_BY_DATE = pred_by_date
+    _WORK_HYBRID_START = hybrid_start
+    _WORK_HYBRID_END = hybrid_end
+
+
+def _apply_predicted_state_worker(state, predicted: str) -> None:
+    state["regime_label"] = predicted
+    if predicted == "bull_low_vol":
+        state["trend_up"] = True
+        state["vol_high"] = False
+    elif predicted == "bull_high_vol":
+        state["trend_up"] = True
+        state["vol_high"] = True
+    elif predicted == "bear_high_vol":
+        state["trend_up"] = False
+        state["vol_high"] = True
+    elif predicted == "bear_low_vol":
+        state["trend_up"] = False
+        state["vol_high"] = False
+
+
+def _evaluate_mapping_worker(args):
+    regime_labels, combo = args
+    mapping = dict(zip(regime_labels, combo))
+
+    def selector(current_date, state, _available):
+        predicted = _WORK_PRED_BY_DATE.get(current_date)
+        if not predicted:
+            return None
+        _apply_predicted_state_worker(state, predicted)
+        chosen = mapping.get(predicted)
+        if not chosen:
+            return None
+        strategy = _WORK_STRATEGIES_BY_NAME.get(chosen)
+        return [strategy] if strategy else None
+
+    backtester = RuleBasedBacktester(
+        _WORK_DF,
+        _WORK_STRATEGIES,
+        regime_table=_WORK_REGIME_TABLE,
+        strategy_selector=selector,
+    )
+    result = backtester.run(start_date=_WORK_HYBRID_START, end_date=_WORK_HYBRID_END)
+    return result.metrics.get("CAGR", 0.0), mapping
 
 
 def _build_features(df: pd.DataFrame, regime_table: pd.DataFrame) -> pd.DataFrame:
@@ -86,6 +161,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=config.TRAIN_RATIO, help="Train split ratio.")
     parser.add_argument("--confirm-days", type=int, default=10, help="Required consecutive days before switching.")
     parser.add_argument("--output-root", default="runs", help="Root directory for outputs.")
+    parser.add_argument("--jobs", type=int, default=1, help="CPU threads for model training (1 = serial).")
+    parser.add_argument(
+        "--mapping-search",
+        action="store_true",
+        help="Exhaustively map one strategy per regime and pick the best CAGR.",
+    )
+    parser.add_argument(
+        "--mapping-allow-reuse",
+        action="store_true",
+        help="Allow strategies to repeat across regimes during mapping search.",
+    )
+    parser.add_argument(
+        "--mapping-max",
+        type=int,
+        default=None,
+        help="Optional cap on the number of mappings to evaluate.",
+    )
+    parser.add_argument(
+        "--mapping-jobs",
+        type=int,
+        default=1,
+        help="Parallel workers for mapping search (1 = serial).",
+    )
     return parser.parse_args()
 
 
@@ -133,21 +231,32 @@ def main() -> None:
     X_train, y_train = features.loc[train_idx], y.loc[train_idx]
     X_test = features.loc[test_idx]
 
-    model = xgb.XGBClassifier(
-        n_estimators=150,
-        max_depth=3,
-        learning_rate=0.1,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        objective="multi:softprob",
-        num_class=len(label_names),
-        eval_metric="mlogloss",
-        random_state=config.SEED,
-    )
-    model.fit(X_train, y_train)
-
-    pred_ids = model.predict(X_test)
-    pred_probs = model.predict_proba(X_test)
+    jobs = max(1, int(args.jobs))
+    train_label_ids = sorted(y_train.unique().tolist())
+    model_trained = False
+    if len(train_label_ids) < 2:
+        only_id = int(train_label_ids[0]) if train_label_ids else 0
+        pred_ids = np.full(len(X_test), only_id, dtype=int)
+        pred_probs = np.zeros((len(X_test), len(label_names)), dtype=float)
+        if len(label_names) > 0:
+            pred_probs[:, only_id] = 1.0
+    else:
+        model = xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=3,
+            learning_rate=0.1,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="multi:softprob",
+            num_class=len(label_names),
+            eval_metric="mlogloss",
+            random_state=config.SEED,
+            n_jobs=jobs,
+        )
+        model.fit(X_train, y_train)
+        model_trained = True
+        pred_ids = model.predict(X_test)
+        pred_probs = model.predict_proba(X_test)
     pred_labels = pd.Series(pred_ids, index=X_test.index).map(id_to_label)
     confirm_days = max(1, args.confirm_days)
     held_pred_labels = _apply_confirmed_switch(pred_labels, confirm_days)
@@ -181,6 +290,9 @@ def main() -> None:
         "confirm_days": confirm_days,
         "start_date": args.start_date,
         "end_date": args.end_date,
+        "model_trained": model_trained,
+        "train_label_count": len(train_label_ids),
+        "train_labels": [id_to_label[idx] for idx in train_label_ids],
         "accuracy": accuracy,
         "daily_accuracy": float((pred_labels == actual_labels).mean()),
         "majority_accuracy": majority_acc,
@@ -188,16 +300,8 @@ def main() -> None:
         **topk_results,
         "note": "Supervised classifier predicts regime labels; accuracy uses confirmed switches.",
     }
-    with open(os.path.join(output_dir, "ml_regime_results.json"), "w") as f:
-        json.dump(results, f, indent=2)
-
-    out_df = pd.DataFrame(
-        {
-            "predicted_regime": held_pred_labels,
-            "actual_regime": labels.loc[test_idx],
-        }
-    )
-    out_df.to_csv(os.path.join(output_dir, "ml_regime_daily.csv"))
+    results["mapping_search"] = bool(args.mapping_search)
+    results["mapping_jobs"] = max(1, int(args.mapping_jobs))
 
     pred_by_date = held_pred_labels.copy()
     strategies_by_name = {strategy.name: strategy for strategy in strategies}
@@ -206,10 +310,7 @@ def main() -> None:
         active = [s for s in available if not s.regime_tags or regime_label in s.regime_tags]
         return active if active else available
 
-    def selector(current_date, state, _available):
-        predicted = pred_by_date.get(current_date)
-        if not predicted:
-            return None
+    def _apply_predicted_state(state: dict, predicted: str) -> None:
         state["regime_label"] = predicted
         if predicted == "bull_low_vol":
             state["trend_up"] = True
@@ -223,17 +324,118 @@ def main() -> None:
         elif predicted == "bear_low_vol":
             state["trend_up"] = False
             state["vol_high"] = False
-        return _select_for_regime(predicted, list(strategies_by_name.values()))
+
+    def _run_hybrid(mapping: dict[str, str] | None):
+        def selector(current_date, state, _available):
+            predicted = pred_by_date.get(current_date)
+            if not predicted:
+                return None
+            _apply_predicted_state(state, predicted)
+            if mapping is None:
+                return _select_for_regime(predicted, list(strategies_by_name.values()))
+            chosen = mapping.get(predicted)
+            if not chosen:
+                return None
+            strategy = strategies_by_name.get(chosen)
+            return [strategy] if strategy else None
+
+        hybrid_backtester = RuleBasedBacktester(
+            df,
+            strategies,
+            regime_table=regime_table,
+            strategy_selector=selector,
+        )
+        return hybrid_backtester.run(start_date=hybrid_start, end_date=hybrid_end)
 
     hybrid_start = test_idx.min()
     hybrid_end = test_idx.max() + pd.Timedelta(days=1)
-    hybrid_backtester = RuleBasedBacktester(
-        df,
-        strategies,
-        regime_table=regime_table,
-        strategy_selector=selector,
+    best_mapping = None
+    best_mapping_cagr = None
+    mapping_total = None
+    mappings_evaluated = None
+
+    if args.mapping_search:
+        regime_labels = list(label_names)
+        strategy_names = [s.name for s in strategies]
+        if not args.mapping_allow_reuse and len(strategy_names) < len(regime_labels):
+            raise ValueError(
+                "Not enough strategies for unique mapping per regime. "
+                f"Strategies={len(strategy_names)}, Regimes={len(regime_labels)}."
+            )
+        if args.mapping_allow_reuse:
+            mapping_iter = itertools.product(strategy_names, repeat=len(regime_labels))
+            mapping_total = len(strategy_names) ** len(regime_labels)
+        else:
+            mapping_iter = itertools.permutations(strategy_names, len(regime_labels))
+            mapping_total = math.perm(len(strategy_names), len(regime_labels))
+
+        if args.mapping_max and mapping_total and args.mapping_max < mapping_total:
+            mapping_iter = itertools.islice(mapping_iter, args.mapping_max)
+            mapping_total = args.mapping_max
+
+        best_metrics = None
+        mappings_evaluated = 0
+        progress_interval = max(1, min(500, mapping_total // 20)) if mapping_total else 1
+
+        mapping_jobs = max(1, int(args.mapping_jobs))
+        if mapping_jobs == 1:
+            for combo in mapping_iter:
+                mapping = dict(zip(regime_labels, combo))
+                result = _run_hybrid(mapping)
+                mappings_evaluated += 1
+                cagr = result.metrics.get("CAGR", 0.0)
+                if best_mapping_cagr is None or cagr > best_mapping_cagr:
+                    best_mapping_cagr = cagr
+                    best_mapping = mapping
+                    best_metrics = result
+                if mappings_evaluated % progress_interval == 0 or mappings_evaluated == mapping_total:
+                    print(f"Mapping search: {mappings_evaluated}/{mapping_total} evaluated")
+        else:
+            with ProcessPoolExecutor(
+                max_workers=mapping_jobs,
+                initializer=_init_mapping_worker,
+                initargs=(
+                    data_path,
+                    [s.name for s in strategies],
+                    strategy_roots,
+                    pred_by_date,
+                    hybrid_start,
+                    hybrid_end,
+                ),
+            ) as executor:
+                args_iter = ((regime_labels, combo) for combo in mapping_iter)
+                for cagr, mapping in executor.map(_evaluate_mapping_worker, args_iter, chunksize=1):
+                    mappings_evaluated += 1
+                    if best_mapping_cagr is None or cagr > best_mapping_cagr:
+                        best_mapping_cagr = cagr
+                        best_mapping = mapping
+                    if mappings_evaluated % progress_interval == 0 or mappings_evaluated == mapping_total:
+                        print(f"Mapping search: {mappings_evaluated}/{mapping_total} evaluated")
+
+        if best_mapping is None:
+            raise RuntimeError("Mapping search did not produce any results.")
+        if best_metrics is None:
+            hybrid_result = _run_hybrid(best_mapping)
+        else:
+            hybrid_result = best_metrics
+        results["mapping_search"] = True
+        results["mapping_allow_reuse"] = args.mapping_allow_reuse
+        results["mapping_total"] = mapping_total
+        results["mappings_evaluated"] = mappings_evaluated
+        results["best_mapping"] = best_mapping
+    else:
+        hybrid_result = _run_hybrid(None)
+
+    with open(os.path.join(output_dir, "ml_regime_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    out_df = pd.DataFrame(
+        {"predicted_regime": held_pred_labels, "actual_regime": labels.loc[test_idx]}
     )
-    hybrid_result = hybrid_backtester.run(start_date=hybrid_start, end_date=hybrid_end)
+    if best_mapping:
+        out_df["mapped_strategy"] = out_df["predicted_regime"].map(best_mapping)
+    out_df.to_csv(os.path.join(output_dir, "ml_regime_daily.csv"))
+
     if hybrid_result.transactions:
         pd.DataFrame(hybrid_result.transactions).to_csv(
             os.path.join(output_dir, "transactions.csv"), index=False
@@ -248,6 +450,8 @@ def main() -> None:
         "end_date": hybrid_end.strftime("%Y-%m-%d") if isinstance(hybrid_end, pd.Timestamp) else None,
         "note": "Hybrid backtest uses ML-predicted regimes to select strategies with full trade simulation.",
     }
+    if best_mapping:
+        hybrid_payload["best_mapping"] = best_mapping
     with open(os.path.join(output_dir, "results.json"), "w") as f:
         json.dump(hybrid_payload, f, indent=2)
 

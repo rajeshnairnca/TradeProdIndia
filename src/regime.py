@@ -3,27 +3,158 @@ import numpy as np
 
 from . import config
 
+try:
+    from hmmlearn.hmm import GaussianHMM
+    HMM_AVAILABLE = True
+except ImportError:
+    HMM_AVAILABLE = False
 
-def compute_market_regime_table(df: pd.DataFrame) -> pd.DataFrame:
+
+def _apply_heuristic_trend_vol(market_proxy: pd.DataFrame) -> None:
+    market_proxy["trend_up"] = market_proxy["sma_50"] > market_proxy["sma_200"]
+    vol_threshold = (
+        market_proxy["vol"]
+        .shift(1)
+        .expanding(min_periods=config.ROLLING_WINDOW_FOR_VOL)
+        .quantile(0.75)
+    )
+    market_proxy["vol_high"] = market_proxy["vol"] > vol_threshold
+
+
+def _apply_hmm_trend_vol(market_proxy: pd.DataFrame) -> None:
+    if not HMM_AVAILABLE:
+        raise ImportError("hmmlearn is required for REGIME_MODE=hmm. Please install hmmlearn.")
+    data = market_proxy[["market_return", "vol"]].dropna()
+    if len(data) < max(50, config.HMM_N_COMPONENTS * 10):
+        _apply_heuristic_trend_vol(market_proxy)
+        return
+    X = np.column_stack([data["market_return"].to_numpy(), data["vol"].to_numpy()])
+    model = GaussianHMM(
+        n_components=config.HMM_N_COMPONENTS,
+        covariance_type="full",
+        n_iter=100,
+        min_covar=1e-6,
+        random_state=config.SEED,
+    )
+    model.fit(X)
+    states = model.predict(X)
+
+    stats = []
+    for i in range(config.HMM_N_COMPONENTS):
+        mask = states == i
+        if not np.any(mask):
+            avg_ret = 0.0
+            avg_vol = 0.0
+        else:
+            avg_ret = float(np.mean(X[mask, 0]))
+            avg_vol = float(np.mean(X[mask, 1]))
+        stats.append({"state": i, "avg_ret": avg_ret, "avg_vol": avg_vol})
+    stats_df = pd.DataFrame(stats)
+    ret_threshold = stats_df["avg_ret"].median()
+    vol_threshold = stats_df["avg_vol"].median()
+    bull_states = set(stats_df[stats_df["avg_ret"] > ret_threshold]["state"].tolist())
+    high_vol_states = set(stats_df[stats_df["avg_vol"] > vol_threshold]["state"].tolist())
+
+    trend_up_series = pd.Series(states, index=data.index).isin(bull_states)
+    vol_high_series = pd.Series(states, index=data.index).isin(high_vol_states)
+
+    _apply_heuristic_trend_vol(market_proxy)
+    market_proxy.loc[trend_up_series.index, "trend_up"] = trend_up_series
+    market_proxy.loc[vol_high_series.index, "vol_high"] = vol_high_series
+
+
+def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
+    if not HMM_AVAILABLE:
+        raise ImportError("hmmlearn is required for REGIME_MODE=hmm_rolling. Please install hmmlearn.")
+    data = market_proxy[["market_return", "vol"]].dropna()
+    if data.empty:
+        _apply_heuristic_trend_vol(market_proxy)
+        return
+
+    warmup = max(50, config.HMM_WARMUP_PERIOD)
+    step = max(1, config.HMM_STEP_SIZE)
+    min_train = max(50, config.HMM_N_COMPONENTS * 10)
+
+    trend_up = pd.Series(index=data.index, dtype=bool)
+    vol_high = pd.Series(index=data.index, dtype=bool)
+
+    train_end = warmup
+    while train_end < len(data):
+        train_slice = data.iloc[:train_end]
+        predict_slice = data.iloc[train_end : train_end + step]
+        if len(train_slice) < min_train or predict_slice.empty:
+            train_end += step
+            continue
+
+        X_train = np.column_stack([train_slice["market_return"].to_numpy(), train_slice["vol"].to_numpy()])
+        X_pred = np.column_stack([predict_slice["market_return"].to_numpy(), predict_slice["vol"].to_numpy()])
+        try:
+            model = GaussianHMM(
+                n_components=config.HMM_N_COMPONENTS,
+                covariance_type="full",
+                n_iter=100,
+                min_covar=1e-6,
+                random_state=config.SEED,
+            )
+            model.fit(X_train)
+            train_states = model.predict(X_train)
+            pred_states = model.predict(X_pred)
+
+            stats = []
+            for i in range(config.HMM_N_COMPONENTS):
+                mask = train_states == i
+                if not np.any(mask):
+                    avg_ret = 0.0
+                    avg_vol = 0.0
+                else:
+                    avg_ret = float(np.mean(X_train[mask, 0]))
+                    avg_vol = float(np.mean(X_train[mask, 1]))
+                stats.append({"state": i, "avg_ret": avg_ret, "avg_vol": avg_vol})
+            stats_df = pd.DataFrame(stats)
+            ret_threshold = stats_df["avg_ret"].median()
+            vol_threshold = stats_df["avg_vol"].median()
+            bull_states = set(stats_df[stats_df["avg_ret"] > ret_threshold]["state"].tolist())
+            high_vol_states = set(stats_df[stats_df["avg_vol"] > vol_threshold]["state"].tolist())
+
+            trend_up.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index).isin(bull_states)
+            vol_high.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index).isin(high_vol_states)
+        except Exception:
+            pass
+
+        train_end += step
+
+    _apply_heuristic_trend_vol(market_proxy)
+    if not trend_up.empty:
+        market_proxy.loc[trend_up.index, "trend_up"] = trend_up
+    if not vol_high.empty:
+        market_proxy.loc[vol_high.index, "vol_high"] = vol_high
+
+
+def compute_market_regime_table(df: pd.DataFrame, mode: str | None = None) -> pd.DataFrame:
     """
     Build a per-date regime table using:
       - Trend: market SMA50 vs SMA200 (market = average close across universe)
-      - Volatility: rolling std of market returns vs 75th percentile
+      - Volatility: rolling std of market returns vs 75th percentile (heuristic)
       - Breadth: % of stocks with Close > SMA_50
       - Dispersion: cross-sectional std of ROC_10_z (as a proxy for momentum dispersion)
     Returns a DataFrame indexed by date with booleans and helper labels.
     """
+    mode = (mode or config.REGIME_MODE).lower()
     market_proxy = df.groupby(level="date")["Close"].mean().to_frame("market_close")
     market_proxy["market_return"] = market_proxy["market_close"].pct_change()
     market_proxy["sma_50"] = market_proxy["market_close"].rolling(window=50, min_periods=50).mean()
     market_proxy["sma_200"] = market_proxy["market_close"].rolling(window=200, min_periods=200).mean()
-    market_proxy["trend_up"] = (market_proxy["sma_50"] > market_proxy["sma_200"])
-
-    vol = market_proxy["market_return"].rolling(
-        window=config.ROLLING_WINDOW_FOR_VOL, min_periods=config.ROLLING_WINDOW_FOR_VOL
+    market_proxy["vol"] = market_proxy["market_return"].rolling(
+        window=config.ROLLING_WINDOW_FOR_VOL,
+        min_periods=config.ROLLING_WINDOW_FOR_VOL,
     ).std()
-    vol_threshold = vol.shift(1).expanding(min_periods=config.ROLLING_WINDOW_FOR_VOL).quantile(0.75)
-    market_proxy["vol_high"] = vol > vol_threshold
+
+    if mode == "hmm":
+        _apply_hmm_trend_vol(market_proxy)
+    elif mode == "hmm_rolling":
+        _apply_hmm_rolling_trend_vol(market_proxy)
+    else:
+        _apply_heuristic_trend_vol(market_proxy)
 
     # Breadth: share of stocks above their SMA_50 (neutral 0.5 if SMA_50 missing)
     if "SMA_50" in df.columns:

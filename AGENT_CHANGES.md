@@ -31,3 +31,10 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Updated ML selector to enforce a minimum hold period (`--hold-days`, defaults to `--label-horizon`) and evaluate decision accuracy at switch points.
 - Replaced fixed hold with dynamic switching: the ML selector now switches only after `--confirm-days` consecutive predictions for a new strategy.
 - Reworked `scripts/ml_regime/ml_strategy_selector.py` into a supervised regime classifier and hybrid backtest using predicted regimes to choose strategies.
+- Added optional HMM-based regime labeling in `src/regime.py` with `REGIME_MODE` and `HMM_N_COMPONENTS` in `src/config.py` (requires `hmmlearn`).
+- Added walk-forward HMM regime mode (`REGIME_MODE=hmm_rolling`) with `HMM_WARMUP_PERIOD` and `HMM_STEP_SIZE` to reduce lookahead bias.
+- Added `--jobs` to `scripts/backtesting/strategy_sweep.py` to parallelize sweep backtests.
+- Added `--jobs` to `scripts/ml_regime/ml_strategy_selector.py` to use multiple CPU threads for XGBoost training.
+- Added exhaustive per-regime strategy mapping search to `scripts/ml_regime/ml_strategy_selector.py` (`--mapping-search`).
+- Added `--mapping-jobs` to parallelize mapping search in `scripts/ml_regime/ml_strategy_selector.py`.
+- Added a guard in `scripts/ml_regime/ml_strategy_selector.py` for single-class training splits to avoid XGBoost errors.
