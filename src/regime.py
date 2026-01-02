@@ -10,6 +10,29 @@ except ImportError:
     HMM_AVAILABLE = False
 
 
+def _fit_hmm(X: np.ndarray, n_components: int) -> GaussianHMM:
+    covar_types = [config.HMM_COVARIANCE_TYPE or "full"]
+    if covar_types[0] == "full":
+        covar_types.append("diag")
+    last_err: Exception | None = None
+    for covar_type in covar_types:
+        try:
+            model = GaussianHMM(
+                n_components=n_components,
+                covariance_type=covar_type,
+                n_iter=100,
+                min_covar=config.HMM_MIN_COVAR,
+                random_state=config.SEED,
+            )
+            model.fit(X)
+            return model
+        except Exception as exc:
+            last_err = exc
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("HMM fit failed unexpectedly.")
+
+
 def _apply_heuristic_trend_vol(market_proxy: pd.DataFrame) -> None:
     market_proxy["trend_up"] = market_proxy["sma_50"] > market_proxy["sma_200"]
     vol_threshold = (
@@ -29,15 +52,15 @@ def _apply_hmm_trend_vol(market_proxy: pd.DataFrame) -> None:
         _apply_heuristic_trend_vol(market_proxy)
         return
     X = np.column_stack([data["market_return"].to_numpy(), data["vol"].to_numpy()])
-    model = GaussianHMM(
-        n_components=config.HMM_N_COMPONENTS,
-        covariance_type="full",
-        n_iter=100,
-        min_covar=1e-6,
-        random_state=config.SEED,
-    )
-    model.fit(X)
+    try:
+        model = _fit_hmm(X, config.HMM_N_COMPONENTS)
+    except Exception:
+        _apply_heuristic_trend_vol(market_proxy)
+        return
     states = model.predict(X)
+    state_series = pd.Series(states, index=data.index, dtype="Int64")
+    market_proxy["hmm_state"] = pd.Series(index=market_proxy.index, dtype="Int64")
+    market_proxy.loc[state_series.index, "hmm_state"] = state_series
 
     stats = []
     for i in range(config.HMM_N_COMPONENTS):
@@ -77,6 +100,7 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
 
     trend_up = pd.Series(index=data.index, dtype=bool)
     vol_high = pd.Series(index=data.index, dtype=bool)
+    hmm_state = pd.Series(index=data.index, dtype="Int64")
 
     train_end = warmup
     while train_end < len(data):
@@ -89,14 +113,7 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
         X_train = np.column_stack([train_slice["market_return"].to_numpy(), train_slice["vol"].to_numpy()])
         X_pred = np.column_stack([predict_slice["market_return"].to_numpy(), predict_slice["vol"].to_numpy()])
         try:
-            model = GaussianHMM(
-                n_components=config.HMM_N_COMPONENTS,
-                covariance_type="full",
-                n_iter=100,
-                min_covar=1e-6,
-                random_state=config.SEED,
-            )
-            model.fit(X_train)
+            model = _fit_hmm(X_train, config.HMM_N_COMPONENTS)
             train_states = model.predict(X_train)
             pred_states = model.predict(X_pred)
 
@@ -118,12 +135,15 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
 
             trend_up.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index).isin(bull_states)
             vol_high.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index).isin(high_vol_states)
+            hmm_state.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index)
         except Exception:
             pass
 
         train_end += step
 
     _apply_heuristic_trend_vol(market_proxy)
+    market_proxy["hmm_state"] = pd.Series(index=market_proxy.index, dtype="Int64")
+    market_proxy.loc[hmm_state.index, "hmm_state"] = hmm_state
     if not trend_up.empty:
         market_proxy.loc[trend_up.index, "trend_up"] = trend_up
     if not vol_high.empty:
@@ -148,6 +168,7 @@ def compute_market_regime_table(df: pd.DataFrame, mode: str | None = None) -> pd
         window=config.ROLLING_WINDOW_FOR_VOL,
         min_periods=config.ROLLING_WINDOW_FOR_VOL,
     ).std()
+    market_proxy["hmm_state"] = pd.Series(index=market_proxy.index, dtype="Int64")
 
     if mode == "hmm":
         _apply_hmm_trend_vol(market_proxy)
@@ -189,11 +210,23 @@ def compute_market_regime_table(df: pd.DataFrame, mode: str | None = None) -> pd
         return "bear_low_vol"
 
     market_proxy["regime_label"] = market_proxy.apply(_label, axis=1)
+    if (
+        config.HMM_STATE_LABELS
+        and mode in ("hmm", "hmm_rolling")
+        and "hmm_state" in market_proxy.columns
+    ):
+        def _label_hmm(state):
+            if pd.isna(state):
+                return "unknown"
+            return f"hmm_state_{int(state)}"
+
+        market_proxy["regime_label"] = market_proxy["hmm_state"].apply(_label_hmm)
     market_proxy["combined_regime"] = 2 * market_proxy["trend_up"].astype(float) + market_proxy["vol_high"].astype(float)
     return market_proxy[
         [
             "trend_up",
             "vol_high",
+            "hmm_state",
             "breadth",
             "breadth_low",
             "breadth_high",

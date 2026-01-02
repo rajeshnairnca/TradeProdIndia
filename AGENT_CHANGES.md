@@ -38,3 +38,17 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added exhaustive per-regime strategy mapping search to `scripts/ml_regime/ml_strategy_selector.py` (`--mapping-search`).
 - Added `--mapping-jobs` to parallelize mapping search in `scripts/ml_regime/ml_strategy_selector.py`.
 - Added a guard in `scripts/ml_regime/ml_strategy_selector.py` for single-class training splits to avoid XGBoost errors.
+- Added optional HMM state-based regime labels in `src/regime.py` with `HMM_STATE_LABELS` in `src/config.py` to expose N unnamed regimes for HMM modes.
+- Added `scripts/visualize_regimes.py` CLI options to render 4-state regime comparisons and optional HMM state plots.
+- Fixed `scripts/visualize_regimes.py` to add project root to `sys.path` so `src` imports work when executed directly.
+- Added HMM fit fallback controls in `src/config.py` (`HMM_COVARIANCE_TYPE`, `HMM_MIN_COVAR`) and a retry path in `src/regime.py` to avoid non‑positive‑definite covariance failures.
+- Added a command/flag reference section to `README.md` covering scripts and environment flags.
+- Fixed `scripts/visualize_regimes.py` to avoid Matplotlib deprecation warnings and handle missing HMM state values in plots.
+- Added `--eval-full-period` to `scripts/ml_regime/ml_strategy_selector.py` so hybrid evaluation can run on the full filtered period and included extra period metadata in outputs.
+- Added `performance.png` output to `scripts/ml_regime/ml_strategy_selector.py` for the hybrid backtest.
+- Added regime overlays to the ML selector performance plot in `scripts/ml_regime/ml_strategy_selector.py`.
+- Fixed colormap handling in `scripts/ml_regime/ml_strategy_selector.py` and `scripts/visualize_regimes.py` for older Matplotlib versions.
+- Added `--skip-ml` to `scripts/ml_regime/ml_strategy_selector.py` to bypass the classifier and use regime labels directly.
+- Made `--skip-ml` skip the train/test split so evaluation runs on the full filtered period.
+- Added automatic run summaries to `runs/ml_regime/summary.csv` from `scripts/ml_regime/ml_strategy_selector.py` with detailed metadata and metrics.
+- Expanded ML regime summary rows with eval duration and regime switch stats.

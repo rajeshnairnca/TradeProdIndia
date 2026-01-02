@@ -1,4 +1,5 @@
 import argparse
+import csv
 import itertools
 import json
 import math
@@ -9,6 +10,9 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from concurrent.futures import ProcessPoolExecutor
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,6 +30,16 @@ _WORK_STRATEGIES = None
 _WORK_PRED_BY_DATE = None
 _WORK_HYBRID_START = None
 _WORK_HYBRID_END = None
+
+
+def _get_cmap(name: str, count: int):
+    try:
+        cmap = plt.colormaps.get_cmap(name)
+        if hasattr(cmap, "resampled"):
+            return cmap.resampled(count)
+        return cmap
+    except Exception:
+        return plt.get_cmap(name, count)
 
 
 def _init_mapping_worker(data_path, strategy_names, strategy_roots, pred_by_date, hybrid_start, hybrid_end):
@@ -49,6 +63,16 @@ def _init_mapping_worker(data_path, strategy_names, strategy_roots, pred_by_date
     _WORK_PRED_BY_DATE = pred_by_date
     _WORK_HYBRID_START = hybrid_start
     _WORK_HYBRID_END = hybrid_end
+
+
+def _append_summary_row(summary_path: str, row: dict) -> None:
+    os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+    write_header = not os.path.exists(summary_path)
+    with open(summary_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def _apply_predicted_state_worker(state, predicted: str) -> None:
@@ -163,6 +187,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="runs", help="Root directory for outputs.")
     parser.add_argument("--jobs", type=int, default=1, help="CPU threads for model training (1 = serial).")
     parser.add_argument(
+        "--skip-ml",
+        action="store_true",
+        help="Skip XGBoost training and use regime labels directly (optionally confirm-smoothed).",
+    )
+    parser.add_argument(
+        "--eval-full-period",
+        action="store_true",
+        help="Evaluate hybrid backtest (and mapping search) over the full filtered period.",
+    )
+    parser.add_argument(
         "--mapping-search",
         action="store_true",
         help="Exhaustively map one strategy per regime and pick the best CAGR.",
@@ -218,8 +252,14 @@ def main() -> None:
     common_index = features.index.intersection(labels.index)
     features = features.loc[common_index].dropna()
     labels = labels.loc[features.index]
+    features_full = features
+    labels_full = labels
 
-    train_idx, test_idx = _split_by_ratio(features.index, args.train_ratio)
+    if args.skip_ml:
+        train_idx = features.index
+        test_idx = features.index
+    else:
+        train_idx, test_idx = _split_by_ratio(features.index, args.train_ratio)
     if len(test_idx) == 0:
         raise RuntimeError("Train/test split produced an empty test set.")
 
@@ -230,36 +270,47 @@ def main() -> None:
     y = labels.map(label_to_id).astype(int)
     X_train, y_train = features.loc[train_idx], y.loc[train_idx]
     X_test = features.loc[test_idx]
+    X_full = features_full
 
     jobs = max(1, int(args.jobs))
     train_label_ids = sorted(y_train.unique().tolist())
     model_trained = False
-    if len(train_label_ids) < 2:
-        only_id = int(train_label_ids[0]) if train_label_ids else 0
-        pred_ids = np.full(len(X_test), only_id, dtype=int)
-        pred_probs = np.zeros((len(X_test), len(label_names)), dtype=float)
-        if len(label_names) > 0:
-            pred_probs[:, only_id] = 1.0
+    pred_probs_test = None
+    if args.skip_ml:
+        pred_labels = labels.loc[test_idx]
+        pred_labels_full = labels_full
     else:
-        model = xgb.XGBClassifier(
-            n_estimators=150,
-            max_depth=3,
-            learning_rate=0.1,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="multi:softprob",
-            num_class=len(label_names),
-            eval_metric="mlogloss",
-            random_state=config.SEED,
-            n_jobs=jobs,
-        )
-        model.fit(X_train, y_train)
-        model_trained = True
-        pred_ids = model.predict(X_test)
-        pred_probs = model.predict_proba(X_test)
-    pred_labels = pd.Series(pred_ids, index=X_test.index).map(id_to_label)
+        if len(train_label_ids) < 2:
+            only_id = int(train_label_ids[0]) if train_label_ids else 0
+            pred_ids_test = np.full(len(X_test), only_id, dtype=int)
+            pred_ids_full = np.full(len(X_full), only_id, dtype=int)
+            pred_probs_test = np.zeros((len(X_test), len(label_names)), dtype=float)
+            if len(label_names) > 0:
+                pred_probs_test[:, only_id] = 1.0
+        else:
+            model = xgb.XGBClassifier(
+                n_estimators=150,
+                max_depth=3,
+                learning_rate=0.1,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                objective="multi:softprob",
+                num_class=len(label_names),
+                eval_metric="mlogloss",
+                random_state=config.SEED,
+                n_jobs=jobs,
+            )
+            model.fit(X_train, y_train)
+            model_trained = True
+            pred_ids_test = model.predict(X_test)
+            pred_probs_test = model.predict_proba(X_test)
+            pred_ids_full = model.predict(X_full)
+        pred_labels = pd.Series(pred_ids_test, index=X_test.index).map(id_to_label)
+        pred_labels_full = pd.Series(pred_ids_full, index=X_full.index).map(id_to_label)
+
     confirm_days = max(1, args.confirm_days)
     held_pred_labels = _apply_confirmed_switch(pred_labels, confirm_days)
+    held_pred_labels_full = _apply_confirmed_switch(pred_labels_full, confirm_days)
 
     actual_labels = labels.loc[test_idx]
     decision_mask = held_pred_labels.ne(held_pred_labels.shift(1))
@@ -272,8 +323,8 @@ def main() -> None:
     topk_results = {}
     for k in (2, 3):
         kk = min(k, len(label_names))
-        if decision_mask.any():
-            topk_ids = np.argsort(pred_probs[decision_mask.values], axis=1)[:, -kk:]
+        if decision_mask.any() and pred_probs_test is not None:
+            topk_ids = np.argsort(pred_probs_test[decision_mask.values], axis=1)[:, -kk:]
             true_ids = decision_actual.map(label_to_id).to_numpy()
             hit = np.any(topk_ids == true_ids[:, None], axis=1)
             topk_results[f"top_{kk}_accuracy"] = float(hit.mean())
@@ -290,6 +341,12 @@ def main() -> None:
         "confirm_days": confirm_days,
         "start_date": args.start_date,
         "end_date": args.end_date,
+        "skip_ml": bool(args.skip_ml),
+        "data_start": features_full.index.min().strftime("%Y-%m-%d"),
+        "data_end": features_full.index.max().strftime("%Y-%m-%d"),
+        "test_start": test_idx.min().strftime("%Y-%m-%d"),
+        "test_end": test_idx.max().strftime("%Y-%m-%d"),
+        "eval_full_period": bool(args.eval_full_period),
         "model_trained": model_trained,
         "train_label_count": len(train_label_ids),
         "train_labels": [id_to_label[idx] for idx in train_label_ids],
@@ -300,10 +357,12 @@ def main() -> None:
         **topk_results,
         "note": "Supervised classifier predicts regime labels; accuracy uses confirmed switches.",
     }
+    if args.skip_ml:
+        results["note"] = "ML skipped; regime labels used directly (confirm-smoothed)."
     results["mapping_search"] = bool(args.mapping_search)
     results["mapping_jobs"] = max(1, int(args.mapping_jobs))
 
-    pred_by_date = held_pred_labels.copy()
+    pred_by_date = held_pred_labels_full.copy() if args.eval_full_period else held_pred_labels.copy()
     strategies_by_name = {strategy.name: strategy for strategy in strategies}
 
     def _select_for_regime(regime_label, available):
@@ -347,8 +406,12 @@ def main() -> None:
         )
         return hybrid_backtester.run(start_date=hybrid_start, end_date=hybrid_end)
 
-    hybrid_start = test_idx.min()
-    hybrid_end = test_idx.max() + pd.Timedelta(days=1)
+    if args.eval_full_period:
+        hybrid_start = features_full.index.min()
+        hybrid_end = features_full.index.max() + pd.Timedelta(days=1)
+    else:
+        hybrid_start = test_idx.min()
+        hybrid_end = test_idx.max() + pd.Timedelta(days=1)
     best_mapping = None
     best_mapping_cagr = None
     mapping_total = None
@@ -429,9 +492,14 @@ def main() -> None:
     with open(os.path.join(output_dir, "ml_regime_results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    out_df = pd.DataFrame(
-        {"predicted_regime": held_pred_labels, "actual_regime": labels.loc[test_idx]}
-    )
+    if args.eval_full_period:
+        out_df = pd.DataFrame(
+            {"predicted_regime": held_pred_labels_full, "actual_regime": labels_full}
+        )
+    else:
+        out_df = pd.DataFrame(
+            {"predicted_regime": held_pred_labels, "actual_regime": labels.loc[test_idx]}
+        )
     if best_mapping:
         out_df["mapped_strategy"] = out_df["predicted_regime"].map(best_mapping)
     out_df.to_csv(os.path.join(output_dir, "ml_regime_daily.csv"))
@@ -440,6 +508,53 @@ def main() -> None:
         pd.DataFrame(hybrid_result.transactions).to_csv(
             os.path.join(output_dir, "transactions.csv"), index=False
         )
+    if hybrid_result.equity_curve and hybrid_result.dates:
+        dates = pd.to_datetime(hybrid_result.dates)
+        equity = np.array(hybrid_result.equity_curve, dtype=float)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(dates, equity, color="black", linewidth=1.2)
+
+        if pred_by_date is not None:
+            regimes = pred_by_date.reindex(dates).astype("object")
+            regimes = regimes.fillna("unknown")
+            unique_labels = [str(x) for x in pd.Series(regimes.unique()).tolist()]
+            known_order = ["bull_low_vol", "bull_high_vol", "bear_low_vol", "bear_high_vol", "unknown"]
+            ordered = [label for label in known_order if label in unique_labels]
+            ordered += [label for label in sorted(unique_labels) if label not in ordered]
+
+            color_map = {
+                "bull_low_vol": "green",
+                "bull_high_vol": "gold",
+                "bear_high_vol": "red",
+                "bear_low_vol": "orange",
+                "unknown": "gray",
+            }
+            cmap = _get_cmap("tab20", max(3, len(ordered)))
+            denom = max(1, len(ordered) - 1)
+            y_min, y_max = np.nanmin(equity), np.nanmax(equity)
+            for idx, label in enumerate(ordered):
+                mask = regimes.eq(label).fillna(False)
+                if not mask.any():
+                    continue
+                color = color_map.get(label, cmap(idx / denom))
+                ax.fill_between(
+                    dates,
+                    y_min,
+                    y_max,
+                    where=mask.to_numpy(),
+                    color=color,
+                    alpha=0.18,
+                    label=label,
+                )
+            ax.legend(loc="upper left", ncol=2)
+
+        ax.set_title("Hybrid Backtest Performance")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Net Worth ($)")
+        ax.grid(True)
+        plot_path = os.path.join(output_dir, "performance.png")
+        plt.savefig(plot_path)
+        print(f"Performance plot saved to {plot_path}")
     hybrid_payload = {
         "cagr": hybrid_result.metrics.get("CAGR", 0.0) / 100.0,
         "final_net_worth": hybrid_result.metrics.get("final_net_worth", config.INITIAL_CAPITAL),
@@ -448,12 +563,92 @@ def main() -> None:
         "strategies": [s.name for s in strategies],
         "start_date": hybrid_start.strftime("%Y-%m-%d") if isinstance(hybrid_start, pd.Timestamp) else None,
         "end_date": hybrid_end.strftime("%Y-%m-%d") if isinstance(hybrid_end, pd.Timestamp) else None,
+        "data_start": features_full.index.min().strftime("%Y-%m-%d"),
+        "data_end": features_full.index.max().strftime("%Y-%m-%d"),
+        "test_start": test_idx.min().strftime("%Y-%m-%d"),
+        "test_end": test_idx.max().strftime("%Y-%m-%d"),
+        "eval_full_period": bool(args.eval_full_period),
         "note": "Hybrid backtest uses ML-predicted regimes to select strategies with full trade simulation.",
     }
     if best_mapping:
         hybrid_payload["best_mapping"] = best_mapping
     with open(os.path.join(output_dir, "results.json"), "w") as f:
         json.dump(hybrid_payload, f, indent=2)
+
+    eval_days = len(hybrid_result.dates) if hybrid_result.dates else 0
+    eval_years = eval_days / 252.0 if eval_days else 0.0
+    switch_count = None
+    switch_rate = None
+    unique_regimes = None
+    if pred_by_date is not None and hybrid_result.dates:
+        date_index = pd.to_datetime(hybrid_result.dates)
+        regime_series = pred_by_date.reindex(date_index)
+        if not regime_series.empty:
+            switch_mask = regime_series.ne(regime_series.shift(1))
+            switch_count = max(0, int(switch_mask.sum()) - 1)
+            switch_rate = switch_count / max(len(regime_series), 1)
+            unique_regimes = int(regime_series.nunique(dropna=True))
+
+    summary_path = os.path.join(PROJECT_ROOT, args.output_root, "ml_regime", "summary.csv")
+    summary_row = {
+        "run_id": os.path.basename(output_dir),
+        "output_dir": output_dir,
+        "timestamp_utc": stamp,
+        "command": " ".join(sys.argv),
+        "trading_region": config.TRADING_REGION,
+        "data_file": config.DATA_FILE,
+        "universe_filter": config.UNIVERSE_FILTER,
+        "regime_mode": config.REGIME_MODE,
+        "hmm_n_components": config.HMM_N_COMPONENTS,
+        "hmm_state_labels": config.HMM_STATE_LABELS,
+        "hmm_warmup_period": config.HMM_WARMUP_PERIOD,
+        "hmm_step_size": config.HMM_STEP_SIZE,
+        "hmm_covariance_type": config.HMM_COVARIANCE_TYPE,
+        "hmm_min_covar": config.HMM_MIN_COVAR,
+        "start_date_arg": args.start_date,
+        "end_date_arg": args.end_date,
+        "data_start": results.get("data_start"),
+        "data_end": results.get("data_end"),
+        "test_start": results.get("test_start"),
+        "test_end": results.get("test_end"),
+        "eval_full_period": results.get("eval_full_period"),
+        "train_ratio": args.train_ratio,
+        "confirm_days": confirm_days,
+        "skip_ml": results.get("skip_ml"),
+        "jobs": args.jobs,
+        "mapping_search": results.get("mapping_search"),
+        "mapping_allow_reuse": results.get("mapping_allow_reuse"),
+        "mapping_max": args.mapping_max,
+        "mapping_jobs": args.mapping_jobs,
+        "mapping_total": results.get("mapping_total"),
+        "mappings_evaluated": results.get("mappings_evaluated"),
+        "model_trained": results.get("model_trained"),
+        "train_label_count": results.get("train_label_count"),
+        "train_labels": json.dumps(results.get("train_labels")),
+        "regime_labels": json.dumps(results.get("regime_labels")),
+        "accuracy": results.get("accuracy"),
+        "daily_accuracy": results.get("daily_accuracy"),
+        "majority_accuracy": results.get("majority_accuracy"),
+        "random_accuracy": results.get("random_accuracy"),
+        "top_2_accuracy": results.get("top_2_accuracy"),
+        "top_3_accuracy": results.get("top_3_accuracy"),
+        "hybrid_start": hybrid_payload.get("start_date"),
+        "hybrid_end": hybrid_payload.get("end_date"),
+        "eval_days": eval_days,
+        "eval_years": eval_years,
+        "switch_count": switch_count,
+        "switch_rate": switch_rate,
+        "unique_regimes": unique_regimes,
+        "cagr_pct": hybrid_payload.get("metrics", {}).get("CAGR"),
+        "sharpe": hybrid_payload.get("metrics", {}).get("Sharpe Ratio"),
+        "max_drawdown": hybrid_payload.get("metrics", {}).get("Max Drawdown"),
+        "final_net_worth": hybrid_payload.get("final_net_worth"),
+        "num_strategies": hybrid_payload.get("num_strategies"),
+        "strategies": json.dumps(hybrid_payload.get("strategies")),
+        "best_mapping": json.dumps(hybrid_payload.get("best_mapping")),
+        "note": results.get("note"),
+    }
+    _append_summary_row(summary_path, summary_row)
 
     print(f"Results saved to {output_dir}")
     print(f"Decision Accuracy (confirm): {results['accuracy']:.2%}")
