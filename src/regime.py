@@ -150,13 +150,17 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
         market_proxy.loc[vol_high.index, "vol_high"] = vol_high
 
 
-def compute_market_regime_table(df: pd.DataFrame, mode: str | None = None) -> pd.DataFrame:
+def compute_market_regime_table(
+    df: pd.DataFrame,
+    mode: str | None = None,
+    dispersion_col: str | None = None,
+) -> pd.DataFrame:
     """
     Build a per-date regime table using:
       - Trend: market SMA50 vs SMA200 (market = average close across universe)
       - Volatility: rolling std of market returns vs 75th percentile (heuristic)
       - Breadth: % of stocks with Close > SMA_50
-      - Dispersion: cross-sectional std of ROC_10_z (as a proxy for momentum dispersion)
+      - Dispersion: cross-sectional std of ROC_10 (configurable)
     Returns a DataFrame indexed by date with booleans and helper labels.
     """
     mode = (mode or config.REGIME_MODE).lower()
@@ -187,8 +191,12 @@ def compute_market_regime_table(df: pd.DataFrame, mode: str | None = None) -> pd
     market_proxy["breadth_low"] = market_proxy["breadth"] < 0.45
     market_proxy["breadth_high"] = market_proxy["breadth"] > 0.55
 
-    # Dispersion: cross-sectional std of ROC_10_z (neutral 0 if missing)
-    if "ROC_10_z" in df.columns:
+    # Dispersion: cross-sectional std of the configured ROC column (neutral 0 if missing)
+    dispersion_source = dispersion_col or config.REGIME_DISPERSION_COL
+    if dispersion_source in df.columns:
+        dispersion = df.groupby(level="date")[dispersion_source].std()
+        dispersion = dispersion.reindex(market_proxy.index)
+    elif dispersion_source != "ROC_10_z" and "ROC_10_z" in df.columns:
         dispersion = df.groupby(level="date")["ROC_10_z"].std()
         dispersion = dispersion.reindex(market_proxy.index)
     else:

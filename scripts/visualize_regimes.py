@@ -30,6 +30,29 @@ def _resolve_data_path(region: str | None, data_file: str | None) -> str:
     return config.DATA_FILE
 
 
+def _filter_by_date(obj: pd.Series | pd.DataFrame, start: str | None, end: str | None):
+    if start is None and end is None:
+        return obj
+    start_ts = pd.to_datetime(start) if start else None
+    end_ts = pd.to_datetime(end) if end else None
+    if start_ts is not None and end_ts is not None:
+        return obj.loc[(obj.index >= start_ts) & (obj.index <= end_ts)]
+    if start_ts is not None:
+        return obj.loc[obj.index >= start_ts]
+    return obj.loc[obj.index <= end_ts]
+
+
+def _dispersion_signal(reg_df: pd.DataFrame) -> pd.Series:
+    signal = pd.Series(0, index=reg_df.index, dtype=float)
+    signal.loc[reg_df["dispersion_high"]] = 1.0
+    signal.loc[reg_df["dispersion_low"]] = -1.0
+    return signal
+
+
+def _gross_target_series(reg_df: pd.DataFrame) -> pd.Series:
+    return reg_df.apply(regime.regime_gross_target, axis=1)
+
+
 def _plot_regime_4state(ax, market_proxy: pd.Series, reg_df: pd.DataFrame | None, title: str) -> None:
     ax.set_title(title)
     ax.set_ylabel("Average Price")
@@ -166,6 +189,68 @@ def plot_regime_comparison(
         print(f"Saved HMM state plot to {output_states_file}")
 
 
+def plot_dispersion_correction_comparison(
+    region: str | None = None,
+    data_file: str | None = None,
+    output_file: str = "regime_dispersion_correction.png",
+    dispersion_before: str = "ROC_10_z",
+    dispersion_after: str = "ROC_10",
+    start: str | None = None,
+    end: str | None = None,
+) -> None:
+    data_path = _resolve_data_path(region, data_file)
+    print(f"Loading data from {data_path}...")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+
+    df = pd.read_parquet(data_path)
+    market_proxy = df.groupby(level="date")["Close"].mean()
+
+    print(f"Computing regimes (before={dispersion_before}, after={dispersion_after})...")
+    regime_before = regime.compute_market_regime_table(df, mode="heuristic", dispersion_col=dispersion_before)
+    regime_after = regime.compute_market_regime_table(df, mode="heuristic", dispersion_col=dispersion_after)
+
+    common_idx = market_proxy.index.intersection(regime_before.index).intersection(regime_after.index)
+    market_proxy = market_proxy.loc[common_idx]
+    regime_before = regime_before.loc[common_idx]
+    regime_after = regime_after.loc[common_idx]
+
+    market_proxy = _filter_by_date(market_proxy, start, end)
+    regime_before = regime_before.reindex(market_proxy.index)
+    regime_after = regime_after.reindex(market_proxy.index)
+
+    disp_before = _dispersion_signal(regime_before)
+    disp_after = _dispersion_signal(regime_after)
+    gross_before = _gross_target_series(regime_before)
+    gross_after = _gross_target_series(regime_after)
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
+    _plot_regime_4state(
+        axes[0],
+        market_proxy,
+        regime_after,
+        "Trend/Vol Regime (unchanged by dispersion correction)",
+    )
+
+    axes[1].set_title("Dispersion State (low=-1, neutral=0, high=1)")
+    axes[1].step(disp_before.index, disp_before, where="post", label=f"before ({dispersion_before})", color="tab:orange")
+    axes[1].step(disp_after.index, disp_after, where="post", label=f"after ({dispersion_after})", color="tab:blue")
+    axes[1].set_ylabel("Dispersion State")
+    axes[1].set_yticks([-1, 0, 1])
+    axes[1].set_yticklabels(["low", "neutral", "high"])
+    axes[1].legend(loc="upper left")
+
+    axes[2].set_title("Regime Gross Target Impact")
+    axes[2].plot(gross_before.index, gross_before, label=f"before ({dispersion_before})", color="tab:orange")
+    axes[2].plot(gross_after.index, gross_after, label=f"after ({dispersion_after})", color="tab:blue")
+    axes[2].set_ylabel("Gross Target")
+    axes[2].legend(loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(output_file)
+    print(f"Saved plot to {output_file}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize heuristic and HMM regimes.")
     parser.add_argument("--region", type=str, default=None, help="Trading region (us/india).")
@@ -180,17 +265,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-hmm", action="store_true", help="Skip full-history HMM plot.")
     parser.add_argument("--skip-hmm-rolling", action="store_true", help="Skip HMM rolling plot.")
     parser.add_argument("--plot-hmm-states", action="store_true", help="Plot raw HMM state labels.")
+    parser.add_argument(
+        "--compare-dispersion",
+        action="store_true",
+        help="Compare regimes before/after dispersion correction (ROC_10_z vs ROC_10).",
+    )
+    parser.add_argument("--dispersion-before", type=str, default="ROC_10_z", help="Dispersion column for baseline.")
+    parser.add_argument("--dispersion-after", type=str, default="ROC_10", help="Dispersion column for correction.")
+    parser.add_argument("--start", type=str, default=None, help="Start date (YYYY-MM-DD).")
+    parser.add_argument("--end", type=str, default=None, help="End date (YYYY-MM-DD).")
+    parser.add_argument(
+        "--output-compare",
+        type=str,
+        default="regime_dispersion_correction.png",
+        help="Output image for dispersion comparison.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    plot_regime_comparison(
-        region=args.region,
-        data_file=args.data_file,
-        output_file=args.output,
-        output_states_file=args.output_states,
-        include_hmm=not args.skip_hmm,
-        include_hmm_rolling=not args.skip_hmm_rolling,
-        plot_hmm_states=args.plot_hmm_states,
-    )
+    if args.compare_dispersion:
+        plot_dispersion_correction_comparison(
+            region=args.region,
+            data_file=args.data_file,
+            output_file=args.output_compare,
+            dispersion_before=args.dispersion_before,
+            dispersion_after=args.dispersion_after,
+            start=args.start,
+            end=args.end,
+        )
+    else:
+        plot_regime_comparison(
+            region=args.region,
+            data_file=args.data_file,
+            output_file=args.output,
+            output_states_file=args.output_states,
+            include_hmm=not args.skip_hmm,
+            include_hmm_rolling=not args.skip_hmm_rolling,
+            plot_hmm_states=args.plot_hmm_states,
+        )
