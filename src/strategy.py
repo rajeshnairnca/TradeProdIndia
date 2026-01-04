@@ -7,7 +7,14 @@ from typing import Callable, Iterable
 
 import pandas as pd
 
-REGIME_LABELS = ("bull_low_vol", "bull_high_vol", "bear_low_vol", "bear_high_vol")
+REGIME_LABELS = (
+    "bull_low_vol",
+    "bull_high_vol",
+    "bear_low_vol",
+    "bear_high_vol",
+    "sideways_low_vol",
+    "sideways_high_vol",
+)
 
 
 @dataclass(frozen=True)

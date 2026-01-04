@@ -80,15 +80,27 @@ def _apply_predicted_state_worker(state, predicted: str) -> None:
     if predicted == "bull_low_vol":
         state["trend_up"] = True
         state["vol_high"] = False
+        state["trend_state"] = "bull"
     elif predicted == "bull_high_vol":
         state["trend_up"] = True
         state["vol_high"] = True
+        state["trend_state"] = "bull"
     elif predicted == "bear_high_vol":
         state["trend_up"] = False
         state["vol_high"] = True
+        state["trend_state"] = "bear"
     elif predicted == "bear_low_vol":
         state["trend_up"] = False
         state["vol_high"] = False
+        state["trend_state"] = "bear"
+    elif predicted == "sideways_high_vol":
+        state["trend_up"] = False
+        state["vol_high"] = True
+        state["trend_state"] = "sideways"
+    elif predicted == "sideways_low_vol":
+        state["trend_up"] = False
+        state["vol_high"] = False
+        state["trend_state"] = "sideways"
 
 
 def _evaluate_mapping_worker(args):
@@ -129,8 +141,6 @@ def _build_features(df: pd.DataFrame, regime_table: pd.DataFrame) -> pd.DataFram
             "market_vol": market_vol,
             "breadth": regime_table["breadth"],
             "dispersion": regime_table["dispersion"],
-            "trend_up": regime_table["trend_up"].astype(float),
-            "vol_high": regime_table["vol_high"].astype(float),
         }
     )
     return features.sort_index()
@@ -374,15 +384,27 @@ def main() -> None:
         if predicted == "bull_low_vol":
             state["trend_up"] = True
             state["vol_high"] = False
+            state["trend_state"] = "bull"
         elif predicted == "bull_high_vol":
             state["trend_up"] = True
             state["vol_high"] = True
+            state["trend_state"] = "bull"
         elif predicted == "bear_high_vol":
             state["trend_up"] = False
             state["vol_high"] = True
+            state["trend_state"] = "bear"
         elif predicted == "bear_low_vol":
             state["trend_up"] = False
             state["vol_high"] = False
+            state["trend_state"] = "bear"
+        elif predicted == "sideways_high_vol":
+            state["trend_up"] = False
+            state["vol_high"] = True
+            state["trend_state"] = "sideways"
+        elif predicted == "sideways_low_vol":
+            state["trend_up"] = False
+            state["vol_high"] = False
+            state["trend_state"] = "sideways"
 
     def _run_hybrid(mapping: dict[str, str] | None):
         def selector(current_date, state, _available):
@@ -518,7 +540,15 @@ def main() -> None:
             regimes = pred_by_date.reindex(dates).astype("object")
             regimes = regimes.fillna("unknown")
             unique_labels = [str(x) for x in pd.Series(regimes.unique()).tolist()]
-            known_order = ["bull_low_vol", "bull_high_vol", "bear_low_vol", "bear_high_vol", "unknown"]
+            known_order = [
+                "bull_low_vol",
+                "bull_high_vol",
+                "bear_low_vol",
+                "bear_high_vol",
+                "sideways_low_vol",
+                "sideways_high_vol",
+                "unknown",
+            ]
             ordered = [label for label in known_order if label in unique_labels]
             ordered += [label for label in sorted(unique_labels) if label not in ordered]
 
@@ -527,6 +557,8 @@ def main() -> None:
                 "bull_high_vol": "gold",
                 "bear_high_vol": "red",
                 "bear_low_vol": "orange",
+                "sideways_low_vol": "steelblue",
+                "sideways_high_vol": "deepskyblue",
                 "unknown": "gray",
             }
             cmap = _get_cmap("tab20", max(3, len(ordered)))

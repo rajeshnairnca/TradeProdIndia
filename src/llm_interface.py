@@ -51,7 +51,7 @@ def get_new_alpha_idea(existing_alphas_summary: str, ensemble_cagr: float, faile
     - DO NOT include any other code, explanations, or markdown.
     - The `generate_scores` function must be deterministic (no randomness) and return a `pd.Series` indexed exactly like `df`.
     - Avoid look-ahead bias: do not use negative shifts, forward-looking rolling windows, or future data.
-    - `REGIME_TAGS` must be a list containing any of: bull_low_vol, bull_high_vol, bear_low_vol, bear_high_vol.
+    - `REGIME_TAGS` must be a list containing any of: bull_low_vol, bull_high_vol, bear_low_vol, bear_high_vol, sideways_low_vol, sideways_high_vol.
     """
     response = client.models.generate_content(
         # model="gemini-2.5-pro",

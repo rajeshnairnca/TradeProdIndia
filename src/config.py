@@ -96,6 +96,7 @@ SEED = 42
 # ---- Regime Detection Configuration ----
 REGIME_MODE = _env_str("REGIME_MODE", "heuristic").lower()
 REGIME_DISPERSION_COL = _env_str("REGIME_DISPERSION_COL", "ROC_10")
+REGIME_TREND_BAND = _env_float("REGIME_TREND_BAND", 0.02)
 HMM_N_COMPONENTS = _env_int("HMM_N_COMPONENTS", 4)
 HMM_WARMUP_PERIOD = _env_int("HMM_WARMUP_PERIOD", 2520)  # ~10 years
 HMM_STEP_SIZE = _env_int("HMM_STEP_SIZE", 5)  # ~1 month

@@ -736,6 +736,22 @@ def validate_output(df: pd.DataFrame, expected_cols: list[str]):
         assert not df[col].isna().any(), f"NaNs found in {col}"
 
 
+def _fetch_sector(stock) -> str:
+    """Best-effort sector lookup; returns 'unknown' if unavailable."""
+    try:
+        if hasattr(stock, "get_info"):
+            info = stock.get_info()
+        else:
+            info = getattr(stock, "info", None)
+        if isinstance(info, dict):
+            sector = info.get("sector") or info.get("industry")
+            if isinstance(sector, str) and sector.strip():
+                return sector.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
 def main():
     args = parse_args()
     stock_list = load_stock_list(args.stocks_file)
@@ -744,6 +760,7 @@ def main():
 
     # --- 1. Data Download ---
     all_stock_data = {}
+    sector_by_ticker = {}
     print(f"\nDownloading data from yfinance for {len(stock_list)} stocks ({args.period} period)...")
     for ticker in tqdm(stock_list, desc="Downloading Stocks"):
         try:
@@ -752,6 +769,7 @@ def main():
             if df.empty:
                 continue
             all_stock_data[ticker] = df
+            sector_by_ticker[ticker] = _fetch_sector(stock)
         except Exception as e:
             print(f"\nError downloading {ticker}: {e}")
 
@@ -803,6 +821,8 @@ def main():
     master_df.reset_index(inplace=True)
     master_df.rename(columns={'Date': 'date'}, inplace=True)
     master_df['date'] = pd.to_datetime(master_df['date'])
+    if sector_by_ticker:
+        master_df['sector'] = master_df['ticker'].map(lambda x: sector_by_ticker.get(x, "unknown"))
 
     print(f"\nPre-calculating {args.rolling_window}-day rolling features (ADV and Volatility)...")
     master_df.sort_values(by=['ticker', 'date'], inplace=True)

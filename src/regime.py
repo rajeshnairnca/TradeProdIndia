@@ -157,7 +157,7 @@ def compute_market_regime_table(
 ) -> pd.DataFrame:
     """
     Build a per-date regime table using:
-      - Trend: market SMA50 vs SMA200 (market = average close across universe)
+      - Trend: market SMA50 vs SMA200 with sideways band (market = average close across universe)
       - Volatility: rolling std of market returns vs 75th percentile (heuristic)
       - Breadth: % of stocks with Close > SMA_50
       - Dispersion: cross-sectional std of ROC_10 (configurable)
@@ -180,6 +180,19 @@ def compute_market_regime_table(
         _apply_hmm_rolling_trend_vol(market_proxy)
     else:
         _apply_heuristic_trend_vol(market_proxy)
+
+    trend_strength = (market_proxy["sma_50"] / (market_proxy["sma_200"] + 1e-9)) - 1.0
+    if mode in ("hmm", "hmm_rolling"):
+        trend_state = np.where(market_proxy["trend_up"], "bull", "bear")
+    else:
+        band = config.REGIME_TREND_BAND
+        trend_state = np.where(
+            trend_strength > band,
+            "bull",
+            np.where(trend_strength < -band, "bear", "sideways"),
+        )
+        market_proxy["trend_up"] = trend_state == "bull"
+    market_proxy["trend_state"] = pd.Series(trend_state, index=market_proxy.index)
 
     # Breadth: share of stocks above their SMA_50 (neutral 0.5 if SMA_50 missing)
     if "SMA_50" in df.columns:
@@ -209,13 +222,18 @@ def compute_market_regime_table(
 
     # Combined regime label (trend x vol)
     def _label(row):
-        if row["trend_up"] and not row["vol_high"]:
+        trend_state = row.get("trend_state", "bear")
+        if trend_state == "bull" and not row["vol_high"]:
             return "bull_low_vol"
-        if row["trend_up"] and row["vol_high"]:
+        if trend_state == "bull" and row["vol_high"]:
             return "bull_high_vol"
-        if (not row["trend_up"]) and row["vol_high"]:
+        if trend_state == "bear" and row["vol_high"]:
             return "bear_high_vol"
-        return "bear_low_vol"
+        if trend_state == "bear" and not row["vol_high"]:
+            return "bear_low_vol"
+        if trend_state == "sideways" and row["vol_high"]:
+            return "sideways_high_vol"
+        return "sideways_low_vol"
 
     market_proxy["regime_label"] = market_proxy.apply(_label, axis=1)
     if (
@@ -229,10 +247,12 @@ def compute_market_regime_table(
             return f"hmm_state_{int(state)}"
 
         market_proxy["regime_label"] = market_proxy["hmm_state"].apply(_label_hmm)
-    market_proxy["combined_regime"] = 2 * market_proxy["trend_up"].astype(float) + market_proxy["vol_high"].astype(float)
+    trend_code = market_proxy["trend_state"].map({"bear": 0, "sideways": 1, "bull": 2}).fillna(0)
+    market_proxy["combined_regime"] = 2 * trend_code.astype(float) + market_proxy["vol_high"].astype(float)
     return market_proxy[
         [
             "trend_up",
+            "trend_state",
             "vol_high",
             "hmm_state",
             "breadth",
@@ -251,6 +271,7 @@ def get_regime_state(regime_table: pd.DataFrame | None, current_date) -> dict:
     if regime_table is None or current_date not in regime_table.index:
         return {
             "trend_up": False,
+            "trend_state": "bear",
             "vol_high": False,
             "dispersion_high": False,
             "dispersion_low": False,
@@ -259,8 +280,12 @@ def get_regime_state(regime_table: pd.DataFrame | None, current_date) -> dict:
             "regime_label": "unknown",
         }
     row = regime_table.loc[current_date]
+    trend_state = row.get("trend_state")
+    if pd.isna(trend_state) or not trend_state:
+        trend_state = "bull" if bool(row.get("trend_up", False)) else "bear"
     return {
         "trend_up": bool(row.get("trend_up", False)),
+        "trend_state": str(trend_state),
         "vol_high": bool(row.get("vol_high", False)),
         "dispersion_high": bool(row.get("dispersion_high", False)),
         "dispersion_low": bool(row.get("dispersion_low", False)),
@@ -271,6 +296,15 @@ def get_regime_state(regime_table: pd.DataFrame | None, current_date) -> dict:
 
 
 def regime_top_k(state: dict, default_top_k: int) -> int:
+    trend_state = state.get("trend_state")
+    if not trend_state:
+        trend_state = "bull" if state.get("trend_up") else "bear"
+    if trend_state == "sideways":
+        if state.get("vol_high") and state.get("dispersion_low") and state.get("breadth_low"):
+            return max(4, default_top_k - 4)
+        if state.get("vol_high"):
+            return max(5, default_top_k - 3)
+        return max(6, default_top_k - 2)
     if state.get("vol_high") and state.get("dispersion_low") and state.get("breadth_low"):
         return 5
     if state.get("vol_high") and state.get("dispersion_high"):
@@ -285,7 +319,10 @@ def regime_top_k(state: dict, default_top_k: int) -> int:
 
 
 def regime_gross_target(state: dict) -> float:
-    trend_up = bool(state.get("trend_up", False))
+    trend_state = state.get("trend_state")
+    if not trend_state:
+        trend_state = "bull" if state.get("trend_up") else "bear"
+    trend_up = trend_state == "bull"
     vol_high = bool(state.get("vol_high", False))
     dispersion_high = bool(state.get("dispersion_high", False))
     dispersion_low = bool(state.get("dispersion_low", False))
@@ -293,7 +330,9 @@ def regime_gross_target(state: dict) -> float:
     breadth_high = bool(state.get("breadth_high", False))
 
     gross = 0.85
-    if (not trend_up) and vol_high:
+    if trend_state == "sideways":
+        gross = 0.7 if vol_high else 0.85
+    elif (not trend_up) and vol_high:
         gross = 0.6
     elif (not trend_up) and (not vol_high):
         gross = 0.75

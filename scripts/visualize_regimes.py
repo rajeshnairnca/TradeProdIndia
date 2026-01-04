@@ -62,10 +62,22 @@ def _plot_regime_4state(ax, market_proxy: pd.Series, reg_df: pd.DataFrame | None
         ax.text(0.5, 0.5, "Data Not Available", ha="center")
         return
 
-    mask_bull_calm = (reg_df["trend_up"] & ~reg_df["vol_high"])
-    mask_bull_vol = (reg_df["trend_up"] & reg_df["vol_high"])
-    mask_bear_crash = (~reg_df["trend_up"] & reg_df["vol_high"])
-    mask_bear_calm = (~reg_df["trend_up"] & ~reg_df["vol_high"])
+    if "trend_state" in reg_df.columns:
+        trend_state = reg_df["trend_state"].astype(str)
+        mask_bull = trend_state.eq("bull")
+        mask_bear = trend_state.eq("bear")
+        mask_sideways = trend_state.eq("sideways")
+    else:
+        mask_bull = reg_df["trend_up"]
+        mask_bear = ~reg_df["trend_up"]
+        mask_sideways = pd.Series(False, index=reg_df.index)
+
+    mask_bull_calm = (mask_bull & ~reg_df["vol_high"])
+    mask_bull_vol = (mask_bull & reg_df["vol_high"])
+    mask_bear_crash = (mask_bear & reg_df["vol_high"])
+    mask_bear_calm = (mask_bear & ~reg_df["vol_high"])
+    mask_sideways_calm = (mask_sideways & ~reg_df["vol_high"])
+    mask_sideways_vol = (mask_sideways & reg_df["vol_high"])
 
     y_min, y_max = market_proxy.min(), market_proxy.max()
     dates = market_proxy.index
@@ -73,6 +85,13 @@ def _plot_regime_4state(ax, market_proxy: pd.Series, reg_df: pd.DataFrame | None
     ax.fill_between(dates, y_min, y_max, where=mask_bull_vol, color="gold", alpha=0.3, label="Bull (High Vol)")
     ax.fill_between(dates, y_min, y_max, where=mask_bear_crash, color="red", alpha=0.3, label="Bear (High Vol)")
     ax.fill_between(dates, y_min, y_max, where=mask_bear_calm, color="orange", alpha=0.2, label="Bear (Low Vol)")
+    if mask_sideways.any():
+        ax.fill_between(
+            dates, y_min, y_max, where=mask_sideways_calm, color="steelblue", alpha=0.2, label="Sideways (Low Vol)"
+        )
+        ax.fill_between(
+            dates, y_min, y_max, where=mask_sideways_vol, color="deepskyblue", alpha=0.25, label="Sideways (High Vol)"
+        )
     ax.legend(loc="upper left")
 
 
