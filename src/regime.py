@@ -35,6 +35,7 @@ def _fit_hmm(X: np.ndarray, n_components: int) -> GaussianHMM:
 
 def _apply_heuristic_trend_vol(market_proxy: pd.DataFrame) -> None:
     market_proxy["trend_up"] = market_proxy["sma_50"] > market_proxy["sma_200"]
+    # TODO: Experiment with ADX/slope sideways override and rolling vol quantile thresholds.
     vol_threshold = (
         market_proxy["vol"]
         .shift(1)

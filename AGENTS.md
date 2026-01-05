@@ -28,3 +28,6 @@
 - Use concise, imperative commits (e.g., `Add walkforward gating`); group related changes per commit.  
 - PRs should describe the goal, key changes, and how you validated (commands run, datasets used, any shortcuts). Include links to logs/artifacts in `runs/` or `logs/` when relevant.  
 - Note any deviations from default workflows (custom hyperparams, truncated datasets) so others can reproduce.
+
+## Change Log
+- Log every code change in `AGENT_CHANGES.md` (agent_changes.md) with a brief note on what changed and why.

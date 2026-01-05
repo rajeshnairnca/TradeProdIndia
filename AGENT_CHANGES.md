@@ -52,3 +52,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Made `--skip-ml` skip the train/test split so evaluation runs on the full filtered period.
 - Added automatic run summaries to `runs/ml_regime/summary.csv` from `scripts/ml_regime/ml_strategy_selector.py` with detailed metadata and metrics.
 - Expanded ML regime summary rows with eval duration and regime switch stats.
+
+## 2025-01-05
+- Added a change-log requirement in `AGENTS.md`.
+- Added a TODO note in `src/regime.py` to consider ADX/slope sideways overrides and rolling vol quantile thresholds.
