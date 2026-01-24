@@ -67,3 +67,4 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added `--regime-mapping` support to `scripts/backtesting/backtester.py` for per-regime strategy selection.
 - Added `--regime-mapping` support to `scripts/backtesting/sector_experiments.py` for fixed per-regime mappings.
 - Documented the 31% CAGR sector experiment command in `README.md`.
+- Set `WEIGHT_SMOOTHING` default to 0.85 in `src/config.py` for longer holds.
