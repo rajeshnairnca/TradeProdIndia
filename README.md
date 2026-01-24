@@ -138,6 +138,28 @@ Example:
 caffeinate -i python3 scripts/backtesting/strategy_sweep.py --min-size 2 --max-size 4 --max-combos 200 --jobs 7
 ```
 
+### Sector Experiments
+
+Command: `python3 scripts/backtesting/sector_experiments.py`
+
+Flags:
+- `--sectors`: comma-separated sector names or repeatable (default: all).
+- `--start-date`: YYYY-MM-DD inclusive start.
+- `--end-date`: YYYY-MM-DD exclusive end.
+- `--regime-scope`: `global` or `sector` (compute regimes on global data or per-sector).
+- `--regime-mapping`: JSON mapping from regime to strategy name.
+
+Example (31% CAGR run):
+```bash
+TRADING_REGION=us DATA_FILE=data/daily_data_us_31percent.parquet REGIME_MODE=heuristic caffeinate -i \
+  python3 scripts/backtesting/sector_experiments.py \
+  --sectors Technology \
+  --start-date 2010-01-01 \
+  --end-date 2025-01-01 \
+  --regime-scope sector \
+  --regime-mapping '{"bear_high_vol":"rule_mean_reversion","bear_low_vol":"rule_low_vol_defensive","bull_high_vol":"rule_quality_min_vol","bull_low_vol":"rule_momentum_acceleration","sideways_high_vol":"rule_range_reversion","sideways_low_vol":"rule_trend_strength"}'
+```
+
 ### Walk-Forward Validation
 
 Command: `python3 src/walkforward.py`

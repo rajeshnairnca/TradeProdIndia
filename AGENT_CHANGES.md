@@ -56,3 +56,14 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 ## 2025-01-05
 - Added a change-log requirement in `AGENTS.md`.
 - Added a TODO note in `src/regime.py` to consider ADX/slope sideways overrides and rolling vol quantile thresholds.
+
+## 2025-01-06
+- Added a raw SQLite store for market data in `src/data_store.py` and configuration in `src/config.py` (`RAW_DATA_DB_FILE`).
+- Added `scripts/data_extraction/ingest_yfinance_db.py` to append yfinance data into the raw DB with duplicate protection and optional metadata.
+- Added `src/data_prep.py` and `scripts/data_extraction/prepare_dataset.py` to build lookahead-safe, normalized datasets from the raw DB.
+- Added universe CSVs in `data/universe_us.csv` and `data/universe_india.csv`, plus `.gitignore` allowlisting for `data/universe_*.csv`.
+- Added per-ticker date bounds (`start_date`, `end_date`) and `--min-history-days` gating for newly listed tickers.
+- Added flexible universe CSV parsing in `src/universe.py` and restored `NASDAQ100_TICKERS`.
+- Added `--regime-mapping` support to `scripts/backtesting/backtester.py` for per-regime strategy selection.
+- Added `--regime-mapping` support to `scripts/backtesting/sector_experiments.py` for fixed per-regime mappings.
+- Documented the 31% CAGR sector experiment command in `README.md`.

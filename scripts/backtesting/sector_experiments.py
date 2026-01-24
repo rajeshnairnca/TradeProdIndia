@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Search for the best strategy-per-regime mapping per sector/scope.",
     )
     parser.add_argument(
+        "--regime-mapping",
+        type=str,
+        default=None,
+        help="JSON mapping of regime_label -> strategy name to use for all sectors/scopes.",
+    )
+    parser.add_argument(
         "--mapping-allow-reuse",
         action="store_true",
         help="Allow strategies to repeat across regimes during mapping search.",
@@ -147,6 +153,7 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
     mode = payload["mode"]
     mapping_allow_reuse = payload.get("mapping_allow_reuse", False)
     mapping_max = payload.get("mapping_max")
+    mapping_fixed = payload.get("mapping")
     skip_strategies = set(payload.get("skip_strategies", []))
     start_date = pd.to_datetime(payload["start_date"]) if payload["start_date"] else None
     end_date = pd.to_datetime(payload["end_date"]) if payload["end_date"] else None
@@ -168,7 +175,43 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
     strategies_by_name = {strategy.name: strategy for strategy in strategies}
 
     rows = []
-    if mode == "mapping":
+    if mode == "mapping_fixed":
+        if not mapping_fixed:
+            raise ValueError("Missing --regime-mapping payload for mapping_fixed mode.")
+
+        def selector(current_date, state, _available):
+            label = state.get("regime_label")
+            chosen = mapping_fixed.get(str(label)) if label is not None else None
+            if not chosen:
+                return None
+            strategy = strategies_by_name.get(chosen)
+            return [strategy] if strategy else None
+
+        backtester = RuleBasedBacktester(
+            sector_df,
+            strategies,
+            regime_table=regime_table,
+            strategy_selector=selector,
+        )
+        result = backtester.run(start_date=start_date, end_date=end_date)
+        rows.append(
+            {
+                "sector": sector,
+                "regime_scope": scope,
+                "tickers": len(sector_tickers),
+                "start_date": payload["start_date"],
+                "end_date": payload["end_date"],
+                "strategy": "__mapping_fixed__",
+                "mapping": json.dumps(mapping_fixed, sort_keys=True),
+                "mappings_evaluated": 1,
+                "mapping_total": 1,
+                "cagr_pct": result.metrics.get("CAGR"),
+                "sharpe": result.metrics.get("Sharpe Ratio"),
+                "max_drawdown": result.metrics.get("Max Drawdown"),
+                "final_net_worth": result.metrics.get("final_net_worth"),
+            }
+        )
+    elif mode == "mapping":
         regime_labels = (
             pd.Series(regime_table["regime_label"])
             .dropna()
@@ -270,15 +313,34 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
 
 def main() -> None:
     args = parse_args()
-    if args.best_single_strategy and args.regime_mapping_search:
-        raise ValueError("Use only one of --best-single-strategy or --regime-mapping-search.")
+    if args.best_single_strategy and (args.regime_mapping_search or args.regime_mapping):
+        raise ValueError("Use only one of --best-single-strategy or mapping options.")
+    if args.regime_mapping_search and args.regime_mapping:
+        raise ValueError("Use only one of --regime-mapping or --regime-mapping-search.")
     if not args.strategy_roots:
         args.strategy_roots = ["alphas"]
     strategy_names = args.strategies or list_strategy_names(args.strategy_roots)
+    mapping_fixed = None
+    if args.regime_mapping:
+        try:
+            mapping_fixed = json.loads(args.regime_mapping)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON for --regime-mapping: {exc}") from exc
+        if not isinstance(mapping_fixed, dict) or not mapping_fixed:
+            raise ValueError("--regime-mapping must be a non-empty JSON object.")
+        mapping_fixed = {str(key): str(value) for key, value in mapping_fixed.items()}
+        mapping_strategy_names = {value for value in mapping_fixed.values() if value}
+        missing = sorted(name for name in mapping_strategy_names if name not in strategy_names)
+        if missing:
+            strategy_names.extend(missing)
     strategies = load_strategies(strategy_names, args.strategy_roots)
     if not strategies:
         raise ValueError("No strategies loaded.")
     strategies_by_name = {strategy.name: strategy for strategy in strategies}
+    if mapping_fixed:
+        for name in sorted(set(mapping_fixed.values())):
+            if name and name not in strategies_by_name:
+                raise ValueError(f"Unknown strategy in --regime-mapping: {name}")
 
     data_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
     df = pd.read_parquet(data_path)
@@ -337,7 +399,7 @@ def main() -> None:
     ]
     completed = set()
     if args.resume:
-        resume_path = mapping_summary_path if args.regime_mapping_search else summary_path
+        resume_path = mapping_summary_path if (args.regime_mapping_search or mapping_fixed) else summary_path
         if os.path.exists(resume_path):
             existing = pd.read_csv(resume_path)
             if "strategy" in existing.columns:
@@ -357,7 +419,14 @@ def main() -> None:
         scopes.append("sector")
 
     if args.jobs > 1:
-        mode = "mapping" if args.regime_mapping_search else "best_single" if args.best_single_strategy else "ensemble"
+        if args.regime_mapping_search:
+            mode = "mapping"
+        elif mapping_fixed:
+            mode = "mapping_fixed"
+        elif args.best_single_strategy:
+            mode = "best_single"
+        else:
+            mode = "ensemble"
         completed_by_scope = {}
         if args.best_single_strategy:
             for sector, scope, strategy in completed:
@@ -367,8 +436,9 @@ def main() -> None:
         tasks = []
         for sector in sectors:
             for scope in scopes:
-                if args.regime_mapping_search:
-                    key = (sector, scope, "__mapping__")
+                if args.regime_mapping_search or mapping_fixed:
+                    mapping_key = "__mapping__" if args.regime_mapping_search else "__mapping_fixed__"
+                    key = (sector, scope, mapping_key)
                     if key in completed:
                         continue
                     tasks.append(
@@ -381,6 +451,7 @@ def main() -> None:
                             "mode": mode,
                             "mapping_allow_reuse": args.mapping_allow_reuse,
                             "mapping_max": args.mapping_max,
+                            "mapping": mapping_fixed,
                             "start_date": args.start_date,
                             "end_date": args.end_date,
                         }
@@ -427,7 +498,7 @@ def main() -> None:
                     desc="Sector tasks",
                 ):
                     for row in rows:
-                        if args.regime_mapping_search:
+                        if args.regime_mapping_search or mapping_fixed:
                             needs_header = not os.path.exists(mapping_summary_path)
                             with open(mapping_summary_path, "a", newline="") as f:
                                 writer = csv.DictWriter(f, fieldnames=mapping_fieldnames)
@@ -537,6 +608,48 @@ def main() -> None:
                                 writer.writeheader()
                             writer.writerow(best_row)
                         completed.add(key)
+                elif mapping_fixed:
+                    key = (sector, scope, "__mapping_fixed__")
+                    if key in completed:
+                        continue
+
+                    def selector(current_date, state, _available):
+                        label = state.get("regime_label")
+                        chosen = mapping_fixed.get(str(label)) if label is not None else None
+                        if not chosen:
+                            return None
+                        strategy = strategies_by_name.get(chosen)
+                        return [strategy] if strategy else None
+
+                    backtester = RuleBasedBacktester(
+                        sector_df,
+                        strategies,
+                        regime_table=regime_table,
+                        strategy_selector=selector,
+                    )
+                    result = backtester.run(start_date=start_date, end_date=end_date)
+                    row = {
+                        "sector": sector,
+                        "regime_scope": scope,
+                        "tickers": len(sector_tickers),
+                        "start_date": args.start_date,
+                        "end_date": args.end_date,
+                        "strategy": "__mapping_fixed__",
+                        "mapping": json.dumps(mapping_fixed, sort_keys=True),
+                        "mappings_evaluated": 1,
+                        "mapping_total": 1,
+                        "cagr_pct": result.metrics.get("CAGR"),
+                        "sharpe": result.metrics.get("Sharpe Ratio"),
+                        "max_drawdown": result.metrics.get("Max Drawdown"),
+                        "final_net_worth": result.metrics.get("final_net_worth"),
+                    }
+                    needs_header = not os.path.exists(mapping_summary_path)
+                    with open(mapping_summary_path, "a", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=mapping_fieldnames)
+                        if needs_header:
+                            writer.writeheader()
+                        writer.writerow(row)
+                    completed.add(key)
                 elif args.best_single_strategy:
                     for strategy in strategies:
                         key = (sector, scope, strategy.name)
@@ -592,7 +705,7 @@ def main() -> None:
                         writer.writerow(row)
                     completed.add(key)
 
-    if args.regime_mapping_search and os.path.exists(mapping_summary_path):
+    if (args.regime_mapping_search or mapping_fixed) and os.path.exists(mapping_summary_path):
         summary = pd.read_csv(mapping_summary_path)
         with open(os.path.join(output_dir, "sector_regime_mapping_summary.json"), "w") as f:
             json.dump(summary.to_dict(orient="records"), f, indent=2)

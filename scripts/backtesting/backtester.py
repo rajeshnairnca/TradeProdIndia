@@ -41,19 +41,53 @@ def parse_args():
     parser.add_argument("--use-full-history", action="store_true", help="Backtest on full history instead of holdout.")
     parser.add_argument("--start-date", type=str, help="Optional YYYY-MM-DD to start backtest.")
     parser.add_argument("--end-date", type=str, help="Optional YYYY-MM-DD to end backtest (exclusive).")
+    parser.add_argument(
+        "--regime-mapping",
+        type=str,
+        help="JSON mapping of regime_label -> strategy name for per-regime strategy selection.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     strategy_roots = args.strategy_roots or ["alphas"]
+    mapping = None
     strategy_names = args.strategies or list_strategy_names(strategy_roots)
+    if args.regime_mapping:
+        try:
+            mapping = json.loads(args.regime_mapping)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON for --regime-mapping: {exc}") from exc
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError("--regime-mapping must be a non-empty JSON object.")
+        mapping = {str(key): str(value) for key, value in mapping.items()}
+        mapping_strategy_names = {value for value in mapping.values() if value}
+        missing = sorted(name for name in mapping_strategy_names if name not in strategy_names)
+        if missing:
+            strategy_names.extend(missing)
     if not strategy_names:
         raise ValueError("No strategies found to backtest.")
 
     strategies = load_strategies(strategy_names, strategy_roots)
     if not strategies:
         raise ValueError("No valid strategies loaded.")
+    mapping_selector = None
+    if mapping:
+        strategy_lookup = {strategy.name: strategy for strategy in strategies}
+        for name in sorted(set(mapping.values())):
+            if name and name not in strategy_lookup:
+                raise ValueError(f"Unknown strategy in --regime-mapping: {name}")
+
+        def mapping_selector(current_date, state, strategies):
+            label = str(state.get("regime_label", "unknown"))
+            chosen = mapping.get(label)
+            if not chosen:
+                return None
+            selected = strategy_lookup.get(chosen)
+            if selected is None:
+                return None
+            return [selected]
 
     data_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
     df = pd.read_parquet(data_path)
@@ -72,7 +106,12 @@ def main():
         if split_index < len(all_dates):
             start_date = pd.to_datetime(all_dates[split_index])
 
-    backtester = RuleBasedBacktester(df, strategies, regime_table=regime_table)
+    backtester = RuleBasedBacktester(
+        df,
+        strategies,
+        regime_table=regime_table,
+        strategy_selector=mapping_selector,
+    )
     result = backtester.run(start_date=start_date, end_date=end_date)
 
     ensemble_dirname = make_ensemble_dirname([s.name for s in strategies])
