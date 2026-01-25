@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 
@@ -20,6 +21,35 @@ def _env_float(name: str, default: float) -> float:
         return float(val)
     except ValueError:
         return default
+
+
+def _env_optional_float(name: str) -> float | None:
+    val = os.getenv(name)
+    if val is None:
+        return None
+    val = val.strip()
+    if not val:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
+def _env_json_dict(name: str) -> dict | None:
+    val = os.getenv(name)
+    if val is None:
+        return None
+    val = val.strip()
+    if not val:
+        return None
+    try:
+        data = json.loads(val)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
 
 
 def _env_str(name: str, default: str) -> str:
@@ -57,6 +87,9 @@ USE_VOL_PARITY = True
 
 USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", True)
 BACKTEST_USE_FULL_HISTORY = _env_bool("BACKTEST_USE_FULL_HISTORY", True)
+BEAR_CASH_OUT = _env_bool("BEAR_CASH_OUT", False)
+BEAR_GROSS_TARGET = _env_optional_float("BEAR_GROSS_TARGET")
+REGIME_GROSS_TARGETS = _env_json_dict("REGIME_GROSS_TARGETS")
 
 # ---- Market/Cost Configuration ----
 TRADING_REGION = _env_str("TRADING_REGION", "india").lower()

@@ -323,12 +323,25 @@ def regime_gross_target(state: dict) -> float:
     trend_state = state.get("trend_state")
     if not trend_state:
         trend_state = "bull" if state.get("trend_up") else "bear"
+    override = getattr(config, "REGIME_GROSS_TARGETS", None) or {}
+    regime_label = state.get("regime_label")
+    if regime_label in override:
+        try:
+            return max(0.0, min(1.1, float(override[regime_label])))
+        except (TypeError, ValueError):
+            pass
     trend_up = trend_state == "bull"
     vol_high = bool(state.get("vol_high", False))
     dispersion_high = bool(state.get("dispersion_high", False))
     dispersion_low = bool(state.get("dispersion_low", False))
     breadth_low = bool(state.get("breadth_low", False))
     breadth_high = bool(state.get("breadth_high", False))
+
+    if trend_state == "bear":
+        if config.BEAR_CASH_OUT:
+            return 0.0
+        if config.BEAR_GROSS_TARGET is not None:
+            return max(0.0, min(1.1, config.BEAR_GROSS_TARGET))
 
     gross = 0.85
     if trend_state == "sideways":

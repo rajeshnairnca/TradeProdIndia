@@ -73,3 +73,6 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added `--plot` support to `scripts/backtesting/sector_experiments.py` to save equity curve PNGs under the run output directory.
 - Added regime-background shading to sector experiment plots using regime labels.
 - Darkened regime background colors in sector experiment plots for better visibility.
+- Added `BEAR_CASH_OUT` config flag to optionally zero exposure in bear regimes.
+- Added `BEAR_GROSS_TARGET` to allow fixed bear-regime exposure overrides.
+- Added `REGIME_GROSS_TARGETS` support for per-regime gross target overrides.
