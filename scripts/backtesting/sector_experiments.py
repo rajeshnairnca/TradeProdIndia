@@ -7,6 +7,10 @@ import sys
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib import patches as mpatches
 import pandas as pd
 from tqdm import tqdm
 
@@ -89,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional output directory (enables resume).",
     )
     parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Save equity curve PNGs under the output directory.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from existing summary CSV in --output-dir.",
@@ -116,9 +125,14 @@ def _run_backtest(
     regime_table: pd.DataFrame,
     start_date: pd.Timestamp | None,
     end_date: pd.Timestamp | None,
+    plot_path: str | None = None,
+    plot_title: str | None = None,
+    plot_regime_table: pd.DataFrame | None = None,
 ) -> dict:
     backtester = RuleBasedBacktester(df, strategies, regime_table=regime_table)
     result = backtester.run(start_date=start_date, end_date=end_date)
+    if plot_path:
+        _save_equity_plot(result, plot_path, plot_title, regime_table=plot_regime_table)
     metrics = result.metrics
     return {
         "cagr_pct": metrics.get("CAGR"),
@@ -127,6 +141,91 @@ def _run_backtest(
         "final_net_worth": metrics.get("final_net_worth"),
         "metrics": metrics,
     }
+
+
+def _sanitize_filename(value: str) -> str:
+    return "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in value)
+
+
+def _plot_path(base_dir: str | None, sector: str, scope: str, label: str) -> str | None:
+    if not base_dir:
+        return None
+    name = "_".join(
+        _sanitize_filename(part) for part in (sector, scope, label) if part
+    )
+    return os.path.join(base_dir, f"{name}.png")
+
+
+def _regime_color_map(labels: list[str]) -> dict[str, str]:
+    base = {
+        "bull_low_vol": "#52B788",
+        "bull_high_vol": "#4D96FF",
+        "bear_low_vol": "#F4A261",
+        "bear_high_vol": "#E76F51",
+        "sideways_low_vol": "#B5B5B5",
+        "sideways_high_vol": "#E9C46A",
+        "unknown": "#BDBDBD",
+    }
+    palette = [
+        "#4D96FF",
+        "#E76F51",
+        "#52B788",
+        "#F4A261",
+        "#B5B5B5",
+        "#E9C46A",
+        "#6D9DC5",
+        "#D68FD0",
+    ]
+    next_idx = 0
+    for label in labels:
+        if label not in base:
+            base[label] = palette[next_idx % len(palette)]
+            next_idx += 1
+    return base
+
+
+def _add_regime_background(ax, dates: list[pd.Timestamp], regime_series: pd.Series) -> None:
+    if regime_series is None or regime_series.empty:
+        return
+    labels = regime_series.fillna("unknown").astype(str).tolist()
+    if not labels:
+        return
+    color_map = _regime_color_map(sorted(set(labels)))
+    start_idx = 0
+    for i in range(1, len(labels)):
+        if labels[i] != labels[start_idx]:
+            ax.axvspan(dates[start_idx], dates[i], color=color_map[labels[start_idx]], alpha=0.28, linewidth=0)
+            start_idx = i
+    ax.axvspan(dates[start_idx], dates[-1], color=color_map[labels[start_idx]], alpha=0.28, linewidth=0)
+
+    unique_labels = sorted(set(labels))
+    if len(unique_labels) <= 8:
+        handles = [mpatches.Patch(color=color_map[label], label=label) for label in unique_labels]
+        ax.legend(handles=handles, loc="upper left", fontsize=8, framealpha=0.9)
+
+
+def _save_equity_plot(
+    result,
+    plot_path: str,
+    title: str | None,
+    regime_table: pd.DataFrame | None = None,
+) -> None:
+    if result is None or not getattr(result, "equity_curve", None):
+        return
+    plt.figure(figsize=(10, 4))
+    ax = plt.gca()
+    if regime_table is not None and "regime_label" in regime_table.columns:
+        idx = pd.Index(result.dates)
+        regimes = regime_table.reindex(idx)["regime_label"]
+        _add_regime_background(ax, list(idx), regimes)
+    ax.plot(result.dates, result.equity_curve)
+    plt.xlabel("Date")
+    plt.ylabel("Equity")
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.savefig(plot_path)
+    plt.close()
 
 
 def _mapping_iter(strategy_names: list[str], regime_labels: list[str], allow_reuse: bool):
@@ -154,6 +253,8 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
     mapping_allow_reuse = payload.get("mapping_allow_reuse", False)
     mapping_max = payload.get("mapping_max")
     mapping_fixed = payload.get("mapping")
+    plot_enabled = payload.get("plot", False)
+    plot_dir = payload.get("plot_dir")
     skip_strategies = set(payload.get("skip_strategies", []))
     start_date = pd.to_datetime(payload["start_date"]) if payload["start_date"] else None
     end_date = pd.to_datetime(payload["end_date"]) if payload["end_date"] else None
@@ -194,6 +295,15 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
             strategy_selector=selector,
         )
         result = backtester.run(start_date=start_date, end_date=end_date)
+        if plot_enabled:
+            os.makedirs(plot_dir, exist_ok=True)
+            plot_path = _plot_path(plot_dir, sector, scope, "mapping_fixed")
+            _save_equity_plot(
+                result,
+                plot_path,
+                f"{sector} | {scope} | mapping_fixed",
+                regime_table=regime_table,
+            )
         rows.append(
             {
                 "sector": sector,
@@ -234,6 +344,7 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
             mapping_total = mapping_max
 
         best_row = None
+        best_result = None
         evaluated = 0
         for combo in mapping_iter:
             mapping = dict(zip(regime_labels, combo))
@@ -271,13 +382,33 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
             }
             if best_row is None or (row["cagr_pct"] or -1e9) > (best_row["cagr_pct"] or -1e9):
                 best_row = row
+                best_result = result
         if best_row:
+            if plot_enabled and best_result is not None:
+                os.makedirs(plot_dir, exist_ok=True)
+                plot_path = _plot_path(plot_dir, sector, scope, "mapping_best")
+                _save_equity_plot(
+                    best_result,
+                    plot_path,
+                    f"{sector} | {scope} | mapping_best",
+                    regime_table=regime_table,
+                )
             rows.append(best_row)
     elif mode == "best_single":
         for strategy in strategies:
             if strategy.name in skip_strategies:
                 continue
-            result = _run_backtest(sector_df, [strategy], regime_table, start_date, end_date)
+            plot_path = _plot_path(plot_dir, sector, scope, strategy.name) if plot_enabled else None
+            result = _run_backtest(
+                sector_df,
+                [strategy],
+                regime_table,
+                start_date,
+                end_date,
+                plot_path=plot_path,
+                plot_title=f"{sector} | {scope} | {strategy.name}",
+                plot_regime_table=regime_table,
+            )
             rows.append(
                 {
                     "sector": sector,
@@ -293,7 +424,17 @@ def _evaluate_sector_scope_task(payload: dict) -> list[dict]:
                 }
             )
     else:
-        result = _run_backtest(sector_df, strategies, regime_table, start_date, end_date)
+        plot_path = _plot_path(plot_dir, sector, scope, "ensemble") if plot_enabled else None
+        result = _run_backtest(
+            sector_df,
+            strategies,
+            regime_table,
+            start_date,
+            end_date,
+            plot_path=plot_path,
+            plot_title=f"{sector} | {scope} | ensemble",
+            plot_regime_table=regime_table,
+        )
         rows.append(
             {
                 "sector": sector,
@@ -366,6 +507,9 @@ def main() -> None:
         stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(PROJECT_ROOT, args.output_root, "sector_experiments", stamp)
     os.makedirs(output_dir, exist_ok=True)
+    plot_dir = os.path.join(output_dir, "plots") if args.plot else None
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
 
     summary_path = os.path.join(output_dir, "sector_experiment_summary.csv")
     mapping_summary_path = os.path.join(output_dir, "sector_regime_mapping_summary.csv")
@@ -454,6 +598,8 @@ def main() -> None:
                             "mapping": mapping_fixed,
                             "start_date": args.start_date,
                             "end_date": args.end_date,
+                            "plot": args.plot,
+                            "plot_dir": plot_dir,
                         }
                     )
                 elif args.best_single_strategy:
@@ -471,6 +617,8 @@ def main() -> None:
                             "skip_strategies": sorted(done),
                             "start_date": args.start_date,
                             "end_date": args.end_date,
+                            "plot": args.plot,
+                            "plot_dir": plot_dir,
                         }
                     )
                 else:
@@ -487,6 +635,8 @@ def main() -> None:
                             "mode": mode,
                             "start_date": args.start_date,
                             "end_date": args.end_date,
+                            "plot": args.plot,
+                            "plot_dir": plot_dir,
                         }
                     )
 
@@ -599,6 +749,7 @@ def main() -> None:
                         }
                         if best_row is None or (row["cagr_pct"] or -1e9) > (best_row["cagr_pct"] or -1e9):
                             best_row = row
+                            best_result = result
 
                     if best_row:
                         needs_header = not os.path.exists(mapping_summary_path)
@@ -607,6 +758,14 @@ def main() -> None:
                             if needs_header:
                                 writer.writeheader()
                             writer.writerow(best_row)
+                        if args.plot and best_result is not None:
+                            plot_path = _plot_path(plot_dir, sector, scope, "mapping_best")
+                            _save_equity_plot(
+                                best_result,
+                                plot_path,
+                                f"{sector} | {scope} | mapping_best",
+                                regime_table=regime_table,
+                            )
                         completed.add(key)
                 elif mapping_fixed:
                     key = (sector, scope, "__mapping_fixed__")
@@ -649,6 +808,14 @@ def main() -> None:
                         if needs_header:
                             writer.writeheader()
                         writer.writerow(row)
+                    if args.plot:
+                        plot_path = _plot_path(plot_dir, sector, scope, "mapping_fixed")
+                        _save_equity_plot(
+                            result,
+                            plot_path,
+                            f"{sector} | {scope} | mapping_fixed",
+                            regime_table=regime_table,
+                        )
                     completed.add(key)
                 elif args.best_single_strategy:
                     for strategy in strategies:
@@ -659,7 +826,17 @@ def main() -> None:
                             f"Running {sector} ({scope}) | {strategy.name} "
                             f"with {len(sector_tickers)} tickers..."
                         )
-                        result = _run_backtest(sector_df, [strategy], regime_table, start_date, end_date)
+                        plot_path = _plot_path(plot_dir, sector, scope, strategy.name) if args.plot else None
+                        result = _run_backtest(
+                            sector_df,
+                            [strategy],
+                            regime_table,
+                            start_date,
+                            end_date,
+                            plot_path=plot_path,
+                            plot_title=f"{sector} | {scope} | {strategy.name}",
+                            plot_regime_table=regime_table,
+                        )
                         row = {
                             "sector": sector,
                             "regime_scope": scope,
@@ -684,7 +861,17 @@ def main() -> None:
                     if key in completed:
                         continue
                     print(f"Running {sector} ({scope}) with {len(sector_tickers)} tickers...")
-                    result = _run_backtest(sector_df, strategies, regime_table, start_date, end_date)
+                    plot_path = _plot_path(plot_dir, sector, scope, "ensemble") if args.plot else None
+                    result = _run_backtest(
+                        sector_df,
+                        strategies,
+                        regime_table,
+                        start_date,
+                        end_date,
+                        plot_path=plot_path,
+                        plot_title=f"{sector} | {scope} | ensemble",
+                        plot_regime_table=regime_table,
+                    )
                     row = {
                         "sector": sector,
                         "regime_scope": scope,

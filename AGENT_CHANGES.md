@@ -68,3 +68,8 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added `--regime-mapping` support to `scripts/backtesting/sector_experiments.py` for fixed per-regime mappings.
 - Documented the 31% CAGR sector experiment command in `README.md`.
 - Set `WEIGHT_SMOOTHING` default to 0.85 in `src/config.py` for longer holds.
+
+## 2026-01-24
+- Added `--plot` support to `scripts/backtesting/sector_experiments.py` to save equity curve PNGs under the run output directory.
+- Added regime-background shading to sector experiment plots using regime labels.
+- Darkened regime background colors in sector experiment plots for better visibility.
