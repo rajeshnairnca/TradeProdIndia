@@ -76,3 +76,6 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added `BEAR_CASH_OUT` config flag to optionally zero exposure in bear regimes.
 - Added `BEAR_GROSS_TARGET` to allow fixed bear-regime exposure overrides.
 - Added `REGIME_GROSS_TARGETS` support for per-regime gross target overrides.
+
+## 2026-01-25
+- Added US sell-side FINRA per-share and SEC notional fees to the cost model, with env overrides and backtester wiring.

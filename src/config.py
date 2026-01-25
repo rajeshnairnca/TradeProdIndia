@@ -94,6 +94,8 @@ REGIME_GROSS_TARGETS = _env_json_dict("REGIME_GROSS_TARGETS")
 # ---- Market/Cost Configuration ----
 TRADING_REGION = _env_str("TRADING_REGION", "india").lower()
 US_COMMISSION_RATE = _env_float("US_COMMISSION_RATE", 0.0015)
+US_FINRA_FEE_PER_SHARE = _env_float("US_FINRA_FEE_PER_SHARE", 0.000195)
+US_SEC_FEE_RATE = _env_float("US_SEC_FEE_RATE", 0.0000278)
 UNIVERSE_FILTER = os.getenv("UNIVERSE_FILTER", "all").strip().lower()
 
 # ---- Data Configuration ----

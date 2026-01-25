@@ -199,7 +199,9 @@ class RuleBasedBacktester:
             safe_adv_dollars = np.maximum(safe_adv_dollars, config.MIN_ADV_DOLLARS_SLIPPAGE)
             trade_frac_adv = np.abs(trade_dollars) / (safe_adv_dollars + 1e-9)
             slippage_costs = np.sum(np.abs(trade_dollars) * (config.SLIPPAGE_COEFF * trade_frac_adv))
-            brokerage_costs = np.sum(vectorized_brokerage_calculator(trade_dollars))
+            brokerage_costs = np.sum(
+                vectorized_brokerage_calculator(trade_dollars, trade_shares=trade_shares)
+            )
             total_costs = slippage_costs + brokerage_costs
 
             cash -= np.sum(trade_dollars) + total_costs
