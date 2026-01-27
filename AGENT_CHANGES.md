@@ -126,3 +126,5 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 
 ## 2026-01-27
 - Cleaned the repo for the GitHub move: removed local venv/caches/logs and selected scripts/utilities; updated .gitignore, Dockerfile, requirements, config, and the data extraction script.
+
+- Rewrote git history to purge the tracked `venv/` directory (removes large files blocking GitHub push).
