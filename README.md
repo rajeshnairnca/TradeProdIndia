@@ -1,306 +1,144 @@
-# Autonomous Trading Ensemble System (Deterministic, Rule-Based)
+# Trading Ensemble System (Rule-Based)
 
-## Project Overview
+## Overview
 
-This project is a deterministic, rule-based trading system that runs an ensemble of strategies and adapts which ones are active based on market regime (trend/volatility/breadth/dispersion). A large language model (LLM) can propose new rule-based strategies, which are then backtested and promoted if they improve performance.
+This repository contains a deterministic, rule-based trading system. It loads strategy signals, tags them by market regime, and runs ensemble backtests or production trade generation. A production pipeline can refresh market data, generate daily trades, and expose results through a small API.
 
-Key technologies:
-
-* **Python**
-* **Pandas & NumPy** for data manipulation
-* **Matplotlib** for plotting
-* **Google Generative AI** for LLM strategy generation
-
-## Project Structure
+## Repository Layout
 
 ```
-/
-├─── _candidates/      # Staging area for LLM-proposed strategies.
-├─── alphas/           # Home for promoted strategies (each has strategy.py + description.txt).
-│    └─── _ensembles/  # Stores backtest results for strategy combinations.
-├─── data/             # Raw data files (daily prices, indicators).
-├─── scripts/          # Executable scripts (backtesting, orchestration).
-├─── src/              # Core strategy + backtesting logic.
-├─── README.md         # This file.
-└─── requirements.txt
+.
+├── alphas/                   # Promoted strategies (each folder: strategy.py + description.txt)
+│   └── _ensembles/           # Backtest outputs by region
+├── data/                     # Local data: parquet, raw DB, universe lists
+├── scripts/                  # CLI entry points
+│   ├── backtesting/          # Backtester, sweeps, sector experiments
+│   ├── data_extraction/      # yfinance extractor
+│   └── production/           # Daily run, API server, queue tools
+├── src/                      # Core engine (regimes, backtester, portfolio, production)
+├── runs/                     # Runtime artifacts (ignored by git)
+├── logs/                     # Logs (ignored by git)
+├── requirements.txt
+├── requirements.production.txt
+└── Dockerfile
 ```
 
 ## Strategy Format
 
-Each strategy lives under `alphas/<strategy_name>/strategy.py` and must define:
+Each strategy lives at `alphas/<strategy_name>/strategy.py` and must define:
 
-* `DESCRIPTION`: one-line description
-* `REGIME_TAGS`: list of regimes (bull_low_vol, bull_high_vol, bear_low_vol, bear_high_vol)
-* `generate_scores(df: pd.DataFrame) -> pd.Series`: returns a score per row (same index as `df`)
+- `DESCRIPTION`: short text summary
+- `REGIME_TAGS`: list of regime labels (any of: `bull_low_vol`, `bull_high_vol`, `bear_low_vol`, `bear_high_vol`, `sideways_low_vol`, `sideways_high_vol`)
+- `generate_scores(df: pd.DataFrame) -> pd.Series`: per-row scores aligned to the input index
 
-## Ensemble Logic
+## Setup
 
-On each day:
-
-1. Determine market regime from `src/regime.py`.
-2. Select strategies whose `REGIME_TAGS` match.
-3. Z-score each strategy’s cross-sectional signal and average them.
-4. Build a top‑K portfolio with optional volatility parity and regime-based sizing.
-
-## Usage
-
-### 1. Install Dependencies
+- Use Python 3.11.
+- Activate your virtual environment before running anything.
 
 ```bash
-/path/to/your/venv/bin/pip install -r requirements.txt
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. Backtest Strategies
+For production containers, use `requirements.production.txt` (see `Dockerfile`).
+
+## Backtesting
 
 ```bash
-# Backtest a single strategy
+# Single strategy
 caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following
 
-# Backtest multiple strategies as an ensemble
-caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following rule_mean_reversion rule_volatility_breakout
-```
+# Ensemble
+caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following rule_mean_reversion
 
-By default, the backtester filters the universe to the Nasdaq 100 list. To disable the filter:
-
-```bash
-UNIVERSE_FILTER=all caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following
-```
-
-### 2b. Sweep Strategy Combinations
-
-```bash
-# Find the best combo among all strategies
-caffeinate -i python3 scripts/backtesting/strategy_sweep.py
-
-# Limit combo sizes and samples
-caffeinate -i python3 scripts/backtesting/strategy_sweep.py --min-size 2 --max-size 4 --max-combos 100
-```
-
-### 3. Walk-Forward Validation
-
-```bash
-caffeinate -i python3 src/walkforward.py --alpha-name rule_trend_following
-```
-
-### 4. Orchestrate LLM Strategy Generation
-
-```bash
-caffeinate -i python3 scripts/orchestration/orchestrator.py
-```
-
-The orchestrator will:
-
-1. Summarize current strategies.
-2. Ask the LLM for a new rule-based strategy.
-3. Backtest the candidate with the ensemble.
-4. Promote the candidate if it improves results.
-
-## Command Reference (Scripts + Flags)
-
-Use `caffeinate -i` for long runs (examples below use it where helpful).
-
-### Backtester
-
-Command: `python3 scripts/backtesting/backtester.py`
-
-Flags:
-- `--strategies`: list of strategy names to include (default: all in `alphas/`).
-- `--strategy-roots`: repeatable; root dirs to load strategies from (default: `alphas`).
-- `--output-root`: root directory for outputs (default: `alphas`).
-- `--use-full-history`: ignore holdout split and backtest full history.
-- `--start-date`: YYYY-MM-DD inclusive start date.
-- `--end-date`: YYYY-MM-DD exclusive end date.
-
-Examples:
-```bash
-caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following
-```
-
-### Strategy Sweep
-
-Command: `python3 scripts/backtesting/strategy_sweep.py`
-
-Flags:
-- `--strategies`: list of strategy names to consider (default: all in `alphas/`).
-- `--strategy-roots`: repeatable; root dirs to load strategies from.
-- `--min-size`: minimum strategies per combo (default: 1).
-- `--max-size`: maximum strategies per combo (default: all).
-- `--max-combos`: cap combinations evaluated.
-- `--seed`: RNG seed for sampling combos (default: 42).
-- `--metric`: metric to optimize: `cagr`, `sharpe`, `max_drawdown`.
-- `--start-date`: YYYY-MM-DD inclusive start.
-- `--end-date`: YYYY-MM-DD exclusive end.
-- `--output-root`: output root (default: `alphas`).
-- `--jobs`: parallel workers (1 = serial).
-
-Example:
-```bash
+# Sweep combinations
 caffeinate -i python3 scripts/backtesting/strategy_sweep.py --min-size 2 --max-size 4 --max-combos 200 --jobs 7
 ```
 
-### Sector Experiments
+Sector experiments:
 
-Command: `python3 scripts/backtesting/sector_experiments.py`
-
-Flags:
-- `--sectors`: comma-separated sector names or repeatable (default: all).
-- `--start-date`: YYYY-MM-DD inclusive start.
-- `--end-date`: YYYY-MM-DD exclusive end.
-- `--regime-scope`: `global` or `sector` (compute regimes on global data or per-sector).
-- `--regime-mapping`: JSON mapping from regime to strategy name.
-
-Example (31% CAGR run):
 ```bash
-TRADING_REGION=us DATA_FILE=data/daily_data_us_31percent.parquet REGIME_MODE=heuristic caffeinate -i \
-  python3 scripts/backtesting/sector_experiments.py \
-  --sectors Technology \
-  --start-date 2010-01-01 \
-  --end-date 2025-01-01 \
-  --regime-scope sector \
-  --regime-mapping '{"bear_high_vol":"rule_mean_reversion","bear_low_vol":"rule_low_vol_defensive","bull_high_vol":"rule_quality_min_vol","bull_low_vol":"rule_momentum_acceleration","sideways_high_vol":"rule_range_reversion","sideways_low_vol":"rule_trend_strength"}'
+caffeinate -i python3 scripts/backtesting/sector_experiments.py --sectors Technology --regime-scope sector --plot
 ```
 
-### Walk-Forward Validation
+Outputs are written under `alphas/_ensembles/<region>/...` (backtester, sweeps) or `runs/` (sector experiments).
 
-Command: `python3 src/walkforward.py`
+## Production Pipeline
 
-Flags:
-- `--alpha-name`: single strategy name.
-- `--strategies`: list of strategy names to validate together.
-- `--strategy-roots`: repeatable; root dirs to load strategies from.
+Daily run (TradingView refresh + trade generation):
 
-Example:
 ```bash
-caffeinate -i python3 src/walkforward.py --alpha-name rule_trend_following
+caffeinate -i python3 scripts/production/daily_run.py
 ```
 
-### LLM Orchestration
+Useful options:
+- `--skip-update` to avoid TradingView calls (local dry runs)
+- `--print-trades` to emit trades to stdout
+- `--sector` and `--regime-scope` for sector-focused production runs
 
-Command: `python3 scripts/orchestration/orchestrator.py`
+Queue adjustments (cash or tickers):
 
-Flags:
-- `--llm-guidance`: extra prompt guidance passed to the LLM.
-- `--sweep-baseline`: run a combo sweep to pick the baseline ensemble.
-- `--sweep-min-size`: minimum strategies in sweep combos.
-- `--sweep-max-size`: maximum strategies in sweep combos.
-- `--sweep-max-combos`: max combos to evaluate per sweep.
-- `--sweep-metric`: metric for sweep (`cagr`, `sharpe`, `max_drawdown`).
-
-### ML Regime Strategy Selector
-
-Command: `python3 scripts/ml_regime/ml_strategy_selector.py`
-
-Flags:
-- `--strategies`: list of strategy names to include (default: all in `alphas/`).
-- `--strategy-roots`: repeatable; root dirs to load strategies from.
-- `--start-date`: YYYY-MM-DD inclusive start.
-- `--end-date`: YYYY-MM-DD exclusive end.
-- `--train-ratio`: train/test split (default: `config.TRAIN_RATIO`).
-- `--confirm-days`: consecutive days before a regime switch is confirmed (default: 10).
-- `--output-root`: output root (default: `runs`).
-- `--jobs`: CPU threads for XGBoost training.
-- `--mapping-search`: exhaustive search: one strategy per regime, pick best CAGR.
-- `--mapping-allow-reuse`: allow strategies to repeat across regimes during mapping.
-- `--mapping-max`: cap number of mappings evaluated.
-- `--mapping-jobs`: parallel workers for mapping search.
-- `--eval-full-period`: run the hybrid backtest (and mapping eval) over the full filtered period instead of test split.
-- `--skip-ml`: bypass XGBoost training and use regime labels directly (optionally confirm-smoothed); skips train/test split.
-
-Example (HMM rolling, 7 regimes, mapping search):
 ```bash
-REGIME_MODE=hmm_rolling HMM_N_COMPONENTS=7 HMM_STATE_LABELS=1 TRADING_REGION=us \
-caffeinate -i python3 scripts/ml_regime/ml_strategy_selector.py --mapping-search --mapping-jobs 7
+python3 scripts/production/queue_adjustments.py --add-cash 50000 --add-tickers NVDA,TSLA
 ```
 
-Outputs:
-- Per-run results under `runs/ml_regime/<timestamp>/`
-- Rolling summary appended to `runs/ml_regime/summary.csv`
+Backfill Postgres (if enabled):
 
-### Regime Visualization
-
-Command: `python3 scripts/visualize_regimes.py`
-
-Flags:
-- `--region`: `us` or `india` (defaults to `TRADING_REGION`).
-- `--data-file`: override parquet path.
-- `--output`: output file for 4‑state comparison (default: `regime_comparison_4states.png`).
-- `--output-states`: output file for raw HMM state plot.
-- `--skip-hmm`: skip full-history HMM panel.
-- `--skip-hmm-rolling`: skip rolling HMM panel.
-- `--plot-hmm-states`: render HMM states (uses `hmm_state`).
-
-Example:
 ```bash
-TRADING_REGION=us HMM_N_COMPONENTS=7 caffeinate -i \
-python3 scripts/visualize_regimes.py --plot-hmm-states --output my_regime_plot.png
+python3 scripts/production/backfill_db.py
 ```
 
-### Data Extraction (yfinance)
+## Production API
 
-Command: `python3 "scripts/data_extraction/data_extract_yfinance - days - v6.py"`
+Start the API server:
 
-Flags:
-- `--stocks-file`: newline-delimited ticker list (default: built‑in list).
-- `--output-file`: output parquet (default: `data/daily_data.parquet`).
-- `--period`: yfinance period (default: `20y`).
-- `--interval`: yfinance interval (default: `1d`).
-- `--min-trading-days`: minimum rows per ticker (default: 50).
-- `--rolling-window`: rolling window for ADV/vol/VIX z (default: 21).
-- `--vix-ticker`: VIX ticker (default: `^VIX`).
+```bash
+uvicorn scripts.production.api_server:app --host 0.0.0.0 --port 8000
+```
 
-### XGBoost Alpha (Train)
+Key endpoints:
+- `GET /health`
+- `GET /latest-run`, `GET /latest-summary`, `GET /latest-trades`
+- `GET /trades`, `GET /cagr`, `GET /portfolio`, `GET /universe`
+- `POST /queue-adjustments`, `GET /pending-adjustments`, `POST /clear-pending`, `DELETE /pending-adjustments`
 
-Command: `python3 scripts/xgboost/train_xgb_alpha.py`
+Set `API_KEY` to protect non-health routes (supports `X-API-Key` or `Authorization: Bearer`).
 
-Flags:
-- `--alpha-name`: name for saved XGB alpha (required).
-- `--features-file`: optional feature engineering Python file.
-- `--description`: description stored in results.
-- `--walkforward-folds`: number of walk-forward folds (0 = skip).
+## Data
 
-### XGBoost Alpha (Backtest)
+- `data/daily_data_*.parquet` is the primary price/feature store.
+- `data/market_data.db` is the raw SQLite store for yfinance ingestion.
+- `data/universe_us.txt` and `data/universe_us_exchange_map.json` control the production universe and exchange mapping.
 
-Command: `python3 scripts/xgboost/backtest_xgb_alpha.py`
+Yfinance extraction:
 
-Flags:
-- `--alpha-name`: base alpha name (required; without `_xgb`).
-- `--features-file`: optional feature engineering Python file.
-- `--top-k`: number of tickers to allocate each day.
-- `--gross-cap`: gross exposure cap (1.0 = fully invested).
-- `--max-weight`: max per‑name weight.
-- `--cost-bps`: round‑trip cost in bps.
-- `--sector-cap`: max sector weight as fraction of gross.
-- `--target-vol`: annualized target vol (0 to disable).
-- `--vol-window`: lookback window (days) for realized vol.
-- `--min-gross`: minimum gross when vol targeting is on.
-- `--max-gross`: maximum gross when vol targeting is on.
+```bash
+python3 "scripts/data_extraction/data_extract_yfinance - days - v6.py" --output-file data/daily_data_us.parquet
+```
 
-### Hyperparameter Tuning
+## Configuration (Environment)
 
-Command: `python3 scripts/tuning/tune_hyperparameters.py`
+Common env flags (see `src/config.py`):
 
-Flags:
-- none (runs with internal Optuna settings).
+- `TRADING_REGION` (`us` or `india`)
+- `DATA_FILE` (override parquet path)
+- `DATA_ROOT` (prefix for relative paths)
+- `UNIVERSE_FILTER` (`all`, `none`, `nasdaq100`, or comma-separated tickers)
+- `REGIME_MODE` (`heuristic`, `hmm`, `hmm_rolling`)
+- `HMM_N_COMPONENTS`, `HMM_WARMUP_PERIOD`, `HMM_STEP_SIZE`, `HMM_STATE_LABELS`
+- `BEAR_CASH_OUT`, `BEAR_GROSS_TARGET`, `REGIME_GROSS_TARGETS`
+- `RETENTION_TRADING_DAYS` (production data retention)
 
-### Analysis Helper (Regime/Strategy Fit)
+Production storage + API:
 
-Command: `python3 scripts/analysis/regime_strategy_fit.py`
+- `DATABASE_URL` / `POSTGRES_URL` enables Postgres-backed runs/trades/state
+- `API_KEY` for API auth
+- `EXCHANGE_MAP_FILE`, `OUTPUT_DIR`, `STATE_FILE`, `PENDING_FILE` for API paths
 
-Flags:
-- none.
+## Notes
 
-## Environment Flags (Global)
-
-These are read from the environment via `src/config.py`:
-- `TRADING_REGION`: `us` or `india` (drives default data file and output routing).
-- `DATA_FILE`: override data parquet path.
-- `UNIVERSE_FILTER`: `all`, `none`, `nasdaq100`, or comma‑separated tickers.
-- `REGIME_MODE`: `heuristic`, `hmm`, or `hmm_rolling`.
-- `HMM_N_COMPONENTS`: number of HMM states (regimes).
-- `HMM_WARMUP_PERIOD`: initial HMM training window (days).
-- `HMM_STEP_SIZE`: HMM rolling prediction block size (days).
-- `HMM_STATE_LABELS`: `1/true` to use `hmm_state_*` labels instead of 4‑state bull/bear.
-- `HMM_COVARIANCE_TYPE`: `full` or `diag` (HMM fit stability).
-- `HMM_MIN_COVAR`: minimum covariance floor for HMM.
-- `USE_REGIME_SYSTEM`: enable/disable regime overlays.
-- `BACKTEST_USE_FULL_HISTORY`: default to full history in backtests.
+- `.env` holds secrets/keys and is ignored by git.
+- Large artifacts belong in `runs/` or `logs/` (ignored by git).
+- There are no formal tests; validate changes via short backtests before long runs.

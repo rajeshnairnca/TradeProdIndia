@@ -128,3 +128,5 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Cleaned the repo for the GitHub move: removed local venv/caches/logs and selected scripts/utilities; updated .gitignore, Dockerfile, requirements, config, and the data extraction script.
 
 - Rewrote git history to purge the tracked `venv/` directory (removes large files blocking GitHub push).
+
+- Rewrote README to match current project structure, scripts, and production workflow.
