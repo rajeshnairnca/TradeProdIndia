@@ -1,7 +1,7 @@
-# requirements.txt
+# requirements.production.txt
 
 # Core data handling
-numpy==1.26.4
+numpy>=2.0.0,<3
 pandas
 matplotlib
 tqdm
@@ -12,7 +12,7 @@ pyarrow
 # Market data + indicators
 yfinance
 tradingview_ta
-pandas-ta
+pandas-ta-classic
 
 # API server
 fastapi

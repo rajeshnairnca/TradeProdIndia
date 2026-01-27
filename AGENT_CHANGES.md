@@ -79,3 +79,50 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 
 ## 2026-01-25
 - Added US sell-side FINRA per-share and SEC notional fees to the cost model, with env overrides and backtester wiring.
+- Added production pipeline helpers in `src/production.py` to update market data and generate daily trades, now sourced from TradingView via `tradingview_ta`.
+- Added `scripts/production/daily_run.py` for daily data refresh + trade generation output.
+- Added `yfinance`, `tradingview_ta`, and `pandas_ta` to `requirements.txt` for market data/indicator dependencies.
+- Added sector-filtered production runs with `--sector` and `--regime-scope` to mirror sector experiment behavior.
+- Added a guard to require all tickers update from TradingView before writing the parquet (override with `--allow-partial-updates`).
+- Defaulted production runs to the Technology sector with global heuristic regimes and the specified regime-to-strategy mapping in `scripts/production/daily_run.py`.
+- Cleaned repository by removing non-production/backtesting scripts, logs, runs, and analysis artifacts (kept data files).
+- Added production support for cash injections and adding new tickers with yfinance history before daily TradingView updates.
+- Added a cash injection log and a universe registry CSV to track added tickers.
+- Added pending adjustments queue support (cash/ticker) and a helper script `scripts/production/queue_adjustments.py` for app-driven updates.
+- Added production data pruning to keep only the most recent trading days (configurable via `RETENTION_TRADING_DAYS`).
+- Added `DATA_ROOT` path support and a minimal FastAPI server (`scripts/production/api_server.py`) with a POST endpoint to queue adjustments.
+- Added API endpoints to list and clear pending adjustments.
+- Added DELETE /pending-adjustments as an alias to clear the queue.
+- Added API key protection for non-health endpoints, updated Dockerfile for Railway, and added a production dry-run script.
+- Added /latest-run endpoint to report the most recent production run date.
+- Added .dockerignore to keep container builds small and fixed pandas-ta dependency name for Docker installs.
+- Switched pandas-ta dependency to pandas_ta for container compatibility.
+- Switched to pandas-ta-classic and updated imports to pandas_ta_classic for container builds.
+- Switched data extraction script to use `pandas_ta` for indicator generation on re-extraction runs.
+- Defaulted data extraction to read tickers from `data/universe_us.txt` instead of the built-in list.
+- Added `requirements.production.txt` with `pandas-ta-classic` + NumPy >=2 for containerized production.
+- Updated Dockerfile to install production requirements; kept `requirements.txt` for pandas_ta-based extraction.
+- Switched TradingView updates in `src/production.py` to batch calls via `get_multiple_analysis`.
+- Added `data/universe_us_exchange_map.json` mapping tickers to NYSE for manual verification.
+- Updated `data/universe_us_exchange_map.json` using TradingView scan data; 2 tickers (MMC, QUBTS) missing from scan.
+- Updated `data/universe_us.txt` to remove MMC and replace QUBTS with QUBT; regenerated exchange map from TradingView data.
+- Added TradingView exchange map support in production updates, with 200-symbol batches capped at 3 requests.
+- Added exchange-aware ticker adjustments via API/queue scripts, and exchange map updates during daily runs.
+- Added API endpoints for current portfolio snapshot and full universe exchange listing.
+- Set initial portfolio cash to $27,000 in config.
+
+## 2026-01-26
+- Tightened .dockerignore to ship only US production data files in container builds.
+- Defaulted Docker image to TRADING_REGION=us for production runs.
+- Added cumulative cost tracking to production state and summaries (with per-day costs preserved).
+- Added daily run backfill to seed cumulative costs from existing summaries.
+- Added /trades endpoint with pagination and /cagr endpoint for overall performance.
+- Added a Postgres-backed production layer (runs, trades, state, pending adjustments) with DATABASE_URL support.
+- Updated production daily run and API server to read/write Postgres when configured.
+- Added cash-flow-adjusted CAGR (time-weighted) alongside the standard CAGR and a money-weighted IRR.
+- Added a backfill script to load existing production runs/trades/state into Postgres.
+- Cleaned local caches/venv artifacts and expanded .gitignore to keep them out of GitHub.
+- Removed local `runs/` directory per cleanup request.
+
+## 2026-01-27
+- Cleaned the repo for the GitHub move: removed local venv/caches/logs and selected scripts/utilities; updated .gitignore, Dockerfile, requirements, config, and the data extraction script.

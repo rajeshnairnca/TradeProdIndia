@@ -1,14 +1,13 @@
-# Dockerfile
+FROM python:3.11-slim
 
-# Use an official Python runtime as a parent image.
-# This is a multi-platform image, so Docker on M1 will pull the arm64 version.
-FROM python:3.9-slim
-
-# Set the working directory in the container to /app
+ENV PYTHONUNBUFFERED=1
+ENV TRADING_REGION=us
 WORKDIR /app
 
-# Copy the requirements file into the container at /app
-COPY requirements.txt .
+COPY requirements.production.txt .
+RUN pip install --no-cache-dir -r requirements.production.txt
 
-# Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+# Default to API server; Railway services can override the command.
+CMD ["uvicorn", "scripts.production.api_server:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.git/
+.gitignore
+.DS_Store
+venv/
+runs/
+logs/
+*.parquet
+*.png
+*.log
+*.csv
+
+# Keep production-only data; exclude everything else in data/.
+data/*
+!data/daily_data_us.parquet
+!data/universe_us.txt
+!data/universe_us_exchange_map.json

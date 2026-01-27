@@ -627,11 +627,16 @@ DEFAULT_INTERVAL = "1d"
 DEFAULT_MIN_TRADING_DAYS = 50
 DEFAULT_ROLLING_WINDOW = 21
 DEFAULT_VIX_TICKER = "^VIX"
+DEFAULT_STOCKS_FILE = "data/universe_us.txt"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download market data, engineer features, and save a consolidated parquet.")
-    parser.add_argument("--stocks-file", help="Path to a newline-delimited list of tickers. If omitted, the built-in list is used.")
+    parser.add_argument(
+        "--stocks-file",
+        default=DEFAULT_STOCKS_FILE,
+        help=f"Path to a newline-delimited list of tickers (default: {DEFAULT_STOCKS_FILE}).",
+    )
     parser.add_argument("--output-file", default=DEFAULT_DATA_FILENAME, help="Path to parquet output (default: data/daily_data.parquet)")
     parser.add_argument("--period", default=DEFAULT_PERIOD, help="yfinance history period (default: 20y)")
     parser.add_argument("--interval", default=DEFAULT_INTERVAL, help="yfinance interval (default: 1d)")
@@ -643,7 +648,9 @@ def parse_args():
 
 def load_stock_list(path: str | None) -> list[str]:
     if not path:
-        return DEFAULT_STOCK_LIST
+        path = DEFAULT_STOCKS_FILE
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Stock list file not found: {path}")
     with open(path, "r") as f:
         tickers = [line.strip() for line in f if line.strip()]
     if not tickers:

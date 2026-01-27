@@ -77,7 +77,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 # ---- Portfolio Configuration ----
-INITIAL_CAPITAL = 1_000_000.0
+INITIAL_CAPITAL = 27_000.0
 TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.15
 TOP_K = 10
@@ -99,11 +99,24 @@ US_SEC_FEE_RATE = _env_float("US_SEC_FEE_RATE", 0.0000278)
 UNIVERSE_FILTER = os.getenv("UNIVERSE_FILTER", "all").strip().lower()
 
 # ---- Data Configuration ----
+DATA_ROOT = _env_str("DATA_ROOT", "").strip()
 REGION_DATA_FILES = {
     "us": "data/daily_data_us.parquet",
     "india": "data/daily_data_india.parquet",
 }
 DATA_FILE = _env_str("DATA_FILE", REGION_DATA_FILES.get(TRADING_REGION, "data/daily_data.parquet"))
+TRADINGVIEW_EXCHANGE_MAP_FILE = _env_str(
+    "TRADINGVIEW_EXCHANGE_MAP_FILE",
+    "data/universe_us_exchange_map.json",
+)
+
+
+def resolve_path(path: str) -> str:
+    if not path:
+        return path
+    if os.path.isabs(path) or not DATA_ROOT:
+        return path
+    return os.path.join(DATA_ROOT, path)
 
 # ---- Penalties & Costs ----
 # From empirical analysis of Indian market brokerage charges
@@ -118,6 +131,10 @@ CASH_RESERVE = 0.01  # keep this fraction in cash to absorb costs
 MIN_ADV_SHARES = 250_000.0  # minimum ADV shares required to trade
 MIN_ADV_DOLLARS_FILTER = 20_000_000.0  # minimum ADV$ required to trade
 MIN_ADV_DOLLARS_SLIPPAGE = 1_000_000.0  # minimum ADV$ used for slippage scaling
+
+# ---- Data Retention ----
+# Keep only the most recent N trading days in production data.
+RETENTION_TRADING_DAYS = _env_int("RETENTION_TRADING_DAYS", 500)
 
 # ---- Walk-Forward Validation Configuration ----
 # If False, the system will use the simple TRAIN_RATIO split.

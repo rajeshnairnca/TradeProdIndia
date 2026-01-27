@@ -2,6 +2,15 @@
 /__pycache__
 *.pyc
 .DS_Store
+/.mypy_cache
+/.pytest_cache
+/.ruff_cache
+/.tmp
+/.mplconfig
+/venv
+/logs
+*.log
+*.csv
 /_candidates
 /alphas
 /candidate_1756738092_walkforward_performance.png
