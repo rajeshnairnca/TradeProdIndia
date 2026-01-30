@@ -1,0 +1,1 @@
+Mean reversion using oversold RSI and distance below short-term trend.

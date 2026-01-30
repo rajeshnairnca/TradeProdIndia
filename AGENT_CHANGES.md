@@ -130,3 +130,9 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Rewrote git history to purge the tracked `venv/` directory (removes large files blocking GitHub push).
 
 - Rewrote README to match current project structure, scripts, and production workflow.
+
+## 2026-01-30
+- Added Postgres-backed price snapshots (`production_prices`) and helpers in `src/production_db.py`.
+- Daily production runs now persist per-ticker close prices to Postgres for the run date.
+- Updated `/portfolio` to price holdings from Postgres when available, with file fallback if no DB prices exist.
+- Stopped ignoring `alphas/` in `.gitignore`, while still ignoring `alphas/_ensembles/` outputs for deploys.

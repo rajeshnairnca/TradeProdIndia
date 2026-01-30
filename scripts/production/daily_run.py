@@ -29,6 +29,7 @@ from src.production_db import (
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
     replace_trades as db_replace_trades,
+    replace_prices as db_replace_prices,
     upsert_run_summary as db_upsert_run_summary,
     upsert_state as db_upsert_state,
 )
@@ -201,6 +202,32 @@ def _update_universe_registry(path: str, tickers: list[str], source: str) -> Non
     else:
         with reg_path.open("a") as f:
             f.writelines(rows)
+
+
+def _build_price_snapshot(df: pd.DataFrame, target_date: pd.Timestamp) -> list[dict[str, float]]:
+    if df is None or df.empty or "Close" not in df.columns:
+        return []
+    date_key = pd.to_datetime(target_date).tz_localize(None)
+    date_values = df.index.get_level_values("date")
+    day_data = df.loc[date_values == date_key]
+    if day_data.empty:
+        return []
+    day_data = day_data.reset_index()
+    if "ticker" not in day_data.columns or "Close" not in day_data.columns:
+        return []
+    prices: list[dict[str, float]] = []
+    for _, row in day_data[["ticker", "Close"]].iterrows():
+        if pd.isna(row["Close"]):
+            continue
+        ticker = str(row["ticker"]).strip().upper()
+        if not ticker:
+            continue
+        try:
+            price = float(row["Close"])
+        except (TypeError, ValueError):
+            continue
+        prices.append({"ticker": ticker, "close_price": price})
+    return prices
 
 
 def _load_pending_adjustments(path: str) -> list[dict]:
@@ -420,6 +447,9 @@ def main():
         if args.date
         else pd.to_datetime(sector_df.index.get_level_values("date").max()).tz_localize(None)
     )
+    price_snapshot: list[dict[str, float]] = []
+    if db_enabled():
+        price_snapshot = _build_price_snapshot(df, target_date)
 
     state_path = _resolve_path(args.state_file)
     state = db_load_state() if db_enabled() else None
@@ -510,6 +540,8 @@ def main():
         if db_enabled():
             db_upsert_run_summary(summary)
             db_replace_trades(summary["date"], trades)
+            if price_snapshot:
+                db_replace_prices(summary["date"], price_snapshot)
         save_state(state_path, new_state)
         if db_enabled():
             db_upsert_state(new_state)

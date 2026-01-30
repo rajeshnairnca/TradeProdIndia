@@ -12,7 +12,7 @@
 *.log
 *.csv
 /_candidates
-/alphas
+alphas/_ensembles/
 /candidate_1756738092_walkforward_performance.png
 /data
 /ensemble_history.json

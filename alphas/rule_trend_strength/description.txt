@@ -1,0 +1,1 @@
+Trend strength based on directional movement and ADX.

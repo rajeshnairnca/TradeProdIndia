@@ -75,6 +75,17 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS production_prices (
+                run_date date NOT NULL,
+                ticker text NOT NULL,
+                close_price double precision,
+                created_at timestamptz DEFAULT now(),
+                PRIMARY KEY (run_date, ticker)
+            );
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS production_state (
                 id integer PRIMARY KEY,
                 last_date date,
@@ -100,6 +111,9 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_trades_ticker_idx ON production_trades (ticker);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_prices_run_date_idx ON production_prices (run_date);"
         )
 
 
@@ -216,6 +230,81 @@ def replace_trades(run_date: str, trades: Iterable[dict[str, Any]]) -> None:
             """,
             rows,
         )
+
+
+def replace_prices(run_date: str, prices: Iterable[dict[str, Any]] | Iterable[tuple[str, float]]) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    rows: list[tuple[str, str, float]] = []
+    for item in prices:
+        ticker = None
+        price = None
+        if isinstance(item, dict):
+            ticker = item.get("ticker")
+            price = item.get("close_price")
+        else:
+            try:
+                ticker, price = item
+            except (TypeError, ValueError):
+                continue
+        if ticker is None:
+            continue
+        ticker_str = str(ticker).strip().upper()
+        if not ticker_str:
+            continue
+        try:
+            price_val = float(price)
+        except (TypeError, ValueError):
+            continue
+        rows.append((run_date, ticker_str, price_val))
+    if not rows:
+        return
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM production_prices WHERE run_date = %s;", (run_date,))
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO production_prices (
+                run_date,
+                ticker,
+                close_price
+            )
+            VALUES %s;
+            """,
+            rows,
+        )
+
+
+def latest_prices(tickers: Iterable[str]) -> tuple[str | None, dict[str, float]]:
+    if not db_enabled():
+        return None, {}
+    init_db()
+    tickers_list = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT run_date FROM production_prices ORDER BY run_date DESC LIMIT 1;")
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return None, {}
+        run_date = row[0]
+        if not tickers_list:
+            return str(run_date), {}
+        cur.execute(
+            """
+            SELECT ticker, close_price
+            FROM production_prices
+            WHERE run_date = %s AND ticker = ANY(%s);
+            """,
+            (run_date, tickers_list),
+        )
+        prices: dict[str, float] = {}
+        for ticker, price in cur.fetchall():
+            if ticker is None or price is None:
+                continue
+            prices[str(ticker).strip().upper()] = float(price)
+        return str(run_date), prices
 
 
 def upsert_state(state: ProductionState) -> None:

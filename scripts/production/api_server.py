@@ -18,6 +18,7 @@ from src.production_db import (
     db_enabled,
     init_db as db_init,
     latest_run_date as db_latest_run_date,
+    latest_prices as db_latest_prices,
     latest_summary as db_latest_summary,
     latest_trades as db_latest_trades,
     list_run_summaries as db_list_run_summaries,
@@ -368,6 +369,46 @@ def portfolio_snapshot():
     positions = state.get("positions", {}) or {}
     if not isinstance(positions, dict):
         positions = {}
+
+    as_of = None
+    price_map: dict[str, float] = {}
+    if _db_ready():
+        as_of, price_map = db_latest_prices(list(positions.keys()))
+
+    if as_of is not None:
+        portfolio_rows = []
+        missing_prices = []
+        portfolio_value = 0.0
+        for ticker, shares in positions.items():
+            try:
+                shares_val = int(shares)
+            except (TypeError, ValueError):
+                shares_val = 0
+            ticker_key = str(ticker).strip().upper()
+            price = price_map.get(ticker_key)
+            value = None
+            if price is not None:
+                value = price * shares_val
+                portfolio_value += value
+            else:
+                missing_prices.append(str(ticker))
+            portfolio_rows.append(
+                {
+                    "ticker": str(ticker),
+                    "shares": shares_val,
+                    "quantity": shares_val,
+                    "price_usd": price,
+                    "value_usd": value,
+                }
+            )
+        return {
+            "as_of": as_of,
+            "cash_usd": cash,
+            "portfolio_value_usd": portfolio_value,
+            "net_worth_usd": cash + portfolio_value,
+            "positions": portfolio_rows,
+            "missing_prices": missing_prices,
+        }
 
     data_path = _resolve_path(config.DATA_FILE)
     if not Path(data_path).exists():

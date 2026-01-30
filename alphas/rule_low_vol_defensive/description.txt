@@ -1,0 +1,1 @@
+Defensive selection favoring low volatility with mild positive drift.

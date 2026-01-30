@@ -1,0 +1,1 @@
+Volatility breakout using ATR expansion, momentum, and volume.
