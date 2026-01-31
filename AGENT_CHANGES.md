@@ -136,3 +136,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Daily production runs now persist per-ticker close prices to Postgres for the run date.
 - Updated `/portfolio` to price holdings from Postgres when available, with file fallback if no DB prices exist.
 - Stopped ignoring `alphas/` in `.gitignore`, while still ignoring `alphas/_ensembles/` outputs for deploys.
+
+## 2026-01-31
+- Added buy-scaling guards in `src/rule_backtester.py` and `src/production.py` to prevent trades from driving cash negative, with recalculated post-trade cash weight.
+- Increased `CASH_RESERVE` to 2% in `src/config.py`.

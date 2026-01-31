@@ -204,10 +204,59 @@ class RuleBasedBacktester:
             )
             total_costs = slippage_costs + brokerage_costs
 
+            cash_after = cash - np.sum(trade_dollars) - total_costs
+            if cash_after < -1e-6 and np.any(trade_dollars > 0):
+                buy_mask = trade_dollars > 0
+                current_holdings_dollars = positions * prices
+
+                def _apply_buy_scale(scale: float):
+                    adj_trade_shares = trade_shares.copy()
+                    adj_trade_shares[buy_mask] = np.floor(
+                        adj_trade_shares[buy_mask] * scale
+                    ).astype(np.int64)
+                    adj_desired_shares = positions + adj_trade_shares
+                    adj_trade_dollars = (adj_desired_shares * prices) - current_holdings_dollars
+                    adj_trade_frac_adv = np.abs(adj_trade_dollars) / (safe_adv_dollars + 1e-9)
+                    adj_slippage_costs = np.abs(adj_trade_dollars) * (
+                        config.SLIPPAGE_COEFF * adj_trade_frac_adv
+                    )
+                    adj_brokerage_costs = vectorized_brokerage_calculator(
+                        adj_trade_dollars, trade_shares=adj_trade_shares
+                    )
+                    adj_total_costs = np.sum(adj_slippage_costs + adj_brokerage_costs)
+                    adj_cash = cash - np.sum(adj_trade_dollars) - adj_total_costs
+                    return (
+                        adj_cash,
+                        adj_desired_shares,
+                        adj_trade_dollars,
+                        adj_trade_shares,
+                        adj_total_costs,
+                    )
+
+                lo, hi = 0.0, 1.0
+                best = None
+                for _ in range(12):
+                    mid = (lo + hi) / 2.0
+                    adj_cash, adj_desired, adj_dollars, adj_shares, adj_costs = _apply_buy_scale(mid)
+                    if adj_cash >= -1e-6:
+                        best = (adj_desired, adj_dollars, adj_shares, adj_costs)
+                        lo = mid
+                    else:
+                        hi = mid
+                if best is None:
+                    _, adj_desired, adj_dollars, adj_shares, adj_costs = _apply_buy_scale(0.0)
+                else:
+                    adj_desired, adj_dollars, adj_shares, adj_costs = best
+                desired_shares = adj_desired
+                trade_dollars = adj_dollars
+                trade_shares = adj_shares
+                total_costs = adj_costs
+
             cash -= np.sum(trade_dollars) + total_costs
             positions = desired_shares
 
             net_worth = cash + np.sum(positions * prices)
+            cash_weight = max(0.0, cash / net_worth) if net_worth > 0 else 0.0
             equity_curve.append(float(net_worth))
             date_history.append(pd.Timestamp(current_date))
             if net_worth <= 0:
