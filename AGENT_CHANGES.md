@@ -140,3 +140,5 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 ## 2026-01-31
 - Added buy-scaling guards in `src/rule_backtester.py` and `src/production.py` to prevent trades from driving cash negative, with recalculated post-trade cash weight.
 - Increased `CASH_RESERVE` to 2% in `src/config.py`.
+- Added `/summaries` API endpoint in `scripts/production/api_server.py` to fetch net worth history with optional date filtering and limits.
+- Added `fields` query param to `/summaries` to return a reduced payload (e.g., only `date` and `net_worth_usd`).

@@ -204,6 +204,72 @@ def latest_summary():
         return json.load(f)
 
 
+@app.get("/summaries", dependencies=[Depends(_require_api_key)])
+def summaries(
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 0,
+    fields: str | None = None,
+):
+    if limit < 0:
+        raise HTTPException(status_code=400, detail="limit must be >= 0")
+
+    start_dt = pd.to_datetime(start) if start else None
+    end_dt = pd.to_datetime(end) if end else None
+
+    rows: list[dict] = []
+    if _db_ready():
+        rows = db_list_run_summaries()
+    if not rows:
+        for run_dir in _list_run_dirs():
+            summary_path = run_dir / "summary.json"
+            if not summary_path.exists():
+                continue
+            try:
+                payload = json.loads(summary_path.read_text())
+            except json.JSONDecodeError:
+                continue
+            if "date" not in payload or "net_worth_usd" not in payload:
+                continue
+            rows.append(payload)
+
+    if not rows:
+        return {"count": 0, "summaries": []}
+
+    def _parse_date(value: str | None):
+        try:
+            return pd.to_datetime(value) if value else None
+        except Exception:
+            return None
+
+    filtered: list[dict] = []
+    for row in rows:
+        row_date = _parse_date(row.get("date"))
+        if row_date is None:
+            continue
+        if start_dt and row_date < start_dt:
+            continue
+        if end_dt and row_date > end_dt:
+            continue
+        filtered.append(row)
+
+    filtered = sorted(filtered, key=lambda r: str(r.get("date")))
+    if limit:
+        filtered = filtered[-limit:]
+
+    field_list: list[str] | None = None
+    if fields:
+        field_list = [f.strip() for f in fields.split(",") if f.strip()]
+
+    if field_list:
+        trimmed = []
+        for row in filtered:
+            trimmed.append({key: row.get(key) for key in field_list})
+        filtered = trimmed
+
+    return {"count": len(filtered), "summaries": filtered}
+
+
 @app.get("/latest-trades", dependencies=[Depends(_require_api_key)])
 def latest_trades(limit: int = 0):
     if _db_ready():
