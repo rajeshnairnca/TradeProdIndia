@@ -2,6 +2,10 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-02
+- Sanitized VIX merge columns in `src/production.py` to coalesce legacy `*_x`/`*_y` fields and prevent duplicate-column merge errors during `update_market_data`.
+- Dropped preexisting VIX columns from update rows before merging fresh VIX stats in `src/production.py` to avoid suffix collisions.
+
 ## 2025-12-31
 - Removed liquidity filter gating in `src/rule_backtester.py` (ADV now used only for slippage scaling).
 - Added region-aware data file selection in `src/config.py` (`TRADING_REGION` -> `data/daily_data_us.parquet` or `data/daily_data_india.parquet`), with `DATA_FILE` override.

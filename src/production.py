@@ -95,6 +95,8 @@ def update_market_data(
         raise ValueError("Expected a MultiIndex [date, ticker] in the data file.")
     if existing.index.names != ["date", "ticker"]:
         raise ValueError(f"Unexpected index names: {existing.index.names}")
+    existing = _coalesce_vix_columns(existing)
+    existing = _coalesce_vix_columns(existing)
 
     tickers = sorted(existing.index.get_level_values("ticker").unique())
     rolling_window = rolling_window or config.ADV_LOOKBACK
@@ -200,6 +202,7 @@ def update_market_data(
         vix_series.loc[target_date] = vix_close
         vix_series = vix_series.sort_index()
         vix_stats = _compute_rolling_vix_stats(vix_series, rolling_window)
+        updates_df = _drop_vix_merge_columns(updates_df)
         updates_df = updates_df.merge(vix_stats, how="left", left_on="date", right_index=True)
 
     if "vix_return" in updates_df.columns:
@@ -585,6 +588,39 @@ def _build_updated_row(
     row["ticker"] = ticker
     row["date"] = bar_date
     return row.to_dict()
+
+
+def _coalesce_vix_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    for base in ("VIX", "VIX_z", "vix_return"):
+        col_x = f"{base}_x"
+        col_y = f"{base}_y"
+        has_suffix = col_x in df.columns or col_y in df.columns
+        if not has_suffix:
+            continue
+        if base not in df.columns:
+            df[base] = np.nan
+        if col_y in df.columns:
+            df[base] = df[base].combine_first(df[col_y])
+        if col_x in df.columns:
+            df[base] = df[base].combine_first(df[col_x])
+        drop_cols = [c for c in (col_x, col_y) if c in df.columns]
+        if drop_cols:
+            df.drop(columns=drop_cols, inplace=True)
+    return df
+
+
+def _drop_vix_merge_columns(df: pd.DataFrame) -> pd.DataFrame:
+    drop_cols: list[str] = []
+    for base in ("VIX", "VIX_z", "vix_return"):
+        for col in (base, f"{base}_x", f"{base}_y"):
+            if col in df.columns:
+                drop_cols.append(col)
+    if not drop_cols:
+        return df
+    return df.drop(columns=drop_cols)
 
 
 def _extract_vix_series(existing: pd.DataFrame) -> pd.Series:
