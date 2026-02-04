@@ -137,14 +137,6 @@ def update_market_data(
         analysis = analysis_map.get(ticker)
         if analysis is None:
             continue
-        indicators = analysis.indicators or {}
-        open_price = indicators.get("open")
-        high_price = indicators.get("high")
-        low_price = indicators.get("low")
-        close_price = indicators.get("close")
-        volume = indicators.get("volume")
-        if any(val is None for val in (open_price, high_price, low_price, close_price, volume)):
-            continue
 
         bar_time = getattr(analysis, "time", None)
         bar_time = pd.to_datetime(bar_time) if bar_time is not None else pd.Timestamp.utcnow()
@@ -154,6 +146,15 @@ def update_market_data(
         last_ticker_date = _to_naive_timestamp(existing_ticker.index.get_level_values("date").max())
         if bar_date <= last_ticker_date:
             resolved_tickers.add(ticker)
+            continue
+
+        indicators = analysis.indicators or {}
+        open_price = indicators.get("open")
+        high_price = indicators.get("high")
+        low_price = indicators.get("low")
+        close_price = indicators.get("close")
+        volume = indicators.get("volume")
+        if any(val is None for val in (open_price, high_price, low_price, close_price, volume)):
             continue
 
         row = _build_updated_row(

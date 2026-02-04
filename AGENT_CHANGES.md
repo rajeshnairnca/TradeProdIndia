@@ -150,3 +150,4 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 ## 2026-02-04
 - Treated TradingView updates with no new bar as resolved (instead of missing) so `require_all_tickers` only fails when analysis data is absent, not just unchanged.
 - Added `/stale-tickers` API endpoint to report tickers missing data for a target date.
+- Resolved no-new-bar tickers before validating OHLCV so missing indicator fields don’t trigger false partial-update errors.
