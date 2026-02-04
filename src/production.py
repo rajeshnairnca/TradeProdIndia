@@ -117,6 +117,7 @@ def update_market_data(
 
     updated_rows: list[dict] = []
     updated_tickers: set[str] = set()
+    resolved_tickers: set[str] = set()
     symbol_by_ticker = {}
     fallback_exchange = exchange_list[0] if exchange_list else "NYSE"
     for ticker in tickers:
@@ -152,6 +153,7 @@ def update_market_data(
         existing_ticker = existing.xs(ticker, level="ticker", drop_level=False)
         last_ticker_date = _to_naive_timestamp(existing_ticker.index.get_level_values("date").max())
         if bar_date <= last_ticker_date:
+            resolved_tickers.add(ticker)
             continue
 
         row = _build_updated_row(
@@ -170,11 +172,12 @@ def update_market_data(
         if row is not None:
             updated_rows.append(row)
             updated_tickers.add(ticker)
+            resolved_tickers.add(ticker)
 
     if not updated_rows:
         return existing
-    if require_all_tickers and len(updated_tickers) != len(tickers):
-        missing = sorted(set(tickers) - updated_tickers)
+    if require_all_tickers and len(resolved_tickers) != len(tickers):
+        missing = sorted(set(tickers) - resolved_tickers)
         preview = ", ".join(missing[:10])
         raise ValueError(
             "Partial update detected from TradingView. "

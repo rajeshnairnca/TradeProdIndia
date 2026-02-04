@@ -146,3 +146,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Increased `CASH_RESERVE` to 2% in `src/config.py`.
 - Added `/summaries` API endpoint in `scripts/production/api_server.py` to fetch net worth history with optional date filtering and limits.
 - Added `fields` query param to `/summaries` to return a reduced payload (e.g., only `date` and `net_worth_usd`).
+
+## 2026-02-04
+- Treated TradingView updates with no new bar as resolved (instead of missing) so `require_all_tickers` only fails when analysis data is absent, not just unchanged.
+- Added `/stale-tickers` API endpoint to report tickers missing data for a target date.

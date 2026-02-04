@@ -535,6 +535,46 @@ def universe_listing():
     return {"count": len(universe), "universe": universe}
 
 
+@app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])
+def stale_tickers(date: Optional[str] = None):
+    data_path = _resolve_path(config.DATA_FILE)
+    if not Path(data_path).exists():
+        raise HTTPException(status_code=404, detail="Data file not found.")
+
+    mapping = _load_exchange_map(EXCHANGE_MAP_FILE)
+    if not mapping:
+        raise HTTPException(status_code=404, detail="Exchange map not found.")
+
+    df = pd.read_parquet(data_path, columns=["Close"])
+    if not isinstance(df.index, pd.MultiIndex) or "ticker" not in df.index.names:
+        raise HTTPException(status_code=500, detail="Unexpected data index format.")
+
+    if date:
+        try:
+            target_date = pd.to_datetime(date).tz_localize(None)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid date format.")
+    else:
+        target_date = df.index.get_level_values("date").max()
+    if target_date is None:
+        raise HTTPException(status_code=404, detail="No dates found in data.")
+    target_date = pd.to_datetime(target_date).tz_localize(None)
+
+    tickers = set(mapping.keys())
+    date_values = df.index.get_level_values("date")
+    day_data = df.loc[date_values == target_date]
+    if not day_data.empty:
+        day_data = day_data.reset_index()
+        if "ticker" in day_data.columns:
+            tickers -= set(day_data["ticker"].astype(str).str.upper().tolist())
+
+    return {
+        "as_of": str(pd.to_datetime(target_date).date()),
+        "count": len(tickers),
+        "stale_tickers": sorted(tickers),
+    }
+
+
 @app.post("/queue-adjustments", dependencies=[Depends(_require_api_key)])
 def queue_adjustments(payload: AdjustmentRequest):
     entries: list[dict] = []
