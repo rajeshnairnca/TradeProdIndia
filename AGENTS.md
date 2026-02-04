@@ -26,6 +26,7 @@
 
 ## Commit & Pull Request Practices
 - Use concise, imperative commits (e.g., `Add walkforward gating`); group related changes per commit.  
+- Before any commit, run: `TRADING_REGION=us DATA_FILE=data/daily_data_us.parquet REGIME_MODE=heuristic caffeinate -i python3 scripts/backtesting/sector_experiments.py --sectors Technology --start-date 2010-01-01 --end-date 2025-01-01 --regime-scope global --regime-mapping '{"bear_high_vol":"rule_mean_reversion","bear_low_vol":"rule_low_vol_defensive","bull_high_vol":"rule_quality_min_vol","bull_low_vol":"rule_momentum_acceleration","sideways_high_vol":"rule_range_reversion","sideways_low_vol":"rule_trend_strength"}'`.  
 - PRs should describe the goal, key changes, and how you validated (commands run, datasets used, any shortcuts). Include links to logs/artifacts in `runs/` or `logs/` when relevant.  
 - Note any deviations from default workflows (custom hyperparams, truncated datasets) so others can reproduce.
 

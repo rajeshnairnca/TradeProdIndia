@@ -97,6 +97,7 @@ US_COMMISSION_RATE = _env_float("US_COMMISSION_RATE", 0.0015)
 US_FINRA_FEE_PER_SHARE = _env_float("US_FINRA_FEE_PER_SHARE", 0.000195)
 US_SEC_FEE_RATE = _env_float("US_SEC_FEE_RATE", 0.0000278)
 UNIVERSE_FILTER = os.getenv("UNIVERSE_FILTER", "all").strip().lower()
+EXCLUDED_TICKERS_FILE = _env_str("EXCLUDED_TICKERS_FILE", "data/universe_excluded.txt")
 
 # ---- Data Configuration ----
 DATA_ROOT = _env_str("DATA_ROOT", "").strip()

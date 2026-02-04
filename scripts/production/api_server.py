@@ -31,6 +31,7 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "runs/production")
 PENDING_FILE = os.getenv("PENDING_FILE", "runs/production/pending_adjustments.jsonl")
 STATE_FILE = os.getenv("STATE_FILE", "runs/production/state.json")
 EXCHANGE_MAP_FILE = os.getenv("EXCHANGE_MAP_FILE", config.TRADINGVIEW_EXCHANGE_MAP_FILE)
+EXCLUDED_TICKERS_FILE = os.getenv("EXCLUDED_TICKERS_FILE", config.EXCLUDED_TICKERS_FILE)
 API_KEY = os.getenv("API_KEY", "").strip()
 
 
@@ -84,6 +85,28 @@ def _load_exchange_map(path: str) -> dict[str, str]:
             continue
         mapping[ticker] = exchange or "UNKNOWN"
     return mapping
+
+
+def _load_excluded_tickers(path: str) -> set[str]:
+    resolved = _resolve_path(path)
+    excluded_path = Path(resolved)
+    if not excluded_path.exists():
+        return set()
+    try:
+        lines = excluded_path.read_text().splitlines()
+    except OSError:
+        return set()
+    return {line.strip().upper() for line in lines if line.strip()}
+
+
+def _write_excluded_tickers(path: str, tickers: set[str]) -> None:
+    resolved = _resolve_path(path)
+    excluded_path = Path(resolved)
+    excluded_path.parent.mkdir(parents=True, exist_ok=True)
+    if not tickers:
+        excluded_path.write_text("")
+        return
+    excluded_path.write_text("\n".join(sorted(tickers)) + "\n")
 
 
 def _load_state(path: str) -> dict | None:
@@ -155,6 +178,10 @@ class AdjustmentRequest(BaseModel):
     tickers: Optional[List[str]] = None
     ticker_exchanges: Optional[dict[str, str]] = None
     source: str = "app"
+
+
+class ExcludeTickersRequest(BaseModel):
+    tickers: List[str]
 
 
 def _require_api_key(
@@ -535,6 +562,23 @@ def universe_listing():
     return {"count": len(universe), "universe": universe}
 
 
+@app.get("/excluded-tickers", dependencies=[Depends(_require_api_key)])
+def list_excluded_tickers():
+    excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+    return {"count": len(excluded), "excluded_tickers": sorted(excluded)}
+
+
+@app.post("/exclude-tickers", dependencies=[Depends(_require_api_key)])
+def exclude_tickers(payload: ExcludeTickersRequest):
+    tickers = [str(t).strip().upper() for t in (payload.tickers or []) if str(t).strip()]
+    if not tickers:
+        raise HTTPException(status_code=400, detail="No tickers provided.")
+    excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+    excluded.update(tickers)
+    _write_excluded_tickers(EXCLUDED_TICKERS_FILE, excluded)
+    return {"count": len(excluded), "excluded_tickers": sorted(excluded)}
+
+
 @app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])
 def stale_tickers(date: Optional[str] = None):
     data_path = _resolve_path(config.DATA_FILE)
@@ -561,6 +605,9 @@ def stale_tickers(date: Optional[str] = None):
     target_date = pd.to_datetime(target_date).tz_localize(None)
 
     tickers = set(mapping.keys())
+    excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+    if excluded:
+        tickers -= excluded
     date_values = df.index.get_level_values("date")
     day_data = df.loc[date_values == target_date]
     if not day_data.empty:

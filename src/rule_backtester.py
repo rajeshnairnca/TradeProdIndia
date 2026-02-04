@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
@@ -43,6 +44,9 @@ class RuleBasedBacktester:
             else:
                 allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
             self.df = self.df[self.df.index.get_level_values("ticker").isin(allowed)]
+        excluded = _load_excluded_tickers()
+        if excluded:
+            self.df = self.df[~self.df.index.get_level_values("ticker").isin(excluded)]
         if self.df.empty:
             raise ValueError("No data left after applying universe filter.")
         self.regime_table = regime_table
@@ -294,3 +298,17 @@ class RuleBasedBacktester:
             transactions=transactions,
             metrics=metrics,
         )
+
+
+def _load_excluded_tickers() -> set[str]:
+    path = config.resolve_path(config.EXCLUDED_TICKERS_FILE)
+    if not path:
+        return set()
+    excluded_path = Path(path)
+    if not excluded_path.exists():
+        return set()
+    try:
+        lines = excluded_path.read_text().splitlines()
+    except OSError:
+        return set()
+    return {line.strip().upper() for line in lines if line.strip()}

@@ -136,6 +136,7 @@ def update_market_data(
     for ticker in tqdm(tickers, desc="Processing TradingView data", unit="ticker"):
         analysis = analysis_map.get(ticker)
         if analysis is None:
+            resolved_tickers.add(ticker)
             continue
 
         bar_time = getattr(analysis, "time", None)
@@ -954,14 +955,33 @@ def generate_trades_for_date(
 
 
 def _apply_universe_filter(df: pd.DataFrame) -> pd.DataFrame:
+    excluded = _load_excluded_tickers()
     universe_filter = config.UNIVERSE_FILTER
     if not universe_filter or universe_filter in ("all", "none"):
-        return df
-    if universe_filter == "nasdaq100":
+        filtered = df
+    elif universe_filter == "nasdaq100":
         allowed = set(NASDAQ100_TICKERS)
+        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
     else:
         allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
-    return df[df.index.get_level_values("ticker").isin(allowed)]
+        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
+    if not excluded:
+        return filtered
+    return filtered[~filtered.index.get_level_values("ticker").isin(excluded)]
+
+
+def _load_excluded_tickers() -> set[str]:
+    path = config.resolve_path(config.EXCLUDED_TICKERS_FILE)
+    if not path:
+        return set()
+    excluded_path = Path(path)
+    if not excluded_path.exists():
+        return set()
+    try:
+        lines = excluded_path.read_text().splitlines()
+    except OSError:
+        return set()
+    return {line.strip().upper() for line in lines if line.strip()}
 
 
 def _precompute_scores(

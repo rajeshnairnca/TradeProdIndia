@@ -151,3 +151,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Treated TradingView updates with no new bar as resolved (instead of missing) so `require_all_tickers` only fails when analysis data is absent, not just unchanged.
 - Added `/stale-tickers` API endpoint to report tickers missing data for a target date.
 - Resolved no-new-bar tickers before validating OHLCV so missing indicator fields don’t trigger false partial-update errors.
+- Marked tickers with missing TradingView analysis as resolved to avoid blocking updates.
+- Added excluded tickers support with `/exclude-tickers` and `/excluded-tickers`, plus a file-based exclusion list applied to production and backtests.
+- Added a pre-commit backtest requirement to `AGENTS.md`.
+- Fixed `RuleBasedBacktester` method indentation after adding excluded-ticker loading so backtests run again.
