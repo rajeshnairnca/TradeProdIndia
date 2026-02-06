@@ -128,7 +128,7 @@ SLIPPAGE_COEFF = _env_float("SLIPPAGE_COEFF", 0.008)
 CASH_DRAG_COEFF = 8e-5  # per-step penalty scaled by cash_weight to discourage idle cash
 WEIGHT_CHANGE_PENALTY = 0.0005  # penalize large day-over-day weight changes (swing-friendly)
 WEIGHT_SMOOTHING = 0.85  # blend factor for previous weights vs new weights (higher = smoother)
-CASH_RESERVE = 0.0  # keep this fraction in cash to absorb costs
+CASH_RESERVE = 0.02  # keep this fraction in cash to absorb costs
 MIN_ADV_SHARES = 250_000.0  # minimum ADV shares required to trade
 MIN_ADV_DOLLARS_FILTER = 20_000_000.0  # minimum ADV$ required to trade
 MIN_ADV_DOLLARS_SLIPPAGE = 1_000_000.0  # minimum ADV$ used for slippage scaling
