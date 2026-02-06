@@ -155,3 +155,4 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added excluded tickers support with `/exclude-tickers` and `/excluded-tickers`, plus a file-based exclusion list applied to production and backtests.
 - Added a pre-commit backtest requirement to `AGENTS.md`.
 - Fixed `RuleBasedBacktester` method indentation after adding excluded-ticker loading so backtests run again.
+- Updated config defaults: TOP_K 10 -> 4; ROLLING_WINDOW_FOR_VOL 21 -> 14; USE_REGIME_SYSTEM True -> False; CASH_RESERVE 0.02 -> 0.0; SLIPPAGE_COEFF 0.005 -> 0.008; REGIME_DISPERSION_COL ROC_10 -> ROC_50; REGIME_TREND_BAND 0.02 -> 0.008.

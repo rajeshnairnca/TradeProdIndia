@@ -80,12 +80,12 @@ def _env_int(name: str, default: int) -> int:
 INITIAL_CAPITAL = 27_000.0
 TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.15
-TOP_K = 10
+TOP_K = 4
 ADV_LOOKBACK = 21
-ROLLING_WINDOW_FOR_VOL = 21
+ROLLING_WINDOW_FOR_VOL = 14
 USE_VOL_PARITY = True
 
-USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", True)
+USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", False)
 BACKTEST_USE_FULL_HISTORY = _env_bool("BACKTEST_USE_FULL_HISTORY", True)
 BEAR_CASH_OUT = _env_bool("BEAR_CASH_OUT", False)
 BEAR_GROSS_TARGET = _env_optional_float("BEAR_GROSS_TARGET")
@@ -124,11 +124,11 @@ def resolve_path(path: str) -> str:
 TURNOVER_PENALTY = 0.000718
 LEVERAGE_PENALTY = 1e-4
 RISK_PENALTY_COEFF = 0.5021
-SLIPPAGE_COEFF = _env_float("SLIPPAGE_COEFF", 0.005)
+SLIPPAGE_COEFF = _env_float("SLIPPAGE_COEFF", 0.008)
 CASH_DRAG_COEFF = 8e-5  # per-step penalty scaled by cash_weight to discourage idle cash
 WEIGHT_CHANGE_PENALTY = 0.0005  # penalize large day-over-day weight changes (swing-friendly)
 WEIGHT_SMOOTHING = 0.85  # blend factor for previous weights vs new weights (higher = smoother)
-CASH_RESERVE = 0.02  # keep this fraction in cash to absorb costs
+CASH_RESERVE = 0.0  # keep this fraction in cash to absorb costs
 MIN_ADV_SHARES = 250_000.0  # minimum ADV shares required to trade
 MIN_ADV_DOLLARS_FILTER = 20_000_000.0  # minimum ADV$ required to trade
 MIN_ADV_DOLLARS_SLIPPAGE = 1_000_000.0  # minimum ADV$ used for slippage scaling
@@ -148,8 +148,8 @@ SEED = 42
 
 # ---- Regime Detection Configuration ----
 REGIME_MODE = _env_str("REGIME_MODE", "heuristic").lower()
-REGIME_DISPERSION_COL = _env_str("REGIME_DISPERSION_COL", "ROC_10")
-REGIME_TREND_BAND = _env_float("REGIME_TREND_BAND", 0.02)
+REGIME_DISPERSION_COL = _env_str("REGIME_DISPERSION_COL", "ROC_50")
+REGIME_TREND_BAND = _env_float("REGIME_TREND_BAND", 0.008)
 HMM_N_COMPONENTS = _env_int("HMM_N_COMPONENTS", 4)
 HMM_WARMUP_PERIOD = _env_int("HMM_WARMUP_PERIOD", 2520)  # ~10 years
 HMM_STEP_SIZE = _env_int("HMM_STEP_SIZE", 5)  # ~1 month
