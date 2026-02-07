@@ -163,3 +163,8 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Integrated Trading212 into daily production runs as the source-of-truth for cash/positions, with FX conversion from GBP to USD.
 - Added broker discrepancies tracking, broker order logging, and side-by-side summary fields (broker cash/net worth/currency).
 - Added Postgres tables and API endpoints for broker account/positions/orders snapshots.
+- Added a Trading212 mapping builder script to generate the ticker map and missing list from the local universe.
+
+## 2026-02-07
+- Expanded Trading212 instrument indexing to include `shortName` aliases so renamed tickers map correctly.
+- Added a Trading212 universe pre-check in the daily production run, halting if any tradable tickers lack a mapping, and stopped using broker cash/positions as the state-of-truth for signal generation.

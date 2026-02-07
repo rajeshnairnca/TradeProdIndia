@@ -204,9 +204,15 @@ def build_instrument_index(
         if not ticker:
             continue
         by_ticker[ticker] = inst
+        symbols: set[str] = set()
         symbol = ticker.split("_", 1)[0].strip().upper()
         if symbol:
-            by_symbol.setdefault(symbol, []).append(inst)
+            symbols.add(symbol)
+        short_name = str(inst.get("shortName", "")).strip().upper()
+        if short_name:
+            symbols.add(short_name)
+        for sym in symbols:
+            by_symbol.setdefault(sym, []).append(inst)
     return by_ticker, by_symbol
 
 

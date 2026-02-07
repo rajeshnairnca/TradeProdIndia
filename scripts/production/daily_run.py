@@ -21,6 +21,7 @@ from src.production import (
     ProductionState,
     save_state,
     update_market_data,
+    _apply_universe_filter,
 )
 from src.production_db import (
     clear_pending_adjustments as db_clear_pending_adjustments,
@@ -321,6 +322,31 @@ def _build_trading212_context(state: ProductionState) -> dict:
         "fx_rate_gbp_per_usd": fx_rate,
         "discrepancies": discrepancies,
     }
+
+
+def _ensure_trading212_universe(
+    df: pd.DataFrame,
+    by_ticker: dict[str, dict],
+    by_symbol: dict[str, list[dict]],
+    overrides: dict[str, str],
+    preferred_currency: str | None = None,
+) -> dict[str, str]:
+    tickers = sorted(set(df.index.get_level_values("ticker").unique()))
+    missing: list[str] = []
+    mapping: dict[str, str] = {}
+    for ticker in tickers:
+        mapped = resolve_t212_ticker(ticker, by_symbol, overrides, preferred_currency)
+        if not mapped or mapped not in by_ticker:
+            missing.append(ticker)
+        else:
+            mapping[ticker] = mapped
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise ValueError(
+            "Missing Trading212 mappings for tickers. "
+            f"Missing {len(missing)} (first 10): {preview}"
+        )
+    return mapping
 
 
 def _execute_trading212_orders(
@@ -688,18 +714,13 @@ def main():
     state_for_trades = state
     if trading212_enabled():
         broker_context = _build_trading212_context(state)
-        broker_positions = broker_context.get("broker_positions", {})
-        broker_positions_int = {
-            ticker: int(round(qty))
-            for ticker, qty in broker_positions.items()
-            if abs(qty) > 1e-9
-        }
-        state_for_trades = ProductionState(
-            last_date=state.last_date,
-            cash=float(broker_context.get("broker_cash_usd", state.cash)),
-            positions=broker_positions_int,
-            prev_weights=state.prev_weights,
-            total_costs_usd=state.total_costs_usd,
+        tradable_df = _apply_universe_filter(sector_df)
+        _ensure_trading212_universe(
+            tradable_df,
+            broker_context.get("by_ticker") or {},
+            broker_context.get("by_symbol") or {},
+            broker_context.get("overrides") or {},
+            preferred_currency=config.TRADING212_PREFERRED_CURRENCY,
         )
 
     regime_table = compute_market_regime_table(df if args.regime_scope == "global" else sector_df)
@@ -727,7 +748,12 @@ def main():
             args.dry_run,
         )
         if broker_missing:
-            summary["broker_missing_tickers"] = sorted(set(broker_missing))
+            missing = sorted(set(broker_missing))
+            summary["broker_missing_tickers"] = missing
+            raise ValueError(
+                "Trading212 mapping missing for generated trades. "
+                f"Missing {len(missing)} (first 10): {', '.join(missing[:10])}"
+            )
         if args.dry_run:
             post_summary = broker_context.get("summary_raw", {})
             post_positions = broker_context.get("positions_raw", [])
