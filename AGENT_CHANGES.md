@@ -168,3 +168,4 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 ## 2026-02-07
 - Expanded Trading212 instrument indexing to include `shortName` aliases so renamed tickers map correctly.
 - Added a Trading212 universe pre-check in the daily production run, halting if any tradable tickers lack a mapping, and stopped using broker cash/positions as the state-of-truth for signal generation.
+- Removed the Trading212 mapping builder script from the repository per request.
