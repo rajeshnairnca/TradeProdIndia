@@ -21,10 +21,15 @@ from src.production_db import (
     latest_prices as db_latest_prices,
     latest_summary as db_latest_summary,
     latest_trades as db_latest_trades,
+    latest_broker_account as db_latest_broker_account,
+    latest_broker_orders as db_latest_broker_orders,
+    latest_broker_positions as db_latest_broker_positions,
     list_run_summaries as db_list_run_summaries,
+    list_broker_orders as db_list_broker_orders,
     list_trades as db_list_trades,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
+    reset_production_data as db_reset_production_data,
 )
 
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "runs/production")
@@ -182,6 +187,10 @@ class AdjustmentRequest(BaseModel):
 
 class ExcludeTickersRequest(BaseModel):
     tickers: List[str]
+
+
+class ResetRequest(BaseModel):
+    confirm: str
 
 
 def _require_api_key(
@@ -426,6 +435,58 @@ def cagr_summary():
     cashflows.append((end_date, end_value))
     irr = _xirr(cashflows)
 
+    broker_payload = None
+    broker_summaries = [
+        s for s in summaries if s.get("broker_net_worth") is not None
+    ]
+    if len(broker_summaries) >= 2:
+        broker_summaries = sorted(broker_summaries, key=lambda s: s["date"])
+        b_start = broker_summaries[0]
+        b_end = broker_summaries[-1]
+        b_start_date = pd.to_datetime(b_start["date"])
+        b_end_date = pd.to_datetime(b_end["date"])
+        b_years = (b_end_date - b_start_date).days / 365.25 if b_end_date > b_start_date else 0.0
+        b_start_val = float(b_start.get("broker_net_worth", 0.0))
+        b_end_val = float(b_end.get("broker_net_worth", 0.0))
+        if b_years > 0 and b_start_val > 0:
+            b_cagr = (b_end_val / b_start_val) ** (1.0 / b_years) - 1.0
+        else:
+            b_cagr = None
+
+        b_twr_growth = 1.0
+        for i in range(1, len(broker_summaries)):
+            start_val = float(broker_summaries[i - 1].get("broker_net_worth", 0.0))
+            end_val = float(broker_summaries[i].get("broker_net_worth", 0.0))
+            fx_rate = float(broker_summaries[i].get("broker_fx_rate_gbp_per_usd") or 0.0)
+            flow_usd = float(broker_summaries[i].get("cash_adjustment", 0.0))
+            flow = flow_usd * fx_rate if fx_rate else flow_usd
+            denom = start_val + flow
+            if denom <= 0:
+                b_twr_growth = None
+                break
+            period_return = (end_val / denom) - 1.0
+            b_twr_growth *= 1.0 + period_return
+
+        b_cagr_adjusted = None
+        if b_twr_growth is not None and b_years > 0:
+            b_cagr_adjusted = b_twr_growth ** (1.0 / b_years) - 1.0
+
+        b_cashflows = [(b_start_date, -b_start_val)]
+        for item in broker_summaries[1:]:
+            fx_rate = float(item.get("broker_fx_rate_gbp_per_usd") or 0.0)
+            flow_usd = float(item.get("cash_adjustment", 0.0))
+            flow = flow_usd * fx_rate if fx_rate else flow_usd
+            if flow != 0.0:
+                b_cashflows.append((pd.to_datetime(item["date"]), -flow))
+        b_cashflows.append((b_end_date, b_end_val))
+        b_irr = _xirr(b_cashflows)
+        broker_payload = {
+            "currency": b_start.get("broker_currency"),
+            "cagr": b_cagr,
+            "cagr_adjusted": b_cagr_adjusted,
+            "irr": b_irr,
+        }
+
     return {
         "start_date": str(start_date.date()),
         "end_date": str(end_date.date()),
@@ -436,6 +497,7 @@ def cagr_summary():
         "cagr_adjusted": cagr_adjusted,
         "irr": irr,
         "cash_adjustments_total_usd": cash_adjustments,
+        "broker": broker_payload,
         "note": "cagr_adjusted uses time-weighted returns with cash flows applied at period start; irr is money-weighted using net worth and cash adjustments.",
     }
 
@@ -560,6 +622,46 @@ def universe_listing():
         raise HTTPException(status_code=404, detail="Exchange map not found.")
     universe = [{"ticker": k, "exchange": v} for k, v in sorted(mapping.items())]
     return {"count": len(universe), "universe": universe}
+
+
+@app.get("/broker-summary", dependencies=[Depends(_require_api_key)])
+def broker_summary(broker: str = "trading212"):
+    if _db_ready():
+        summary = db_latest_broker_account(broker)
+        if summary:
+            return summary
+    raise HTTPException(status_code=404, detail="Broker summary not found.")
+
+
+@app.get("/broker-positions", dependencies=[Depends(_require_api_key)])
+def broker_positions(broker: str = "trading212"):
+    if _db_ready():
+        positions = db_latest_broker_positions(broker)
+        if positions:
+            return {"count": len(positions), "positions": positions}
+    raise HTTPException(status_code=404, detail="Broker positions not found.")
+
+
+@app.get("/broker-orders", dependencies=[Depends(_require_api_key)])
+def broker_orders(broker: str = "trading212", limit: int = 200, offset: int = 0):
+    if limit < 0:
+        raise HTTPException(status_code=400, detail="limit must be >= 0")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    if _db_ready():
+        total, records = db_list_broker_orders(broker, limit, offset)
+        if total > 0:
+            return {"total": total, "limit": limit, "offset": offset, "orders": records}
+    return {"total": 0, "limit": limit, "offset": offset, "orders": []}
+
+
+@app.get("/latest-broker-orders", dependencies=[Depends(_require_api_key)])
+def latest_broker_orders(broker: str = "trading212", limit: int = 0):
+    if _db_ready():
+        records = db_latest_broker_orders(broker, limit=limit)
+        if records:
+            return {"orders": records}
+    raise HTTPException(status_code=404, detail="Broker orders not found.")
 
 
 @app.get("/excluded-tickers", dependencies=[Depends(_require_api_key)])
@@ -714,3 +816,13 @@ def delete_pending_adjustments():
         pending_path.parent.mkdir(parents=True, exist_ok=True)
         pending_path.write_text("")
     return {"cleared": True}
+
+
+@app.post("/reset-production", dependencies=[Depends(_require_api_key)])
+def reset_production(payload: ResetRequest):
+    if payload.confirm != "RESET_PRODUCTION_DATA":
+        raise HTTPException(status_code=400, detail="Confirmation token missing or invalid.")
+    if not _db_ready():
+        raise HTTPException(status_code=400, detail="Database not configured.")
+    db_reset_production_data()
+    return {"reset": True}

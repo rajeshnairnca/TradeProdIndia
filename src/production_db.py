@@ -49,9 +49,37 @@ def init_db() -> None:
                 total_costs_usd double precision,
                 sector text,
                 regime_scope text,
-                cash_adjustment double precision
+                cash_adjustment double precision,
+                broker_name text,
+                broker_currency text,
+                broker_cash double precision,
+                broker_portfolio_value double precision,
+                broker_net_worth double precision,
+                broker_cash_weight double precision,
+                broker_discrepancies jsonb
             );
             """
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_name text;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_currency text;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_cash double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_portfolio_value double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_net_worth double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_cash_weight double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_discrepancies jsonb;"
         )
         cur.execute(
             """
@@ -107,6 +135,58 @@ def init_db() -> None:
             """
         )
         cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_broker_account (
+                run_date date NOT NULL,
+                broker text NOT NULL,
+                currency text,
+                cash double precision,
+                investments double precision,
+                net_worth double precision,
+                payload jsonb,
+                created_at timestamptz DEFAULT now(),
+                PRIMARY KEY (run_date, broker)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_broker_positions (
+                run_date date NOT NULL,
+                broker text NOT NULL,
+                ticker text NOT NULL,
+                quantity double precision,
+                average_price double precision,
+                current_price double precision,
+                instrument_currency text,
+                account_currency text,
+                wallet_current_value double precision,
+                payload jsonb,
+                created_at timestamptz DEFAULT now(),
+                PRIMARY KEY (run_date, broker, ticker)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_broker_orders (
+                id bigserial PRIMARY KEY,
+                run_date date NOT NULL,
+                broker text NOT NULL,
+                ticker text,
+                action text,
+                quantity double precision,
+                filled_quantity double precision,
+                exec_price double precision,
+                currency text,
+                status text,
+                order_id text,
+                payload jsonb,
+                created_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
             "CREATE INDEX IF NOT EXISTS production_trades_run_date_idx ON production_trades (run_date);"
         )
         cur.execute(
@@ -114,6 +194,18 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_prices_run_date_idx ON production_prices (run_date);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_broker_orders_run_date_idx ON production_broker_orders (run_date);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_broker_orders_broker_idx ON production_broker_orders (broker);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_broker_positions_run_date_idx ON production_broker_positions (run_date);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_broker_account_run_date_idx ON production_broker_account (run_date);"
         )
 
 
@@ -147,9 +239,16 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 total_costs_usd,
                 sector,
                 regime_scope,
-                cash_adjustment
+                cash_adjustment,
+                broker_name,
+                broker_currency,
+                broker_cash,
+                broker_portfolio_value,
+                broker_net_worth,
+                broker_cash_weight,
+                broker_discrepancies
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (run_date) DO UPDATE SET
                 num_trades = EXCLUDED.num_trades,
                 net_worth_usd = EXCLUDED.net_worth_usd,
@@ -162,7 +261,14 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 total_costs_usd = EXCLUDED.total_costs_usd,
                 sector = EXCLUDED.sector,
                 regime_scope = EXCLUDED.regime_scope,
-                cash_adjustment = EXCLUDED.cash_adjustment;
+                cash_adjustment = EXCLUDED.cash_adjustment,
+                broker_name = EXCLUDED.broker_name,
+                broker_currency = EXCLUDED.broker_currency,
+                broker_cash = EXCLUDED.broker_cash,
+                broker_portfolio_value = EXCLUDED.broker_portfolio_value,
+                broker_net_worth = EXCLUDED.broker_net_worth,
+                broker_cash_weight = EXCLUDED.broker_cash_weight,
+                broker_discrepancies = EXCLUDED.broker_discrepancies;
             """,
             (
                 run_date,
@@ -178,6 +284,15 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 summary.get("sector"),
                 summary.get("regime_scope"),
                 summary.get("cash_adjustment", 0.0),
+                summary.get("broker_name"),
+                summary.get("broker_currency"),
+                summary.get("broker_cash"),
+                summary.get("broker_portfolio_value"),
+                summary.get("broker_net_worth"),
+                summary.get("broker_cash_weight"),
+                psycopg2.extras.Json(summary.get("broker_discrepancies"))
+                if summary.get("broker_discrepancies") is not None
+                else None,
             ),
         )
 
@@ -443,7 +558,14 @@ def list_run_summaries() -> list[dict[str, Any]]:
                    total_costs_usd,
                    sector,
                    regime_scope,
-                   cash_adjustment
+                   cash_adjustment,
+                   broker_name,
+                   broker_currency,
+                   broker_cash,
+                   broker_portfolio_value,
+                   broker_net_worth,
+                   broker_cash_weight,
+                   broker_discrepancies
             FROM production_runs
             ORDER BY run_date ASC;
             """
@@ -482,7 +604,14 @@ def latest_summary() -> dict[str, Any] | None:
                    total_costs_usd,
                    sector,
                    regime_scope,
-                   cash_adjustment
+                   cash_adjustment,
+                   broker_name,
+                   broker_currency,
+                   broker_cash,
+                   broker_portfolio_value,
+                   broker_net_worth,
+                   broker_cash_weight,
+                   broker_discrepancies
             FROM production_runs
             ORDER BY run_date DESC
             LIMIT 1;
@@ -552,6 +681,287 @@ def latest_trades(limit: int = 0) -> list[dict[str, Any]]:
         return rows
 
 
+def upsert_broker_account(run_date: str, broker: str, summary: dict[str, Any]) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    currency = summary.get("currency")
+    cash = summary.get("cash")
+    investments = summary.get("investments")
+    net_worth = summary.get("net_worth")
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO production_broker_account (
+                run_date,
+                broker,
+                currency,
+                cash,
+                investments,
+                net_worth,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_date, broker) DO UPDATE SET
+                currency = EXCLUDED.currency,
+                cash = EXCLUDED.cash,
+                investments = EXCLUDED.investments,
+                net_worth = EXCLUDED.net_worth,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                run_date,
+                broker,
+                currency,
+                cash,
+                investments,
+                net_worth,
+                psycopg2.extras.Json(summary.get("payload")) if summary.get("payload") is not None else None,
+            ),
+        )
+
+
+def replace_broker_positions(
+    run_date: str,
+    broker: str,
+    positions: Iterable[dict[str, Any]],
+) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    rows = []
+    for pos in positions:
+        rows.append(
+            (
+                run_date,
+                broker,
+                pos.get("ticker"),
+                pos.get("quantity"),
+                pos.get("average_price"),
+                pos.get("current_price"),
+                pos.get("instrument_currency"),
+                pos.get("account_currency"),
+                pos.get("wallet_current_value"),
+                psycopg2.extras.Json(pos.get("payload")) if pos.get("payload") is not None else None,
+            )
+        )
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM production_broker_positions WHERE run_date = %s AND broker = %s;",
+            (run_date, broker),
+        )
+        if not rows:
+            return
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO production_broker_positions (
+                run_date,
+                broker,
+                ticker,
+                quantity,
+                average_price,
+                current_price,
+                instrument_currency,
+                account_currency,
+                wallet_current_value,
+                payload
+            )
+            VALUES %s;
+            """,
+            rows,
+        )
+
+
+def replace_broker_orders(
+    run_date: str,
+    broker: str,
+    orders: Iterable[dict[str, Any]],
+) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    rows = []
+    for order in orders:
+        rows.append(
+            (
+                run_date,
+                broker,
+                order.get("ticker"),
+                order.get("action"),
+                order.get("quantity"),
+                order.get("filled_quantity"),
+                order.get("exec_price"),
+                order.get("currency"),
+                order.get("status"),
+                order.get("order_id"),
+                psycopg2.extras.Json(order.get("payload")) if order.get("payload") is not None else None,
+            )
+        )
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM production_broker_orders WHERE run_date = %s AND broker = %s;",
+            (run_date, broker),
+        )
+        if not rows:
+            return
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO production_broker_orders (
+                run_date,
+                broker,
+                ticker,
+                action,
+                quantity,
+                filled_quantity,
+                exec_price,
+                currency,
+                status,
+                order_id,
+                payload
+            )
+            VALUES %s;
+            """,
+            rows,
+        )
+
+
+def latest_broker_account(broker: str) -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date,
+                   broker,
+                   currency,
+                   cash,
+                   investments,
+                   net_worth,
+                   payload
+            FROM production_broker_account
+            WHERE broker = %s
+            ORDER BY run_date DESC
+            LIMIT 1;
+            """,
+            (broker,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def latest_broker_positions(broker: str) -> list[dict[str, Any]]:
+    if not db_enabled():
+        return []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date,
+                   broker,
+                   ticker,
+                   quantity,
+                   average_price,
+                   current_price,
+                   instrument_currency,
+                   account_currency,
+                   wallet_current_value,
+                   payload
+            FROM production_broker_positions
+            WHERE broker = %s
+            AND run_date = (
+                SELECT MAX(run_date) FROM production_broker_positions WHERE broker = %s
+            )
+            ORDER BY ticker ASC;
+            """,
+            (broker, broker),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def list_broker_orders(broker: str, limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM production_broker_orders WHERE broker = %s;",
+            (broker,),
+        )
+        total = int(cur.fetchone()[0] or 0)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date,
+                   broker,
+                   ticker,
+                   action,
+                   quantity,
+                   filled_quantity,
+                   exec_price,
+                   currency,
+                   status,
+                   order_id,
+                   payload,
+                   created_at
+            FROM production_broker_orders
+            WHERE broker = %s
+            ORDER BY run_date DESC, id DESC
+            LIMIT %s OFFSET %s;
+            """,
+            (broker, limit, offset),
+        )
+        return total, [dict(row) for row in cur.fetchall()]
+
+
+def latest_broker_orders(broker: str, limit: int = 0) -> list[dict[str, Any]]:
+    if not db_enabled():
+        return []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT run_date FROM production_broker_orders WHERE broker = %s ORDER BY run_date DESC LIMIT 1;",
+            (broker,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return []
+        run_date = row[0]
+        query = """
+            SELECT run_date,
+                   broker,
+                   ticker,
+                   action,
+                   quantity,
+                   filled_quantity,
+                   exec_price,
+                   currency,
+                   status,
+                   order_id,
+                   payload,
+                   created_at
+            FROM production_broker_orders
+            WHERE broker = %s AND run_date = %s
+            ORDER BY id DESC
+        """
+        params: tuple[Any, ...] = (broker, run_date)
+        if limit and limit > 0:
+            query += " LIMIT %s"
+            params = (broker, run_date, limit)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        return [dict(row) for row in cur.fetchall()]
+
+
 def append_pending_adjustments(entries: Iterable[dict[str, Any]]) -> None:
     if not db_enabled():
         return
@@ -587,3 +997,24 @@ def clear_pending_adjustments() -> None:
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM production_pending_adjustments;")
+
+
+def reset_production_data() -> None:
+    if not db_enabled():
+        raise RuntimeError("DATABASE_URL/POSTGRES_URL not configured.")
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            TRUNCATE
+                production_runs,
+                production_trades,
+                production_prices,
+                production_state,
+                production_pending_adjustments,
+                production_broker_account,
+                production_broker_positions,
+                production_broker_orders;
+            """
+        )

@@ -18,6 +18,7 @@ pandas-ta
 fastapi
 uvicorn
 psycopg2-binary
+requests
 
 # Gradient-boosted trees for tabular signals
 xgboost

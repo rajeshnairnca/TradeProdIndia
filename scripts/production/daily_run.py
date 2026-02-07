@@ -18,6 +18,7 @@ from src.production import (
     add_universe_tickers,
     generate_trades_for_date,
     load_state,
+    ProductionState,
     save_state,
     update_market_data,
 )
@@ -28,13 +29,29 @@ from src.production_db import (
     list_run_summaries as db_list_run_summaries,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
+    replace_broker_orders as db_replace_broker_orders,
+    replace_broker_positions as db_replace_broker_positions,
     replace_trades as db_replace_trades,
     replace_prices as db_replace_prices,
+    upsert_broker_account as db_upsert_broker_account,
     upsert_run_summary as db_upsert_run_summary,
     upsert_state as db_upsert_state,
 )
 from src.regime import compute_market_regime_table
 from src.strategy import list_strategy_names, load_strategies
+from src.trading212 import (
+    Trading212Client,
+    account_cash_available,
+    account_net_worth,
+    build_instrument_index,
+    compare_positions,
+    extract_fx_rates,
+    load_instruments_cache,
+    load_ticker_overrides,
+    positions_to_internal_positions,
+    resolve_t212_ticker,
+    trading212_enabled,
+)
 
 TRADE_COLUMNS = [
     "date",
@@ -245,6 +262,158 @@ def _load_pending_adjustments(path: str) -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return entries
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_close(a: float, b: float, tol: float = 1e-6) -> bool:
+    return abs(a - b) <= tol
+
+
+def _build_trading212_context(state: ProductionState) -> dict:
+    client = Trading212Client()
+    instruments = load_instruments_cache(client)
+    overrides = load_ticker_overrides()
+    by_ticker, by_symbol = build_instrument_index(instruments)
+
+    summary_raw = client.get_account_summary()
+    positions_raw = client.get_positions()
+
+    account_currency = str(
+        summary_raw.get("currencyCode") or summary_raw.get("currency") or "GBP"
+    ).upper()
+    broker_cash_gbp = account_cash_available(summary_raw)
+    broker_net_worth_gbp = account_net_worth(summary_raw)
+    broker_positions = positions_to_internal_positions(positions_raw, overrides)
+    fx_rates = extract_fx_rates(positions_raw, account_currency=account_currency)
+    fx_rate = fx_rates.get("USD") or config.TRADING212_FX_RATE_USD_GBP
+    if not fx_rate:
+        raise ValueError(
+            "Unable to derive GBP/USD FX rate for Trading212. "
+            "Set TRADING212_FX_RATE_USD_GBP to proceed."
+        )
+    broker_cash_usd = broker_cash_gbp / fx_rate
+    discrepancies = compare_positions(
+        state.positions,
+        broker_positions,
+        state.cash,
+        broker_cash_usd,
+    )
+    return {
+        "client": client,
+        "instruments": instruments,
+        "overrides": overrides,
+        "by_ticker": by_ticker,
+        "by_symbol": by_symbol,
+        "summary_raw": summary_raw,
+        "positions_raw": positions_raw,
+        "account_currency": account_currency,
+        "broker_cash_gbp": broker_cash_gbp,
+        "broker_cash_usd": broker_cash_usd,
+        "broker_net_worth_gbp": broker_net_worth_gbp,
+        "broker_positions": broker_positions,
+        "fx_rates": fx_rates,
+        "fx_rate_gbp_per_usd": fx_rate,
+        "discrepancies": discrepancies,
+    }
+
+
+def _execute_trading212_orders(
+    trades: list[dict],
+    context: dict,
+    dry_run: bool,
+) -> tuple[list[dict], list[str]]:
+    client: Trading212Client = context["client"]
+    by_symbol = context["by_symbol"]
+    overrides = context["overrides"]
+    missing: list[str] = []
+    orders: list[dict] = []
+    for trade in trades:
+        shares = _safe_float(trade.get("shares"))
+        if abs(shares) <= 1e-6:
+            continue
+        ticker = str(trade.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        t212_ticker = resolve_t212_ticker(ticker, by_symbol, overrides)
+        if not t212_ticker:
+            missing.append(ticker)
+            continue
+        if dry_run:
+            continue
+        order_resp = client.place_market_order(
+            ticker=t212_ticker,
+            quantity=shares,
+        )
+        order_id = order_resp.get("id")
+        if order_id is None:
+            raise ValueError(f"Trading212 order failed for {ticker}: {order_resp}")
+        filled = client.wait_for_fill(order_id, expected_qty=abs(shares))
+        status = str(filled.get("status", "")).upper()
+        filled_qty = _safe_float(filled.get("filledQuantity"))
+        if status != "FILLED" or not _float_close(filled_qty, abs(shares)):
+            raise ValueError(
+                f"Trading212 order not fully filled for {ticker}: status={status}, "
+                f"filled={filled_qty}, expected={abs(shares)}"
+            )
+        filled_value = _safe_float(filled.get("filledValue"))
+        exec_price = None
+        if filled_qty > 0 and filled_value > 0:
+            exec_price = filled_value / filled_qty
+        orders.append(
+            {
+                "ticker": ticker,
+                "action": trade.get("action"),
+                "quantity": shares,
+                "filled_quantity": filled_qty,
+                "exec_price": exec_price,
+                "currency": filled.get("currency") or context.get("account_currency"),
+                "status": status,
+                "order_id": str(order_id),
+                "payload": filled,
+            }
+        )
+    return orders, missing
+
+
+def _build_broker_positions_rows(
+    positions: list[dict],
+    account_currency: str,
+) -> list[dict]:
+    rows: list[dict] = []
+    for pos in positions:
+        instrument = pos.get("instrument") or {}
+        wallet = pos.get("walletImpact") or {}
+        rows.append(
+            {
+                "ticker": pos.get("ticker") or instrument.get("ticker"),
+                "quantity": pos.get("quantity"),
+                "average_price": pos.get("averagePricePaid"),
+                "current_price": pos.get("currentPrice"),
+                "instrument_currency": instrument.get("currencyCode"),
+                "account_currency": wallet.get("currencyCode") or account_currency,
+                "wallet_current_value": wallet.get("currentValue"),
+                "payload": pos,
+            }
+        )
+    return rows
+
+
+def _build_broker_account_row(summary: dict, account_currency: str) -> dict:
+    cash = summary.get("cash") or {}
+    investments = summary.get("investments") or {}
+    return {
+        "currency": account_currency,
+        "cash": cash.get("availableToTrade"),
+        "investments": investments.get("currentValue"),
+        "net_worth": account_net_worth(summary),
+        "payload": summary,
+    }
 
 
 def _backfill_cumulative_costs(output_dir: str) -> float:
@@ -511,12 +680,34 @@ def main():
         print(f"State already up to date for {state.last_date}. Use --force to rerun.")
         return
 
+    broker_context = None
+    broker_orders: list[dict] = []
+    broker_missing: list[str] = []
+    broker_account_row: dict | None = None
+    broker_positions_rows: list[dict] = []
+    state_for_trades = state
+    if trading212_enabled():
+        broker_context = _build_trading212_context(state)
+        broker_positions = broker_context.get("broker_positions", {})
+        broker_positions_int = {
+            ticker: int(round(qty))
+            for ticker, qty in broker_positions.items()
+            if abs(qty) > 1e-9
+        }
+        state_for_trades = ProductionState(
+            last_date=state.last_date,
+            cash=float(broker_context.get("broker_cash_usd", state.cash)),
+            positions=broker_positions_int,
+            prev_weights=state.prev_weights,
+            total_costs_usd=state.total_costs_usd,
+        )
+
     regime_table = compute_market_regime_table(df if args.regime_scope == "global" else sector_df)
     trades, new_state, summary = generate_trades_for_date(
         sector_df,
         strategies,
         target_date=target_date,
-        state=state,
+        state=state_for_trades,
         regime_table=regime_table,
         strategy_selector=mapping_selector,
     )
@@ -524,6 +715,46 @@ def main():
     summary["sector"] = sector
     summary["regime_scope"] = args.regime_scope
     summary["cash_adjustment"] = float(total_cash)
+    if broker_context:
+        summary["broker_name"] = "trading212"
+        summary["broker_currency"] = broker_context.get("account_currency")
+        summary["broker_discrepancies"] = broker_context.get("discrepancies")
+        summary["broker_fx_rates"] = broker_context.get("fx_rates")
+        summary["broker_fx_rate_gbp_per_usd"] = broker_context.get("fx_rate_gbp_per_usd")
+        broker_orders, broker_missing = _execute_trading212_orders(
+            trades,
+            broker_context,
+            args.dry_run,
+        )
+        if broker_missing:
+            summary["broker_missing_tickers"] = sorted(set(broker_missing))
+        if args.dry_run:
+            post_summary = broker_context.get("summary_raw", {})
+            post_positions = broker_context.get("positions_raw", [])
+        else:
+            client: Trading212Client = broker_context["client"]
+            post_summary = client.get_account_summary()
+            post_positions = client.get_positions()
+        broker_account_row = _build_broker_account_row(
+            post_summary,
+            broker_context.get("account_currency") or "GBP",
+        )
+        broker_positions_rows = _build_broker_positions_rows(
+            post_positions,
+            broker_context.get("account_currency") or "GBP",
+        )
+        broker_cash_gbp = _safe_float(broker_account_row.get("cash"))
+        broker_net_worth_gbp = _safe_float(broker_account_row.get("net_worth"))
+        broker_portfolio_value = _safe_float(broker_account_row.get("investments"))
+        summary["broker_cash"] = broker_cash_gbp
+        summary["broker_portfolio_value"] = broker_portfolio_value
+        summary["broker_net_worth"] = broker_net_worth_gbp
+        summary["broker_cash_weight"] = (
+            broker_cash_gbp / broker_net_worth_gbp if broker_net_worth_gbp > 0 else 0.0
+        )
+        fx_rate = broker_context.get("fx_rate_gbp_per_usd")
+        if fx_rate:
+            summary["broker_net_worth_usd"] = broker_net_worth_gbp / fx_rate
 
     run_dir = Path(_resolve_path(args.output_dir)) / summary["date"]
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -531,6 +762,17 @@ def main():
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
     trades_path = run_dir / "trades.csv"
     trades_df.to_csv(trades_path, index=False)
+    if broker_context:
+        broker_orders_path = run_dir / "broker_orders.json"
+        with broker_orders_path.open("w") as f:
+            json.dump(
+                {
+                    "orders": broker_orders,
+                    "missing_tickers": summary.get("broker_missing_tickers", []),
+                },
+                f,
+                indent=2,
+            )
 
     summary_path = run_dir / "summary.json"
     with summary_path.open("w") as f:
@@ -542,6 +784,10 @@ def main():
             db_replace_trades(summary["date"], trades)
             if price_snapshot:
                 db_replace_prices(summary["date"], price_snapshot)
+            if broker_context and broker_account_row is not None:
+                db_upsert_broker_account(summary["date"], "trading212", broker_account_row)
+                db_replace_broker_positions(summary["date"], "trading212", broker_positions_rows)
+                db_replace_broker_orders(summary["date"], "trading212", broker_orders)
         save_state(state_path, new_state)
         if db_enabled():
             db_upsert_state(new_state)
