@@ -11,6 +11,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 
 from src import config
+from src.market_data_validation import validate_market_data_frame
 from src.regime import compute_market_regime_table
 from src.rule_backtester import RuleBasedBacktester
 from src.strategy import load_strategies
@@ -37,7 +38,9 @@ def run_walk_forward(strategy_names: list[str], strategy_roots: list[str] | None
     roots = strategy_roots or ["alphas"]
     print(f"--- Starting Walk-Forward Validation for: {strategy_names} ---")
 
-    df = pd.read_parquet(os.path.join(PROJECT_ROOT, config.DATA_FILE))
+    data_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
+    df = pd.read_parquet(data_path)
+    validate_market_data_frame(df, source=data_path, required_columns=["Close"])
     strategies = load_strategies(strategy_names, roots)
     if not strategies:
         raise ValueError("No strategies found for walk-forward validation.")

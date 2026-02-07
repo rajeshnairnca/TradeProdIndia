@@ -67,15 +67,6 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
-def _env_int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        return default
-
 # ---- Portfolio Configuration ----
 INITIAL_CAPITAL = 27_000.0
 TRAIN_RATIO = 0.8
@@ -92,7 +83,7 @@ BEAR_GROSS_TARGET = _env_optional_float("BEAR_GROSS_TARGET")
 REGIME_GROSS_TARGETS = _env_json_dict("REGIME_GROSS_TARGETS")
 
 # ---- Market/Cost Configuration ----
-TRADING_REGION = _env_str("TRADING_REGION", "india").lower()
+TRADING_REGION = _env_str("TRADING_REGION", "us").lower()
 US_COMMISSION_RATE = _env_float("US_COMMISSION_RATE", 0.0015)
 US_FINRA_FEE_PER_SHARE = _env_float("US_FINRA_FEE_PER_SHARE", 0.000195)
 US_SEC_FEE_RATE = _env_float("US_SEC_FEE_RATE", 0.0000278)

@@ -10,17 +10,14 @@ import pandas as pd
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(PROJECT_ROOT)
 
-os.environ.setdefault("TRADING_REGION", "us")
-os.environ.setdefault("REGIME_MODE", "heuristic")
-
 from src import config
+from src.market_data_validation import validate_market_data_frame
+from src.production_market_data import add_universe_tickers, update_market_data
 from src.production import (
-    add_universe_tickers,
     generate_trades_for_date,
     load_state,
     ProductionState,
     save_state,
-    update_market_data,
     _apply_universe_filter,
 )
 from src.production_db import (
@@ -172,6 +169,11 @@ def parse_args():
         "--allow-partial-updates",
         action="store_true",
         help="Allow data updates if some tickers fail TradingView fetch.",
+    )
+    parser.add_argument(
+        "--update-diagnostics-file",
+        default="market_data_update_diagnostics.json",
+        help="Filename to store per-ticker market-data update diagnostics under each run directory.",
     )
     return parser.parse_args()
 
@@ -580,6 +582,13 @@ def main():
 
     data_path = _resolve_path(args.data_file or config.DATA_FILE)
     df = pd.read_parquet(data_path) if args.skip_update else None
+    update_diagnostics: dict | None = None
+    if df is not None:
+        validate_market_data_frame(
+            df,
+            source=data_path,
+            required_columns=["Close", "Open", "High", "Low", "Volume"],
+        )
 
     new_tickers: list[str] = []
     if args.add_tickers:
@@ -596,6 +605,11 @@ def main():
     if new_tickers:
         if df is None:
             df = pd.read_parquet(data_path)
+            validate_market_data_frame(
+                df,
+                source=data_path,
+                required_columns=["Close", "Open", "High", "Low", "Volume"],
+            )
         existing_tickers = set(df.index.get_level_values("ticker").unique())
         df = add_universe_tickers(
             data_path,
@@ -613,7 +627,7 @@ def main():
         _update_exchange_map(args.exchange_map_file, pending_exchange_map)
 
     if not args.skip_update:
-        df = update_market_data(
+        updated_result = update_market_data(
             data_path,
             lookback_days=args.lookback_days,
             interval=args.interval,
@@ -624,9 +638,16 @@ def main():
             timeout=args.tv_timeout,
             require_all_tickers=not args.allow_partial_updates,
             exchange_map_path=args.exchange_map_file,
+            return_diagnostics=True,
         )
+        df, update_diagnostics = updated_result
     if df is None:
         df = pd.read_parquet(data_path)
+    validate_market_data_frame(
+        df,
+        source=data_path,
+        required_columns=["Close", "Open", "High", "Low", "Volume", "sector"],
+    )
 
     if "sector" not in df.columns:
         raise ValueError("Sector column missing in data; re-run data extraction with sector enabled.")
@@ -785,6 +806,11 @@ def main():
     run_dir = Path(_resolve_path(args.output_dir)) / summary["date"]
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    if update_diagnostics is not None:
+        diagnostics_path = run_dir / args.update_diagnostics_file
+        with diagnostics_path.open("w") as f:
+            json.dump(update_diagnostics, f, indent=2)
+
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
     trades_path = run_dir / "trades.csv"
     trades_df.to_csv(trades_path, index=False)
@@ -834,6 +860,8 @@ def main():
 
     print(f"Trades saved to {trades_path}")
     print(f"Summary saved to {summary_path}")
+    if update_diagnostics is not None:
+        print(f"Market update diagnostics saved to {run_dir / args.update_diagnostics_file}")
     print(f"Trades: {summary['num_trades']} | Net Worth: ${summary['net_worth_usd']:,.2f}")
     print(f"Sector: {sector} | Regime scope: {args.regime_scope}")
 

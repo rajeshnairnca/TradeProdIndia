@@ -275,7 +275,7 @@ def summaries(
     def _parse_date(value: str | None):
         try:
             return pd.to_datetime(value) if value else None
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
     filtered: list[dict] = []
@@ -591,7 +591,7 @@ def portfolio_snapshot():
                 price = float(series.iloc[-1])
                 value = price * shares_val
                 portfolio_value += value
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             price = None
         if price is None:
             missing_prices.append(str(ticker))

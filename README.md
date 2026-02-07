@@ -77,6 +77,7 @@ Useful options:
 - `--skip-update` to avoid TradingView calls (local dry runs)
 - `--print-trades` to emit trades to stdout
 - `--sector` and `--regime-scope` for sector-focused production runs
+- `--update-diagnostics-file` to persist per-ticker update statuses/reasons (missing analysis, no new bar, invalid OHLCV, etc.)
 
 Queue adjustments (cash or tickers):
 
@@ -117,6 +118,14 @@ Yfinance extraction:
 ```bash
 python3 "scripts/data_extraction/data_extract_yfinance - days - v6.py" --output-file data/daily_data_us.parquet
 ```
+
+## Testing
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
+```
+
+The suite includes deterministic unit tests and a fast CLI smoke backtest.
 
 ## Configuration (Environment)
 

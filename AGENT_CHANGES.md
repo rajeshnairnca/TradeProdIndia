@@ -169,3 +169,20 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Expanded Trading212 instrument indexing to include `shortName` aliases so renamed tickers map correctly.
 - Added a Trading212 universe pre-check in the daily production run, halting if any tradable tickers lack a mapping, and stopped using broker cash/positions as the state-of-truth for signal generation.
 - Removed the Trading212 mapping builder script from the repository per request.
+- Added `src/market_data_validation.py` with strict parquet preflight checks (MultiIndex shape, required columns, duplicates, datetime compatibility) and wired it into backtesting/production entrypoints.
+- Added `src/production_market_data.py` to modularize production market-data responsibilities (`update_market_data`, `add_universe_tickers`, indicator prep helpers), and re-exported market-data APIs from `src/production.py`.
+- Added structured per-ticker market-data update diagnostics (status/reason metadata) and persisted them from `scripts/production/daily_run.py` via `--update-diagnostics-file`.
+- Hardened fallback exception handling with explicit context/logging in regime HMM flows (`src/regime.py`) and narrowed overly broad exception catches in `scripts/production/api_server.py`.
+- Fixed config consistency issues by removing a duplicate `_env_int` definition and aligning the default `TRADING_REGION` to `us` in `src/config.py`; removed hardcoded env defaults from `scripts/production/daily_run.py`.
+- Added test baseline under `tests/`:
+  - `tests/test_market_data_validation.py`
+  - `tests/test_regime.py`
+  - `tests/test_rule_backtester.py`
+  - `tests/test_backtester_cli_smoke.py`
+  - `tests/conftest.py` path bootstrap.
+- Added CI workflow `.github/workflows/ci.yml` to run syntax lint (`compileall`) plus pytest (including CLI smoke backtest).
+- Updated `README.md` with the new update diagnostics option and test command.
+- Removed unused/deprecated LLM artifacts: deleted `src/llm_interface.py` and `GEMINI.md`.
+- Cleaned local/generated clutter from the working tree: removed `__pycache__/`, `*.pyc`, `.pytest_cache`, and project-level `.DS_Store` files (except permission-restricted `.git` internals).
+- Removed run artifacts under `runs/` per cleanup request.
+- Updated stale guidance in `AGENTS.md` (removed references to `_candidates/` and `scripts/orchestration/orchestrator.py`; refreshed testing guidance to use the current pytest suite).

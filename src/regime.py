@@ -1,7 +1,11 @@
+import logging
+
 import pandas as pd
 import numpy as np
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 try:
     from hmmlearn.hmm import GaussianHMM
@@ -55,7 +59,11 @@ def _apply_hmm_trend_vol(market_proxy: pd.DataFrame) -> None:
     X = np.column_stack([data["market_return"].to_numpy(), data["vol"].to_numpy()])
     try:
         model = _fit_hmm(X, config.HMM_N_COMPONENTS)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "HMM regime fit failed for REGIME_MODE=hmm; falling back to heuristic mode: %s",
+            exc,
+        )
         _apply_heuristic_trend_vol(market_proxy)
         return
     states = model.predict(X)
@@ -102,6 +110,8 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
     trend_up = pd.Series(index=data.index, dtype=bool)
     vol_high = pd.Series(index=data.index, dtype=bool)
     hmm_state = pd.Series(index=data.index, dtype="Int64")
+    failure_count = 0
+    last_error: Exception | None = None
 
     train_end = warmup
     while train_end < len(data):
@@ -137,8 +147,9 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
             trend_up.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index).isin(bull_states)
             vol_high.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index).isin(high_vol_states)
             hmm_state.loc[predict_slice.index] = pd.Series(pred_states, index=predict_slice.index)
-        except Exception:
-            pass
+        except Exception as exc:
+            failure_count += 1
+            last_error = exc
 
         train_end += step
 
@@ -149,6 +160,12 @@ def _apply_hmm_rolling_trend_vol(market_proxy: pd.DataFrame) -> None:
         market_proxy.loc[trend_up.index, "trend_up"] = trend_up
     if not vol_high.empty:
         market_proxy.loc[vol_high.index, "vol_high"] = vol_high
+    if failure_count:
+        logger.warning(
+            "HMM rolling regime fit failed on %d windows; heuristic fallback was used for those windows. Last error: %s",
+            failure_count,
+            last_error,
+        )
 
 
 def compute_market_regime_table(

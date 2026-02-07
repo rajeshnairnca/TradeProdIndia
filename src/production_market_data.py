@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from . import config
-from .costs import vectorized_brokerage_calculator
-from .portfolio import get_target_weights
-from .regime import get_regime_state, regime_gross_target, regime_top_k
-from .strategy import StrategySpec
-from .universe import NASDAQ100_TICKERS
+from .market_data_validation import validate_market_data_frame
+
+logger = logging.getLogger(__name__)
 
 REQUIRED_INDICATOR_COLS = [
     "RSI_14",
@@ -30,43 +28,7 @@ REQUIRED_INDICATOR_COLS = [
     "SMA20_Volume",
 ]
 
-
-@dataclass
-class ProductionState:
-    last_date: str | None
-    cash: float
-    positions: dict[str, int]
-    prev_weights: dict[str, float]
-    total_costs_usd: float = 0.0
-
-
-def load_state(path: str | Path, default_cash: float) -> ProductionState:
-    state_path = Path(path)
-    if not state_path.exists():
-        return ProductionState(last_date=None, cash=default_cash, positions={}, prev_weights={})
-    with state_path.open("r") as f:
-        payload = json.load(f)
-    return ProductionState(
-        last_date=payload.get("last_date"),
-        cash=float(payload.get("cash", default_cash)),
-        positions={k: int(v) for k, v in payload.get("positions", {}).items()},
-        prev_weights={k: float(v) for k, v in payload.get("prev_weights", {}).items()},
-        total_costs_usd=float(payload.get("total_costs_usd", 0.0)),
-    )
-
-
-def save_state(path: str | Path, state: ProductionState) -> None:
-    state_path = Path(path)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "last_date": state.last_date,
-        "cash": state.cash,
-        "positions": state.positions,
-        "prev_weights": state.prev_weights,
-        "total_costs_usd": state.total_costs_usd,
-    }
-    with state_path.open("w") as f:
-        json.dump(payload, f, indent=2)
+_BASE_REQUIRED_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
 
 
 def update_market_data(
@@ -82,8 +44,9 @@ def update_market_data(
     exchange_map_path: str | Path | None = None,
     batch_size: int = 200,
     max_batches: int = 3,
-) -> pd.DataFrame:
-    """Incrementally update the daily parquet with the latest TradingView data."""
+    return_diagnostics: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
+    """Incrementally update the daily parquet with latest TradingView bars."""
     import pandas_ta_classic as ta  # noqa: F401
 
     data_path = Path(data_path)
@@ -91,11 +54,11 @@ def update_market_data(
         raise FileNotFoundError(f"Data file not found: {data_path}")
 
     existing = pd.read_parquet(data_path)
-    if not isinstance(existing.index, pd.MultiIndex):
-        raise ValueError("Expected a MultiIndex [date, ticker] in the data file.")
-    if existing.index.names != ["date", "ticker"]:
-        raise ValueError(f"Unexpected index names: {existing.index.names}")
-    existing = _coalesce_vix_columns(existing)
+    validate_market_data_frame(
+        existing,
+        source=data_path,
+        required_columns=_BASE_REQUIRED_COLUMNS,
+    )
     existing = _coalesce_vix_columns(existing)
 
     tickers = sorted(existing.index.get_level_values("ticker").unique())
@@ -118,7 +81,8 @@ def update_market_data(
     updated_rows: list[dict] = []
     updated_tickers: set[str] = set()
     resolved_tickers: set[str] = set()
-    symbol_by_ticker = {}
+    diagnostics: dict[str, dict] = {}
+    symbol_by_ticker: dict[str, str] = {}
     fallback_exchange = exchange_list[0] if exchange_list else "NYSE"
     for ticker in tickers:
         mapped = exchange_map.get(ticker)
@@ -134,9 +98,16 @@ def update_market_data(
         max_batches=max_batches,
     )
     for ticker in tqdm(tickers, desc="Processing TradingView data", unit="ticker"):
+        symbol = symbol_by_ticker.get(ticker, "")
         analysis = analysis_map.get(ticker)
         if analysis is None:
             resolved_tickers.add(ticker)
+            diagnostics[ticker] = _diag_item(
+                ticker=ticker,
+                status="skipped",
+                reason="missing_analysis",
+                symbol=symbol,
+            )
             continue
 
         bar_time = getattr(analysis, "time", None)
@@ -147,6 +118,14 @@ def update_market_data(
         last_ticker_date = _to_naive_timestamp(existing_ticker.index.get_level_values("date").max())
         if bar_date <= last_ticker_date:
             resolved_tickers.add(ticker)
+            diagnostics[ticker] = _diag_item(
+                ticker=ticker,
+                status="skipped",
+                reason="no_new_bar",
+                symbol=symbol,
+                last_data_date=_fmt_date(last_ticker_date),
+                bar_date=_fmt_date(bar_date),
+            )
             continue
 
         indicators = analysis.indicators or {}
@@ -156,6 +135,15 @@ def update_market_data(
         close_price = indicators.get("close")
         volume = indicators.get("volume")
         if any(val is None for val in (open_price, high_price, low_price, close_price, volume)):
+            diagnostics[ticker] = _diag_item(
+                ticker=ticker,
+                status="error",
+                reason="invalid_ohlcv",
+                symbol=symbol,
+                last_data_date=_fmt_date(last_ticker_date),
+                bar_date=_fmt_date(bar_date),
+                message="TradingView returned missing OHLCV fields.",
+            )
             continue
 
         row = _build_updated_row(
@@ -171,20 +159,55 @@ def update_market_data(
             rolling_window=rolling_window,
             lookback_rows=lookback_rows,
         )
-        if row is not None:
-            updated_rows.append(row)
-            updated_tickers.add(ticker)
-            resolved_tickers.add(ticker)
+        if row is None:
+            diagnostics[ticker] = _diag_item(
+                ticker=ticker,
+                status="error",
+                reason="feature_build_failed",
+                symbol=symbol,
+                last_data_date=_fmt_date(last_ticker_date),
+                bar_date=_fmt_date(bar_date),
+            )
+            continue
+        updated_rows.append(row)
+        updated_tickers.add(ticker)
+        resolved_tickers.add(ticker)
+        diagnostics[ticker] = _diag_item(
+            ticker=ticker,
+            status="updated",
+            reason="ok",
+            symbol=symbol,
+            last_data_date=_fmt_date(last_ticker_date),
+            bar_date=_fmt_date(bar_date),
+        )
+
+    unresolved = sorted(set(tickers) - resolved_tickers)
+    diagnostics_payload = _build_update_diagnostics_payload(
+        diagnostics=diagnostics,
+        total_tickers=len(tickers),
+        updated_tickers=updated_tickers,
+        unresolved_tickers=unresolved,
+        batch_size=batch_size,
+        max_batches=max_batches,
+    )
 
     if not updated_rows:
+        if return_diagnostics:
+            return existing, diagnostics_payload
         return existing
-    if require_all_tickers and len(resolved_tickers) != len(tickers):
-        missing = sorted(set(tickers) - resolved_tickers)
-        preview = ", ".join(missing[:10])
+
+    if require_all_tickers and unresolved:
+        preview = ", ".join(unresolved[:10])
+        reasons = []
+        for ticker in unresolved[:5]:
+            item = diagnostics.get(ticker) or {}
+            reasons.append(f"{ticker}:{item.get('reason', 'unknown')}")
+        reason_preview = ", ".join(reasons)
         raise ValueError(
             "Partial update detected from TradingView. "
             f"Updated {len(updated_tickers)}/{len(tickers)} tickers. "
-            f"Missing (first 10): {preview}"
+            f"Missing (first 10): {preview}. "
+            f"Reasons (first 5): {reason_preview}"
         )
 
     updates_df = pd.DataFrame(updated_rows)
@@ -243,9 +266,15 @@ def update_market_data(
     combined = pd.concat([existing, updates_df], axis=0, sort=False)
     combined = combined[~combined.index.duplicated(keep="last")]
     combined.sort_index(inplace=True)
-
     combined = _prune_history(combined, config.RETENTION_TRADING_DAYS)
     combined.to_parquet(data_path, engine="pyarrow")
+    validate_market_data_frame(
+        combined,
+        source=data_path,
+        required_columns=_BASE_REQUIRED_COLUMNS,
+    )
+    if return_diagnostics:
+        return combined, diagnostics_payload
     return combined
 
 
@@ -259,7 +288,7 @@ def add_universe_tickers(
     vix_ticker: str = "^VIX",
     recompute_cross_sectional: bool = True,
 ) -> pd.DataFrame:
-    """Add new tickers with full yfinance history, then write back to the parquet."""
+    """Add new tickers with yfinance history, then write back to parquet."""
     import yfinance as yf
     import pandas_ta_classic as ta  # noqa: F401
 
@@ -268,13 +297,14 @@ def add_universe_tickers(
         raise FileNotFoundError(f"Data file not found: {data_path}")
 
     existing = pd.read_parquet(data_path)
-    if not isinstance(existing.index, pd.MultiIndex):
-        raise ValueError("Expected a MultiIndex [date, ticker] in the data file.")
-    if existing.index.names != ["date", "ticker"]:
-        raise ValueError(f"Unexpected index names: {existing.index.names}")
+    validate_market_data_frame(
+        existing,
+        source=data_path,
+        required_columns=_BASE_REQUIRED_COLUMNS,
+    )
 
     existing_tickers = set(existing.index.get_level_values("ticker").unique())
-    requested = [t.strip() for t in tickers if t and t.strip()]
+    requested = [str(t).strip().upper() for t in tickers if str(t).strip()]
     new_tickers = [t for t in requested if t not in existing_tickers]
     if not new_tickers:
         return existing
@@ -283,13 +313,19 @@ def add_universe_tickers(
 
     all_stock_data: dict[str, pd.DataFrame] = {}
     sector_by_ticker: dict[str, str] = {}
+    fetch_errors: list[str] = []
     for ticker in tqdm(new_tickers, desc="Fetching yfinance history", unit="ticker"):
         try:
             stock = yf.Ticker(ticker)
             df = stock.history(period=period, interval=interval, auto_adjust=True)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            msg = f"{ticker}: {type(exc).__name__}({exc})"
+            fetch_errors.append(msg)
+            logger.warning("Failed to fetch yfinance history for %s: %s", ticker, exc)
             continue
         if df.empty:
+            fetch_errors.append(f"{ticker}: empty_history")
+            logger.warning("Skipping %s: no yfinance history returned.", ticker)
             continue
         df = df.copy()
         df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -302,12 +338,17 @@ def add_universe_tickers(
                 df[col] = np.nan
         cleaned = df.dropna(subset=REQUIRED_INDICATOR_COLS)
         if len(cleaned) < min_trading_days:
+            fetch_errors.append(f"{ticker}: insufficient_history({len(cleaned)})")
             continue
         all_stock_data[ticker] = cleaned
-        sector_by_ticker[ticker] = _fetch_sector_yfinance(stock)
+        sector_by_ticker[ticker] = _fetch_sector_yfinance(stock, ticker=ticker)
 
     if not all_stock_data:
-        raise ValueError("No new tickers had sufficient data to add.")
+        preview = ", ".join(fetch_errors[:10]) if fetch_errors else "no valid ticker data"
+        raise ValueError(
+            "No new tickers had sufficient data to add. "
+            f"Sample failures: {preview}"
+        )
 
     all_data_list: list[pd.DataFrame] = []
     for ticker, df in all_stock_data.items():
@@ -349,6 +390,7 @@ def add_universe_tickers(
         vix_stats = _compute_rolling_vix_z(vix_df, rolling_window)
         master_df = master_df.merge(vix_stats, how="left", left_on="date", right_index=True)
         if "vix_return" in master_df.columns:
+
             def _beta(group: pd.DataFrame) -> pd.Series:
                 cov = group["log_return"].rolling(window=rolling_window, min_periods=rolling_window).cov(
                     group["vix_return"]
@@ -387,7 +429,75 @@ def add_universe_tickers(
 
     combined = _prune_history(combined, config.RETENTION_TRADING_DAYS)
     combined.to_parquet(data_path, engine="pyarrow")
+    validate_market_data_frame(
+        combined,
+        source=data_path,
+        required_columns=_BASE_REQUIRED_COLUMNS,
+    )
     return combined
+
+
+def _diag_item(
+    ticker: str,
+    status: str,
+    reason: str,
+    symbol: str | None = None,
+    last_data_date: str | None = None,
+    bar_date: str | None = None,
+    message: str | None = None,
+) -> dict:
+    item = {
+        "ticker": ticker,
+        "status": status,
+        "reason": reason,
+        "symbol": symbol,
+        "last_data_date": last_data_date,
+        "bar_date": bar_date,
+    }
+    if message:
+        item["message"] = message
+    return item
+
+
+def _build_update_diagnostics_payload(
+    diagnostics: dict[str, dict],
+    total_tickers: int,
+    updated_tickers: set[str],
+    unresolved_tickers: list[str],
+    batch_size: int,
+    max_batches: int,
+) -> dict:
+    status_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    for item in diagnostics.values():
+        status = str(item.get("status") or "unknown")
+        reason = str(item.get("reason") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return {
+        "generated_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "tickers_total": total_tickers,
+        "tickers_with_diagnostics": len(diagnostics),
+        "updated_count": len(updated_tickers),
+        "unresolved_count": len(unresolved_tickers),
+        "unresolved_tickers": unresolved_tickers,
+        "status_counts": status_counts,
+        "reason_counts": reason_counts,
+        "request_config": {
+            "batch_size": batch_size,
+            "max_batches": max_batches,
+        },
+        "tickers": sorted(diagnostics.values(), key=lambda x: (x["ticker"])),
+    }
+
+
+def _fmt_date(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:  # noqa: BLE001
+        return str(value)
 
 
 def _resolve_tv_interval(interval: str):
@@ -467,18 +577,24 @@ def _fetch_tv_analyses_batch(
         if not batch:
             continue
         try:
-            result = get_multiple_analysis(
-                screener=screener,
-                interval=interval,
-                symbols=batch,
-                timeout=timeout,
-            )
-        except TypeError:
-            result = get_multiple_analysis(
-                screener=screener,
-                interval=interval,
-                symbols=batch,
-            )
+            try:
+                result = get_multiple_analysis(
+                    screener=screener,
+                    interval=interval,
+                    symbols=batch,
+                    timeout=timeout,
+                )
+            except TypeError:
+                result = get_multiple_analysis(
+                    screener=screener,
+                    interval=interval,
+                    symbols=batch,
+                )
+        except Exception as exc:  # noqa: BLE001
+            sample = ",".join(batch[:3])
+            raise RuntimeError(
+                f"TradingView batch request failed for {len(batch)} symbols (sample: {sample})."
+            ) from exc
         if result:
             analysis_by_symbol.update(result)
 
@@ -494,6 +610,7 @@ def _fetch_tv_analysis(
 ):
     from tradingview_ta import TA_Handler
 
+    errors: list[str] = []
     for exchange in exchange_list:
         try:
             if timeout is None:
@@ -520,8 +637,14 @@ def _fetch_tv_analysis(
             )
         try:
             return handler.get_analysis()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{exchange}:{type(exc).__name__}({exc})")
             continue
+    if errors:
+        preview = "; ".join(errors[:3])
+        raise RuntimeError(
+            f"TradingView analysis failed for {symbol} across exchanges. Sample errors: {preview}"
+        )
     return None
 
 
@@ -650,13 +773,18 @@ def _fetch_vix_close(
         exchange, symbol = vix_ticker.split(":", 1)
         exchange_candidates = [exchange]
 
-    analysis = _fetch_tv_analysis(
-        symbol,
-        screener=screener,
-        exchange_list=exchange_candidates,
-        interval=interval,
-        timeout=timeout,
-    )
+    try:
+        analysis = _fetch_tv_analysis(
+            symbol,
+            screener=screener,
+            exchange_list=exchange_candidates,
+            interval=interval,
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        logger.warning("Falling back to historical VIX series for %s: %s", vix_ticker, exc)
+        analysis = None
+
     if analysis is None:
         return float(fallback_series.iloc[-1]) if not fallback_series.empty else None
     indicators = analysis.indicators or {}
@@ -737,7 +865,7 @@ def _recompute_cross_sectional_z(df: pd.DataFrame, columns: list[str]) -> pd.Dat
     return df
 
 
-def _fetch_sector_yfinance(stock) -> str:
+def _fetch_sector_yfinance(stock, ticker: str = "") -> str:
     try:
         if hasattr(stock, "get_info"):
             info = stock.get_info()
@@ -747,310 +875,10 @@ def _fetch_sector_yfinance(stock) -> str:
             sector = info.get("sector") or info.get("industry")
             if isinstance(sector, str) and sector.strip():
                 return sector.strip()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        if ticker:
+            logger.warning("Failed to fetch sector metadata for %s: %s", ticker, exc)
     return "unknown"
-
-
-def generate_trades_for_date(
-    df: pd.DataFrame,
-    strategies: Iterable[StrategySpec],
-    target_date: pd.Timestamp,
-    state: ProductionState,
-    regime_table: pd.DataFrame | None = None,
-    apply_regime_overlays: bool = True,
-    strategy_selector: Callable[[pd.Timestamp, dict, list[StrategySpec]], list[StrategySpec] | None] | None = None,
-) -> tuple[list[dict], ProductionState, dict]:
-    df = _apply_universe_filter(df)
-    if df.empty:
-        raise ValueError("No data left after applying the universe filter.")
-
-    target_date = pd.to_datetime(target_date).tz_localize(None)
-    if target_date not in df.index.get_level_values("date"):
-        raise ValueError(f"Target date {target_date.date()} not found in data.")
-
-    strategies_list = list(strategies)
-    if not strategies_list:
-        raise ValueError("No strategies provided.")
-
-    universe = df.index.get_level_values("ticker").unique().tolist()
-    strategy_scores = _precompute_scores(df, strategies_list)
-
-    state_snapshot = get_regime_state(regime_table, target_date)
-    selected = None
-    if strategy_selector is not None:
-        selected = strategy_selector(target_date, state_snapshot, strategies_list)
-    if selected is None:
-        active_strategies = _select_strategies(strategies_list, state_snapshot.get("regime_label"))
-    else:
-        active_strategies = list(selected)
-
-    active_strategy_names = [strategy.name for strategy in active_strategies]
-    combined_scores = _combine_scores(strategy_scores, active_strategies, target_date, universe)
-
-    day_data = df.loc[target_date].reindex(universe)
-    prices = day_data["Close"].to_numpy(dtype=float)
-    mask = np.isfinite(prices) & (prices > 0)
-    prices = np.nan_to_num(prices, nan=0.0, posinf=0.0, neginf=0.0)
-
-    vol = day_data.get("vol_21")
-    vol = vol.to_numpy(dtype=float) if vol is not None else np.ones_like(prices)
-
-    adv = day_data.get("adv_21")
-    adv = adv.to_numpy(dtype=float) if adv is not None else np.zeros_like(prices)
-    adv = np.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
-
-    apply_overlays = apply_regime_overlays and config.USE_REGIME_SYSTEM
-    dynamic_top_k = config.TOP_K
-    if apply_overlays:
-        dynamic_top_k = regime_top_k(state_snapshot, config.TOP_K)
-
-    weights = get_target_weights(combined_scores, vol, mask.astype(float), top_k=dynamic_top_k)
-
-    positions_arr, prev_weights_arr = _align_state(universe, state.positions, state.prev_weights)
-
-    if config.WEIGHT_SMOOTHING > 0 and np.any(prev_weights_arr):
-        weights = (1.0 - config.WEIGHT_SMOOTHING) * weights + config.WEIGHT_SMOOTHING * prev_weights_arr
-        total = np.sum(weights)
-        if total > 1e-9:
-            weights = weights / total
-
-    weights = weights * mask
-    total = np.sum(weights)
-    if total > 1e-9:
-        weights = weights / total
-    else:
-        weights = np.zeros_like(weights)
-
-    if apply_overlays:
-        gross_target = min(regime_gross_target(state_snapshot), 1.0)
-        weights = weights * gross_target
-
-    reserve = config.CASH_RESERVE
-    total = np.sum(weights)
-    if total > 1e-9:
-        cap = max(0.0, 1.0 - reserve)
-        if total > cap:
-            weights = weights * (cap / total)
-
-    cash_weight = max(0.0, 1.0 - np.sum(weights))
-    net_worth = float(state.cash) + float(np.sum(positions_arr * prices))
-    if net_worth <= 0:
-        raise ValueError("Net worth is non-positive; cannot generate trades.")
-
-    target_alloc_dollars = weights * net_worth
-    desired_shares = np.round(target_alloc_dollars / (prices + 1e-9)).astype(np.int64)
-    desired_alloc_dollars = desired_shares * prices
-    current_holdings_dollars = positions_arr * prices
-    trade_dollars = desired_alloc_dollars - current_holdings_dollars
-    trade_shares = desired_shares - positions_arr
-
-    safe_adv_dollars = np.nan_to_num(adv * prices, nan=0.0, posinf=0.0, neginf=0.0)
-    safe_adv_dollars = np.maximum(safe_adv_dollars, config.MIN_ADV_DOLLARS_SLIPPAGE)
-    trade_frac_adv = np.abs(trade_dollars) / (safe_adv_dollars + 1e-9)
-    slippage_costs = float(np.sum(np.abs(trade_dollars) * (config.SLIPPAGE_COEFF * trade_frac_adv)))
-    brokerage_costs = float(np.sum(vectorized_brokerage_calculator(trade_dollars, trade_shares=trade_shares)))
-    total_costs = slippage_costs + brokerage_costs
-
-    cash_after = float(state.cash) - float(np.sum(trade_dollars)) - total_costs
-    if cash_after < -1e-6 and np.any(trade_dollars > 0):
-        buy_mask = trade_dollars > 0
-        current_holdings_dollars = positions_arr * prices
-
-        def _apply_buy_scale(scale: float):
-            adj_trade_shares = trade_shares.copy()
-            adj_trade_shares[buy_mask] = np.floor(
-                adj_trade_shares[buy_mask] * scale
-            ).astype(np.int64)
-            adj_desired_shares = positions_arr + adj_trade_shares
-            adj_trade_dollars = (adj_desired_shares * prices) - current_holdings_dollars
-            adj_trade_frac_adv = np.abs(adj_trade_dollars) / (safe_adv_dollars + 1e-9)
-            adj_slippage_costs = np.abs(adj_trade_dollars) * (
-                config.SLIPPAGE_COEFF * adj_trade_frac_adv
-            )
-            adj_brokerage_costs = vectorized_brokerage_calculator(
-                adj_trade_dollars, trade_shares=adj_trade_shares
-            )
-            adj_total_costs = float(np.sum(adj_slippage_costs + adj_brokerage_costs))
-            adj_cash = float(state.cash) - float(np.sum(adj_trade_dollars)) - adj_total_costs
-            return (
-                adj_cash,
-                adj_desired_shares,
-                adj_trade_dollars,
-                adj_trade_shares,
-                adj_total_costs,
-            )
-
-        lo, hi = 0.0, 1.0
-        best = None
-        for _ in range(12):
-            mid = (lo + hi) / 2.0
-            adj_cash, adj_desired, adj_dollars, adj_shares, adj_costs = _apply_buy_scale(mid)
-            if adj_cash >= -1e-6:
-                best = (adj_desired, adj_dollars, adj_shares, adj_costs)
-                lo = mid
-            else:
-                hi = mid
-        if best is None:
-            _, adj_desired, adj_dollars, adj_shares, adj_costs = _apply_buy_scale(0.0)
-        else:
-            adj_desired, adj_dollars, adj_shares, adj_costs = best
-        desired_shares = adj_desired
-        trade_dollars = adj_dollars
-        trade_shares = adj_shares
-        total_costs = adj_costs
-
-    cash = float(state.cash) - float(np.sum(trade_dollars)) - total_costs
-    positions = desired_shares
-
-    net_worth = cash + float(np.sum(positions * prices))
-    portfolio_value = float(np.sum(positions * prices))
-    cash_weight = max(0.0, cash / net_worth) if net_worth > 0 else 0.0
-
-    trades: list[dict] = []
-    for i in range(len(trade_dollars)):
-        if abs(trade_dollars[i]) <= 1.0:
-            continue
-        trades.append(
-            {
-                "date": pd.Timestamp(target_date).strftime("%Y-%m-%d"),
-                "ticker": universe[i],
-                "action": "BUY" if trade_dollars[i] > 0 else "SELL",
-                "shares": float(trade_shares[i]),
-                "price_usd": float(prices[i]),
-                "value_usd": float(trade_dollars[i]),
-                "net_worth_usd": float(net_worth),
-                "cash_usd": float(cash),
-                "portfolio_value_usd": float(portfolio_value),
-                "cash_weight": float(cash_weight),
-                "regime": state_snapshot.get("regime_label", "unknown"),
-                "strategies": ",".join(active_strategy_names),
-            }
-        )
-
-    cumulative_costs = float(state.total_costs_usd) + float(total_costs)
-
-    new_state = ProductionState(
-        last_date=pd.Timestamp(target_date).strftime("%Y-%m-%d"),
-        cash=cash,
-        positions={ticker: int(shares) for ticker, shares in zip(universe, positions) if shares != 0},
-        prev_weights={ticker: float(w) for ticker, w in zip(universe, weights) if abs(w) > 1e-9},
-        total_costs_usd=cumulative_costs,
-    )
-
-    summary = {
-        "date": pd.Timestamp(target_date).strftime("%Y-%m-%d"),
-        "num_trades": len(trades),
-        "net_worth_usd": float(net_worth),
-        "cash_usd": float(cash),
-        "portfolio_value_usd": float(portfolio_value),
-        "cash_weight": float(cash_weight),
-        "regime": state_snapshot.get("regime_label", "unknown"),
-        "strategies": active_strategy_names,
-        "daily_costs_usd": float(total_costs),
-        "total_costs_usd": float(cumulative_costs),
-    }
-
-    return trades, new_state, summary
-
-
-def _apply_universe_filter(df: pd.DataFrame) -> pd.DataFrame:
-    excluded = _load_excluded_tickers()
-    universe_filter = config.UNIVERSE_FILTER
-    if not universe_filter or universe_filter in ("all", "none"):
-        filtered = df
-    elif universe_filter == "nasdaq100":
-        allowed = set(NASDAQ100_TICKERS)
-        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
-    else:
-        allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
-        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
-    if not excluded:
-        return filtered
-    return filtered[~filtered.index.get_level_values("ticker").isin(excluded)]
-
-
-def _load_excluded_tickers() -> set[str]:
-    path = config.resolve_path(config.EXCLUDED_TICKERS_FILE)
-    if not path:
-        return set()
-    excluded_path = Path(path)
-    if not excluded_path.exists():
-        return set()
-    try:
-        lines = excluded_path.read_text().splitlines()
-    except OSError:
-        return set()
-    return {line.strip().upper() for line in lines if line.strip()}
-
-
-def _precompute_scores(
-    df: pd.DataFrame,
-    strategies: Iterable[StrategySpec],
-) -> dict[str, pd.Series]:
-    scores: dict[str, pd.Series] = {}
-    for strategy in strategies:
-        series = strategy.score_func(df)
-        if not isinstance(series, pd.Series):
-            raise ValueError(f"Strategy {strategy.name} must return a pandas Series.")
-        if len(series) != len(df):
-            raise ValueError(
-                f"Strategy {strategy.name} returned {len(series)} scores, expected {len(df)}."
-            )
-        if not series.index.equals(df.index):
-            series = series.reindex(df.index)
-        scores[strategy.name] = series.astype(float).fillna(0.0)
-    return scores
-
-
-def _select_strategies(strategies: list[StrategySpec], regime_label: str | None) -> list[StrategySpec]:
-    if not regime_label:
-        return list(strategies)
-    active = [
-        strategy
-        for strategy in strategies
-        if not strategy.regime_tags or regime_label in strategy.regime_tags
-    ]
-    return active if active else list(strategies)
-
-
-def _combine_scores(
-    strategy_scores: dict[str, pd.Series],
-    active_strategies: list[StrategySpec],
-    current_date: pd.Timestamp,
-    universe: list[str],
-) -> np.ndarray:
-    combined = None
-    for strategy in active_strategies:
-        series = strategy_scores[strategy.name]
-        try:
-            day_scores = series.xs(current_date, level="date")
-        except KeyError:
-            continue
-        day_scores = day_scores.reindex(universe).to_numpy(dtype=float)
-        day_scores = np.nan_to_num(day_scores, nan=0.0, posinf=0.0, neginf=0.0)
-        if len(day_scores) == 0:
-            continue
-        mean = np.nanmean(day_scores)
-        std = np.nanstd(day_scores)
-        if std > 1e-9:
-            day_scores = (day_scores - mean) / std
-        else:
-            day_scores = day_scores - mean
-        combined = day_scores if combined is None else combined + day_scores
-    if combined is None:
-        combined = np.zeros(len(universe), dtype=np.float32)
-    return combined
-
-
-def _align_state(
-    universe: list[str],
-    positions: dict[str, int],
-    prev_weights: dict[str, float],
-) -> tuple[np.ndarray, np.ndarray]:
-    positions_arr = np.array([int(positions.get(ticker, 0)) for ticker in universe], dtype=np.int64)
-    prev_weights_arr = np.array([float(prev_weights.get(ticker, 0.0)) for ticker in universe], dtype=np.float32)
-    return positions_arr, prev_weights_arr
 
 
 def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -1098,33 +926,25 @@ def _add_swing_features(df: pd.DataFrame) -> pd.DataFrame:
             )
 
     if "date" in df.columns:
-        dates = pd.to_datetime(df["date"])
-    elif isinstance(df.index, pd.MultiIndex) and "date" in df.index.names:
-        dates = pd.to_datetime(df.index.get_level_values("date"))
+        for col in ["dist_sma50", "dist_sma20", "rvol_20"]:
+            if col in df.columns:
+                df[f"{col}_z"] = df.groupby("date")[col].transform(
+                    lambda x: (x - x.mean()) / (x.std() + 1e-9)
+                )
     else:
-        dates = None
-    if dates is not None:
-        dow = dates.dt.dayofweek
-        month = dates.dt.month
-        df["dow_sin"] = np.sin(2 * np.pi * dow / 7)
-        df["dow_cos"] = np.cos(2 * np.pi * dow / 7)
-        df["month_sin"] = np.sin(2 * np.pi * month / 12)
-        df["month_cos"] = np.cos(2 * np.pi * month / 12)
-
+        for col in ["dist_sma50", "dist_sma20", "rvol_20"]:
+            if col in df.columns:
+                df[f"{col}_z"] = df.groupby(level="date")[col].transform(
+                    lambda x: (x - x.mean()) / (x.std() + 1e-9)
+                )
     return df
 
 
 def _compute_rolling_vix_z(vix_df: pd.DataFrame, rolling_window: int) -> pd.DataFrame:
-    if vix_df.empty:
-        return pd.DataFrame()
-    vix_df = vix_df.copy()
-    vix_df["VIX"] = vix_df["Close"]
-    rolling_mean = vix_df["VIX"].rolling(window=rolling_window, min_periods=rolling_window).mean()
-    rolling_std = vix_df["VIX"].rolling(window=rolling_window, min_periods=rolling_window).std()
-    vix_df["VIX_z"] = (vix_df["VIX"] - rolling_mean) / (rolling_std + 1e-9)
-    vix_df["vix_return"] = vix_df["VIX"].pct_change()
-    return vix_df[["VIX", "VIX_z", "vix_return"]]
-
-
-# Keep public market-data APIs sourced from the dedicated module.
-from .production_market_data import REQUIRED_INDICATOR_COLS, add_universe_tickers, update_market_data  # noqa: E402
+    out = pd.DataFrame(index=vix_df.index)
+    out["VIX"] = vix_df["Close"].astype(float)
+    out["vix_return"] = out["VIX"].pct_change()
+    roll_mean = out["VIX"].rolling(window=rolling_window, min_periods=rolling_window).mean()
+    roll_std = out["VIX"].rolling(window=rolling_window, min_periods=rolling_window).std()
+    out["VIX_z"] = (out["VIX"] - roll_mean) / (roll_std + 1e-9)
+    return out

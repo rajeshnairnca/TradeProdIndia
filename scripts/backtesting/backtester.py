@@ -14,6 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.append(PROJECT_ROOT)
 
 from src import config
+from src.market_data_validation import validate_market_data_frame
 from src.regime import compute_market_regime_table
 from src.rule_backtester import RuleBasedBacktester
 from src.strategy import list_strategy_names, load_strategies
@@ -91,6 +92,11 @@ def main():
 
     data_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
     df = pd.read_parquet(data_path)
+    validate_market_data_frame(
+        df,
+        source=data_path,
+        required_columns=["Close"],
+    )
     regime_table = compute_market_regime_table(df)
 
     start_date = None

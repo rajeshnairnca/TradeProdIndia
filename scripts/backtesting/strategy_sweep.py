@@ -14,6 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.append(PROJECT_ROOT)
 
 from src import config
+from src.market_data_validation import validate_market_data_frame
 from src.regime import compute_market_regime_table
 from src.rule_backtester import RuleBasedBacktester
 from src.strategy import list_strategy_names, load_strategies
@@ -49,6 +50,7 @@ def _init_worker(data_path: str, strategy_names: list[str], strategy_roots: list
     global _WORK_METRIC_KEY
 
     df = pd.read_parquet(data_path)
+    validate_market_data_frame(df, source=data_path, required_columns=["Close"])
     regime_table = compute_market_regime_table(df)
     strategies = load_strategies(strategy_names, strategy_roots)
     strategies_by_name = {s.name: s for s in strategies}
@@ -100,6 +102,7 @@ def main():
 
     data_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
     df = pd.read_parquet(data_path)
+    validate_market_data_frame(df, source=data_path, required_columns=["Close"])
 
     start_date = pd.to_datetime(args.start_date) if args.start_date else None
     end_date = pd.to_datetime(args.end_date) if args.end_date else None
