@@ -207,6 +207,70 @@ def init_db() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_broker_account_run_date_idx ON production_broker_account (run_date);"
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_universe_monitor_state (
+                id integer PRIMARY KEY,
+                run_date date,
+                generated_at_utc timestamptz,
+                candidates_evaluated integer,
+                tv_pass_count integer,
+                tech_tv_pass_count integer,
+                market_cap_pass_count integer,
+                tech_after_market_cap_count integer,
+                quality_pass_count integer,
+                potential_additions_count integer,
+                min_pass_days integer,
+                payload jsonb,
+                updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_universe_monitor_candidates (
+                ticker text PRIMARY KEY,
+                run_date date,
+                exchange text,
+                symbol text,
+                in_current_universe boolean,
+                tv_data boolean,
+                tv_pass boolean,
+                tv_fail_reasons text,
+                sector text,
+                tech_sector boolean,
+                quality_pass boolean,
+                quality_reasons text,
+                monitor_pass boolean,
+                pass_streak integer,
+                total_pass_days integer,
+                close double precision,
+                volume double precision,
+                dollar_volume double precision,
+                market_cap_basic double precision,
+                recommend_all double precision,
+                sma50 double precision,
+                sma200 double precision,
+                trend_up boolean,
+                quality_rows double precision,
+                quality_median_adv_dollars double precision,
+                quality_p20_adv_dollars double precision,
+                quality_p05_price double precision,
+                quality_median_vol21 double precision,
+                quality_p95_abs_log_return double precision,
+                metadata_fail_reasons text,
+                market_cap_pass boolean,
+                yfinance_market_cap double precision,
+                created_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_monitor_candidates_run_date_idx ON production_universe_monitor_candidates (run_date);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_monitor_candidates_monitor_pass_idx ON production_universe_monitor_candidates (monitor_pass, pass_streak);"
+        )
 
 
 def upsert_run_summary(summary: dict[str, Any]) -> None:
@@ -962,6 +1026,264 @@ def latest_broker_orders(broker: str, limit: int = 0) -> list[dict[str, Any]]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def replace_universe_monitor_snapshot(
+    summary: dict[str, Any],
+    candidates: Iterable[dict[str, Any]],
+) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    run_date = summary.get("run_date")
+    if not run_date:
+        return
+    generated_at = summary.get("generated_at_utc")
+
+    rows: list[tuple[Any, ...]] = []
+    for item in candidates:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        rows.append(
+            (
+                ticker,
+                run_date,
+                item.get("exchange"),
+                item.get("symbol"),
+                item.get("in_current_universe"),
+                item.get("tv_data"),
+                item.get("tv_pass"),
+                item.get("tv_fail_reasons"),
+                item.get("sector"),
+                item.get("tech_sector"),
+                item.get("quality_pass"),
+                item.get("quality_reasons"),
+                item.get("monitor_pass"),
+                item.get("pass_streak"),
+                item.get("total_pass_days"),
+                item.get("close"),
+                item.get("volume"),
+                item.get("dollar_volume"),
+                item.get("market_cap_basic"),
+                item.get("recommend_all"),
+                item.get("sma50"),
+                item.get("sma200"),
+                item.get("trend_up"),
+                item.get("quality_rows"),
+                item.get("quality_median_adv_dollars"),
+                item.get("quality_p20_adv_dollars"),
+                item.get("quality_p05_price"),
+                item.get("quality_median_vol21"),
+                item.get("quality_p95_abs_log_return"),
+                item.get("metadata_fail_reasons"),
+                item.get("market_cap_pass"),
+                item.get("yfinance_market_cap"),
+            )
+        )
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE production_universe_monitor_candidates;")
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO production_universe_monitor_candidates (
+                    ticker,
+                    run_date,
+                    exchange,
+                    symbol,
+                    in_current_universe,
+                    tv_data,
+                    tv_pass,
+                    tv_fail_reasons,
+                    sector,
+                    tech_sector,
+                    quality_pass,
+                    quality_reasons,
+                    monitor_pass,
+                    pass_streak,
+                    total_pass_days,
+                    close,
+                    volume,
+                    dollar_volume,
+                    market_cap_basic,
+                    recommend_all,
+                    sma50,
+                    sma200,
+                    trend_up,
+                    quality_rows,
+                    quality_median_adv_dollars,
+                    quality_p20_adv_dollars,
+                    quality_p05_price,
+                    quality_median_vol21,
+                    quality_p95_abs_log_return,
+                    metadata_fail_reasons,
+                    market_cap_pass,
+                    yfinance_market_cap
+                )
+                VALUES %s;
+                """,
+                rows,
+            )
+
+        cur.execute(
+            """
+            INSERT INTO production_universe_monitor_state (
+                id,
+                run_date,
+                generated_at_utc,
+                candidates_evaluated,
+                tv_pass_count,
+                tech_tv_pass_count,
+                market_cap_pass_count,
+                tech_after_market_cap_count,
+                quality_pass_count,
+                potential_additions_count,
+                min_pass_days,
+                payload
+            )
+            VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                run_date = EXCLUDED.run_date,
+                generated_at_utc = EXCLUDED.generated_at_utc,
+                candidates_evaluated = EXCLUDED.candidates_evaluated,
+                tv_pass_count = EXCLUDED.tv_pass_count,
+                tech_tv_pass_count = EXCLUDED.tech_tv_pass_count,
+                market_cap_pass_count = EXCLUDED.market_cap_pass_count,
+                tech_after_market_cap_count = EXCLUDED.tech_after_market_cap_count,
+                quality_pass_count = EXCLUDED.quality_pass_count,
+                potential_additions_count = EXCLUDED.potential_additions_count,
+                min_pass_days = EXCLUDED.min_pass_days,
+                payload = EXCLUDED.payload,
+                updated_at = now();
+            """,
+            (
+                run_date,
+                generated_at,
+                summary.get("candidates_evaluated"),
+                summary.get("tv_pass_count"),
+                summary.get("tech_tv_pass_count"),
+                summary.get("market_cap_pass_count"),
+                summary.get("tech_after_market_cap_count"),
+                summary.get("quality_pass_count"),
+                summary.get("potential_additions_count"),
+                summary.get("min_pass_days"),
+                psycopg2.extras.Json(summary),
+            ),
+        )
+
+
+def latest_universe_monitor_summary() -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date,
+                   generated_at_utc,
+                   candidates_evaluated,
+                   tv_pass_count,
+                   tech_tv_pass_count,
+                   market_cap_pass_count,
+                   tech_after_market_cap_count,
+                   quality_pass_count,
+                   potential_additions_count,
+                   min_pass_days,
+                   payload
+            FROM production_universe_monitor_state
+            WHERE id = 1;
+            """
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def list_universe_monitor_candidates(
+    limit: int,
+    offset: int,
+    watchlist: bool = False,
+    potential: bool = False,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+
+    min_pass_days = 0
+    if potential:
+        state = latest_universe_monitor_summary()
+        if state:
+            min_pass_days = int(state.get("min_pass_days") or 0)
+
+    where: list[str] = []
+    params: list[Any] = []
+    if watchlist:
+        where.append("tv_pass = TRUE AND tech_sector = TRUE AND market_cap_pass = TRUE")
+    if potential:
+        where.append("monitor_pass = TRUE AND pass_streak >= %s")
+        params.append(min_pass_days)
+
+    where_sql = ""
+    if where:
+        where_sql = " WHERE " + " AND ".join(where)
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM production_universe_monitor_candidates{where_sql};",
+            params,
+        )
+        total = int(cur.fetchone()[0] or 0)
+
+        query = f"""
+            SELECT ticker,
+                   run_date,
+                   exchange,
+                   symbol,
+                   in_current_universe,
+                   tv_data,
+                   tv_pass,
+                   tv_fail_reasons,
+                   sector,
+                   tech_sector,
+                   quality_pass,
+                   quality_reasons,
+                   monitor_pass,
+                   pass_streak,
+                   total_pass_days,
+                   close,
+                   volume,
+                   dollar_volume,
+                   market_cap_basic,
+                   recommend_all,
+                   sma50,
+                   sma200,
+                   trend_up,
+                   quality_rows,
+                   quality_median_adv_dollars,
+                   quality_p20_adv_dollars,
+                   quality_p05_price,
+                   quality_median_vol21,
+                   quality_p95_abs_log_return,
+                   metadata_fail_reasons,
+                   market_cap_pass,
+                   yfinance_market_cap
+            FROM production_universe_monitor_candidates
+            {where_sql}
+            ORDER BY pass_streak DESC,
+                     monitor_pass DESC,
+                     recommend_all DESC NULLS LAST,
+                     dollar_volume DESC NULLS LAST,
+                     ticker ASC
+            OFFSET %s LIMIT %s;
+        """
+        page_params = [*params, offset, limit if limit > 0 else total]
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, page_params)
+        return total, [dict(row) for row in cur.fetchall()]
+
+
 def append_pending_adjustments(entries: Iterable[dict[str, Any]]) -> None:
     if not db_enabled():
         return
@@ -1015,6 +1337,8 @@ def reset_production_data() -> None:
                 production_pending_adjustments,
                 production_broker_account,
                 production_broker_positions,
-                production_broker_orders;
+                production_broker_orders,
+                production_universe_monitor_state,
+                production_universe_monitor_candidates;
             """
         )

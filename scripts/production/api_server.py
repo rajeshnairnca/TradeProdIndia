@@ -24,9 +24,11 @@ from src.production_db import (
     latest_broker_account as db_latest_broker_account,
     latest_broker_orders as db_latest_broker_orders,
     latest_broker_positions as db_latest_broker_positions,
+    latest_universe_monitor_summary as db_latest_universe_monitor_summary,
     list_run_summaries as db_list_run_summaries,
     list_broker_orders as db_list_broker_orders,
     list_trades as db_list_trades,
+    list_universe_monitor_candidates as db_list_universe_monitor_candidates,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
     reset_production_data as db_reset_production_data,
@@ -37,6 +39,7 @@ PENDING_FILE = os.getenv("PENDING_FILE", "runs/production/pending_adjustments.js
 STATE_FILE = os.getenv("STATE_FILE", "runs/production/state.json")
 EXCHANGE_MAP_FILE = os.getenv("EXCHANGE_MAP_FILE", config.TRADINGVIEW_EXCHANGE_MAP_FILE)
 EXCLUDED_TICKERS_FILE = os.getenv("EXCLUDED_TICKERS_FILE", config.EXCLUDED_TICKERS_FILE)
+UNIVERSE_MONITOR_OUTPUT_DIR = os.getenv("UNIVERSE_MONITOR_OUTPUT_DIR", "runs/universe_monitor")
 API_KEY = os.getenv("API_KEY", "").strip()
 
 
@@ -69,6 +72,16 @@ def _list_run_dirs() -> list[Path]:
     if not base.exists():
         return []
     return sorted([d for d in base.iterdir() if d.is_dir()], key=lambda d: d.name)
+
+
+def _latest_universe_monitor_dir() -> Path:
+    base = Path(_resolve_path(UNIVERSE_MONITOR_OUTPUT_DIR))
+    if not base.exists():
+        raise HTTPException(status_code=404, detail="No universe monitor output directory found.")
+    dirs = [d for d in base.iterdir() if d.is_dir()]
+    if not dirs:
+        raise HTTPException(status_code=404, detail="No universe monitor runs found.")
+    return sorted(dirs, key=lambda d: d.name)[-1]
 
 
 def _load_exchange_map(path: str) -> dict[str, str]:
@@ -622,6 +635,144 @@ def universe_listing():
         raise HTTPException(status_code=404, detail="Exchange map not found.")
     universe = [{"ticker": k, "exchange": v} for k, v in sorted(mapping.items())]
     return {"count": len(universe), "universe": universe}
+
+
+def _as_bool_mask(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(False, index=df.index)
+    series = df[column]
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False)
+    return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "on"})
+
+
+@app.get("/universe-monitor/summary", dependencies=[Depends(_require_api_key)])
+def universe_monitor_summary():
+    if _db_ready():
+        payload = db_latest_universe_monitor_summary()
+        if payload:
+            full_payload = payload.get("payload")
+            if isinstance(full_payload, dict):
+                return full_payload
+            return payload
+
+    run_dir = _latest_universe_monitor_dir()
+    summary_path = run_dir / "summary.json"
+    if not summary_path.exists():
+        raise HTTPException(status_code=404, detail="Universe monitor summary not found.")
+    with summary_path.open("r") as f:
+        return json.load(f)
+
+
+@app.get("/universe-monitor/candidates", dependencies=[Depends(_require_api_key)])
+def universe_monitor_candidates(
+    limit: int = 200,
+    offset: int = 0,
+    watchlist: bool = False,
+    potential: bool = False,
+):
+    if limit < 0:
+        raise HTTPException(status_code=400, detail="limit must be >= 0")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+
+    if _db_ready():
+        total, records = db_list_universe_monitor_candidates(
+            limit=limit,
+            offset=offset,
+            watchlist=watchlist,
+            potential=potential,
+        )
+        if total > 0:
+            return {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "watchlist": watchlist,
+                "potential": potential,
+                "candidates": records,
+            }
+
+    run_dir = _latest_universe_monitor_dir()
+    csv_path = run_dir / "tech_candidates_all.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=404, detail="Universe monitor candidates CSV not found.")
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return {
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+            "watchlist": watchlist,
+            "potential": potential,
+            "candidates": [],
+        }
+
+    if watchlist:
+        df = df[
+            _as_bool_mask(df, "tv_pass")
+            & _as_bool_mask(df, "tech_sector")
+            & _as_bool_mask(df, "market_cap_pass")
+        ]
+    if potential:
+        min_pass_days = 0
+        summary_path = run_dir / "summary.json"
+        if summary_path.exists():
+            try:
+                payload = json.loads(summary_path.read_text())
+                min_pass_days = int(payload.get("min_pass_days") or 0)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                min_pass_days = 0
+        if "pass_streak" not in df.columns:
+            df["pass_streak"] = 0
+        df["pass_streak"] = pd.to_numeric(df["pass_streak"], errors="coerce").fillna(0)
+        df = df[_as_bool_mask(df, "monitor_pass") & (df["pass_streak"] >= min_pass_days)]
+
+    sort_cols = []
+    ascending = []
+    if "pass_streak" in df.columns:
+        sort_cols.append("pass_streak")
+        ascending.append(False)
+    if "monitor_pass" in df.columns:
+        sort_cols.append("monitor_pass")
+        ascending.append(False)
+    if "recommend_all" in df.columns:
+        sort_cols.append("recommend_all")
+        ascending.append(False)
+    if "dollar_volume" in df.columns:
+        sort_cols.append("dollar_volume")
+        ascending.append(False)
+    if "ticker" in df.columns:
+        sort_cols.append("ticker")
+        ascending.append(True)
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=ascending, kind="stable")
+
+    total = int(len(df))
+    if limit == 0:
+        page = df.iloc[offset:]
+    else:
+        page = df.iloc[offset : offset + limit]
+    page = page.where(pd.notna(page), None)
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "watchlist": watchlist,
+        "potential": potential,
+        "candidates": page.to_dict(orient="records"),
+    }
+
+
+@app.get("/universe-monitor/potential", dependencies=[Depends(_require_api_key)])
+def universe_monitor_potential(limit: int = 200, offset: int = 0):
+    return universe_monitor_candidates(
+        limit=limit,
+        offset=offset,
+        watchlist=False,
+        potential=True,
+    )
 
 
 @app.get("/broker-summary", dependencies=[Depends(_require_api_key)])

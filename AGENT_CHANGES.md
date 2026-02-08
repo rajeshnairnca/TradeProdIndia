@@ -187,3 +187,11 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Removed run artifacts under `runs/` per cleanup request.
 - Updated stale guidance in `AGENTS.md` (removed references to `_candidates/` and `scripts/orchestration/orchestrator.py`; refreshed testing guidance to use the current pytest suite).
 - Added `params_inventory.json` at repo root with a generated inventory of environment variables (shell, `.env`, defaults, resolved values), config constants, and CLI parameters/defaults across project entrypoints.
+
+## 2026-02-08
+- Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.
+- Added reusable monitor helpers in `src/universe_monitor.py` (catalog parsing, technology-sector matching, streak-state updates) with unit tests in `tests/test_universe_monitor.py`.
+- Updated the monitor pipeline to apply low-cost TradingView prechecks first, then fetch yfinance metadata only for survivors and enforce market-cap gating there, reducing metadata calls while preserving manual-review outputs.
+- Fixed a runtime bug in `scripts/backtesting/tech_universe_monitor.py` where quality-history fetches referenced `yf` without importing `yfinance`, which caused `history_error:NameError` for all quality checks.
+- Added DB persistence for universe-monitor snapshots in `src/production_db.py` (state + candidates tables with overwrite semantics) and exposed monitor APIs in `scripts/production/api_server.py` (`/universe-monitor/summary`, `/universe-monitor/candidates`, `/universe-monitor/potential`) for app consumption.
+- Updated `scripts/backtesting/tech_universe_monitor.py` to write monitor results to Postgres by default when DB is configured, plus `--skip-file-output`/`--skip-db` controls.
