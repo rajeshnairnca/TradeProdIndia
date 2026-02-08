@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
 
 import pandas as pd
 
@@ -15,10 +14,7 @@ from src.market_data_validation import validate_market_data_frame
 from src.production_market_data import add_universe_tickers, update_market_data
 from src.production import (
     generate_trades_for_date,
-    load_state,
     ProductionState,
-    save_state,
-    _apply_universe_filter,
 )
 from src.production_db import (
     clear_pending_adjustments as db_clear_pending_adjustments,
@@ -28,6 +24,7 @@ from src.production_db import (
     load_excluded_tickers as db_load_excluded_tickers,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
+    load_universe_map as db_load_universe_map,
     replace_universe_map as db_replace_universe_map,
     replace_broker_orders as db_replace_broker_orders,
     replace_broker_positions as db_replace_broker_positions,
@@ -39,6 +36,8 @@ from src.production_db import (
 )
 from src.regime import compute_market_regime_table
 from src.strategy import list_strategy_names, load_strategies
+from src.universe import NASDAQ100_TICKERS
+from src.universe_quality import apply_quality_filter
 from src.trading212 import (
     Trading212Client,
     account_cash_available,
@@ -77,14 +76,6 @@ DEFAULT_REGIME_MAPPING = {
     "sideways_low_vol": "rule_trend_strength",
 }
 
-DEFAULT_UNIVERSE_REGISTRY = "data/universe_registry.csv"
-DEFAULT_CASH_LOG = "runs/production/cash_injections.csv"
-DEFAULT_PENDING_FILE = "runs/production/pending_adjustments.jsonl"
-DEFAULT_PENDING_APPLIED_FILE = "runs/production/pending_adjustments_applied.jsonl"
-DEFAULT_EXCHANGE_MAP_FILE = config.TRADINGVIEW_EXCHANGE_MAP_FILE
-DEFAULT_EXCLUDED_TICKERS_FILE = config.EXCLUDED_TICKERS_FILE
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Daily production run: update data + generate trades.")
     parser.add_argument("--strategies", nargs="+", help="List of strategy names to include.")
@@ -95,8 +86,6 @@ def parse_args():
         help="JSON mapping of regime_label -> strategy name (defaults to the tech mapping).",
     )
     parser.add_argument("--data-file", default=None, help="Override data file path.")
-    parser.add_argument("--state-file", default="runs/production/state.json", help="Path to state file.")
-    parser.add_argument("--output-dir", default="runs/production", help="Root output directory for daily runs.")
     parser.add_argument("--date", type=str, help="Override target date (YYYY-MM-DD). Defaults to last date in data.")
     parser.add_argument("--skip-update", action="store_true", help="Skip TradingView data update.")
     parser.add_argument("--lookback-days", type=int, default=420, help="Days of lookback for incremental update.")
@@ -109,15 +98,9 @@ def parse_args():
         default="NASDAQ,NYSE,AMEX",
         help="Comma-separated exchange fallback list (default: NASDAQ,NYSE,AMEX).",
     )
-    parser.add_argument(
-        "--exchange-map-file",
-        default=DEFAULT_EXCHANGE_MAP_FILE,
-        help="Path to ticker->exchange map JSON for TradingView lookups.",
-    )
     parser.add_argument("--tv-timeout", type=float, default=None, help="TradingView request timeout in seconds.")
     parser.add_argument("--add-cash", type=float, default=0.0, help="Add cash to the portfolio before trading.")
     parser.add_argument("--cash-note", default="manual", help="Optional note for cash injections.")
-    parser.add_argument("--cash-log", default=DEFAULT_CASH_LOG, help="Path to cash injection log CSV.")
     parser.add_argument(
         "--add-tickers",
         default=None,
@@ -138,24 +121,9 @@ def parse_args():
         help="Minimum history days required for new tickers.",
     )
     parser.add_argument(
-        "--universe-registry",
-        default=DEFAULT_UNIVERSE_REGISTRY,
-        help="CSV registry path for tracking added tickers.",
-    )
-    parser.add_argument(
-        "--pending-file",
-        default=DEFAULT_PENDING_FILE,
-        help="Path to pending cash/ticker adjustments JSONL file.",
-    )
-    parser.add_argument(
-        "--pending-applied-file",
-        default=DEFAULT_PENDING_APPLIED_FILE,
-        help="Path to append applied pending adjustments JSONL.",
-    )
-    parser.add_argument(
         "--skip-pending",
         action="store_true",
-        help="Ignore pending adjustments file for this run.",
+        help="Ignore pending adjustments table for this run.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Generate trades without updating state.")
     parser.add_argument("--force", action="store_true", help="Run even if state already has the target date.")
@@ -173,11 +141,6 @@ def parse_args():
         action="store_true",
         help="Allow data updates if some tickers fail TradingView fetch.",
     )
-    parser.add_argument(
-        "--update-diagnostics-file",
-        default="market_data_update_diagnostics.json",
-        help="Filename to store per-ticker market-data update diagnostics under each run directory.",
-    )
     return parser.parse_args()
 
 
@@ -188,43 +151,34 @@ def _resolve_path(path: str) -> str:
     return os.path.join(PROJECT_ROOT, resolved)
 
 
-def _log_cash_injection(
-    path: str,
-    amount: float,
-    note: str,
-    state_file: str,
-    source: str = "manual",
-    created_at: str | None = None,
-) -> None:
-    if amount == 0:
-        return
-    log_path = Path(_resolve_path(path))
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = created_at or pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    row = f"{timestamp},{amount:.2f},{note},{state_file},{source}\n"
-    if not log_path.exists():
-        with log_path.open("w") as f:
-            f.write("timestamp,amount_usd,note,state_file,source\n")
-            f.write(row)
-    else:
-        with log_path.open("a") as f:
-            f.write(row)
+def _normalize_exchange_map(mapping: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for ticker, exchange in mapping.items():
+        t = str(ticker).strip().upper()
+        ex = str(exchange).strip().upper()
+        if not t:
+            continue
+        normalized[t] = ex or "UNKNOWN"
+    return normalized
 
 
-def _update_universe_registry(path: str, tickers: list[str], source: str) -> None:
-    if not tickers:
-        return
-    reg_path = Path(_resolve_path(path))
-    reg_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = [f"{t},{timestamp},{source}\n" for t in sorted(set(tickers))]
-    if not reg_path.exists():
-        with reg_path.open("w") as f:
-            f.write("ticker,added_at,source\n")
-            f.writelines(rows)
+def _apply_universe_filter_with_exclusions(
+    df: pd.DataFrame,
+    excluded: set[str],
+) -> pd.DataFrame:
+    universe_filter = config.UNIVERSE_FILTER
+    if not universe_filter or universe_filter in ("all", "none"):
+        filtered = df
+    elif universe_filter == "nasdaq100":
+        allowed = set(NASDAQ100_TICKERS)
+        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
     else:
-        with reg_path.open("a") as f:
-            f.writelines(rows)
+        allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
+        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
+    if excluded:
+        filtered = filtered[~filtered.index.get_level_values("ticker").isin(excluded)]
+    filtered, _ = apply_quality_filter(filtered)
+    return filtered
 
 
 def _build_price_snapshot(df: pd.DataFrame, target_date: pd.Timestamp) -> list[dict[str, float]]:
@@ -251,23 +205,6 @@ def _build_price_snapshot(df: pd.DataFrame, target_date: pd.Timestamp) -> list[d
             continue
         prices.append({"ticker": ticker, "close_price": price})
     return prices
-
-
-def _load_pending_adjustments(path: str) -> list[dict]:
-    pending_path = Path(_resolve_path(path))
-    if not pending_path.exists():
-        return []
-    entries: list[dict] = []
-    with pending_path.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return entries
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -447,26 +384,6 @@ def _build_broker_account_row(summary: dict, account_currency: str) -> dict:
     }
 
 
-def _backfill_cumulative_costs(output_dir: str) -> float:
-    base = Path(_resolve_path(output_dir))
-    if not base.exists():
-        return 0.0
-    total = 0.0
-    for run_dir in sorted(d for d in base.iterdir() if d.is_dir()):
-        summary_path = run_dir / "summary.json"
-        if not summary_path.exists():
-            continue
-        try:
-            payload = json.loads(summary_path.read_text())
-        except json.JSONDecodeError:
-            continue
-        if "daily_costs_usd" in payload:
-            total += float(payload.get("daily_costs_usd", 0.0))
-        else:
-            total += float(payload.get("total_costs_usd", 0.0))
-    return total
-
-
 def _broker_notionals(orders: list[dict]) -> tuple[float, float]:
     buy_notional = 0.0
     sell_notional = 0.0
@@ -492,40 +409,13 @@ def _broker_notionals(orders: list[dict]) -> tuple[float, float]:
     return buy_notional, sell_notional
 
 
-def _prior_broker_cost_totals(output_dir: str, target_date: str) -> tuple[float, float]:
+def _prior_broker_cost_totals(target_date: str) -> tuple[float, float]:
     total_broker = 0.0
     total_usd = 0.0
-    if db_enabled():
-        rows = db_list_run_summaries()
-        for row in rows:
-            row_date = str(row.get("date") or "")
-            if not row_date or row_date >= target_date:
-                continue
-            daily_broker = _safe_float(row.get("broker_execution_cost"), default=0.0)
-            daily_usd = row.get("broker_execution_cost_usd")
-            if daily_usd is None:
-                currency = str(row.get("broker_currency") or "").strip().upper()
-                fx_rate = _safe_float(row.get("broker_fx_rate_gbp_per_usd"), default=0.0)
-                if currency == "USD":
-                    daily_usd = daily_broker
-                elif fx_rate > 0:
-                    daily_usd = daily_broker / fx_rate
-                else:
-                    daily_usd = 0.0
-            total_broker += daily_broker
-            total_usd += _safe_float(daily_usd, default=0.0)
-        return total_broker, total_usd
-
-    base = Path(_resolve_path(output_dir))
-    if not base.exists():
-        return 0.0, 0.0
-    for run_dir in sorted(d for d in base.iterdir() if d.is_dir() and d.name < target_date):
-        summary_path = run_dir / "summary.json"
-        if not summary_path.exists():
-            continue
-        try:
-            row = json.loads(summary_path.read_text())
-        except json.JSONDecodeError:
+    rows = db_list_run_summaries()
+    for row in rows:
+        row_date = str(row.get("date") or "")
+        if not row_date or row_date >= target_date:
             continue
         daily_broker = _safe_float(row.get("broker_execution_cost"), default=0.0)
         daily_usd = row.get("broker_execution_cost_usd")
@@ -543,74 +433,14 @@ def _prior_broker_cost_totals(output_dir: str, target_date: str) -> tuple[float,
     return total_broker, total_usd
 
 
-def _mark_pending_applied(pending_path: str, applied_path: str, entries: list[dict]) -> None:
-    if not entries:
-        return
-    applied = Path(_resolve_path(applied_path))
-    applied.parent.mkdir(parents=True, exist_ok=True)
-    with applied.open("a") as f:
-        for entry in entries:
-            f.write(json.dumps(entry) + "\n")
-    pending_file = Path(_resolve_path(pending_path))
-    pending_file.write_text("")
-
-
-def _update_exchange_map(path: str, updates: dict[str, str]) -> None:
-    if not updates:
-        return
-    exchange_path = Path(_resolve_path(path))
-    exchange_path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, str] = {}
-    if exchange_path.exists():
-        try:
-            payload = json.loads(exchange_path.read_text())
-        except json.JSONDecodeError:
-            payload = {}
-    for ticker, exchange in updates.items():
-        t = str(ticker).strip().upper()
-        ex = str(exchange).strip().upper()
-        if not t:
-            continue
-        payload[t] = ex or "UNKNOWN"
-    exchange_path.write_text(
-        "{\n" + ",\n".join([f'  \"{k}\": \"{v}\"' for k, v in sorted(payload.items())]) + "\n}\n"
-    )
-
-
-def _load_exchange_map(path: str) -> dict[str, str]:
-    exchange_path = Path(_resolve_path(path))
-    if not exchange_path.exists():
-        return {}
-    try:
-        payload = json.loads(exchange_path.read_text())
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    out: dict[str, str] = {}
-    for ticker, exchange in payload.items():
-        t = str(ticker).strip().upper()
-        ex = str(exchange).strip().upper()
-        if not t:
-            continue
-        out[t] = ex or "UNKNOWN"
-    return out
-
-
-def _sync_excluded_tickers_from_db(path: str) -> None:
-    if not db_enabled():
-        return
-    tickers = db_load_excluded_tickers()
-    excluded_path = Path(_resolve_path(path))
-    excluded_path.parent.mkdir(parents=True, exist_ok=True)
-    if not tickers:
-        excluded_path.write_text("")
-        return
-    excluded_path.write_text("\n".join(sorted(tickers)) + "\n")
-
-
 def main():
     args = parse_args()
+    if not db_enabled():
+        raise RuntimeError(
+            "Database is required for production runs. Set DATABASE_URL or POSTGRES_URL."
+        )
+    db_init()
+
     strategy_roots = args.strategy_roots or ["alphas"]
     strategy_names = args.strategies or list_strategy_names(strategy_roots)
     if not strategy_names:
@@ -648,19 +478,12 @@ def main():
     if not strategies:
         raise ValueError("No valid strategies loaded.")
 
-    if db_enabled():
-        db_init()
-        _sync_excluded_tickers_from_db(DEFAULT_EXCLUDED_TICKERS_FILE)
-
     pending_entries: list[dict] = []
     pending_cash_entries: list[dict] = []
     pending_tickers: list[str] = []
     pending_exchange_map: dict[str, str] = {}
     if not args.skip_pending:
-        if db_enabled():
-            pending_entries = db_load_pending_adjustments()
-        else:
-            pending_entries = _load_pending_adjustments(args.pending_file)
+        pending_entries = db_load_pending_adjustments()
         for entry in pending_entries:
             entry_type = str(entry.get("type", "")).lower()
             if entry_type == "cash":
@@ -692,9 +515,13 @@ def main():
                         if t:
                             pending_exchange_map[t] = ex or "UNKNOWN"
 
+    universe_map = _normalize_exchange_map(db_load_universe_map())
+    if pending_exchange_map:
+        universe_map.update(_normalize_exchange_map(pending_exchange_map))
+        db_replace_universe_map(universe_map)
+
     data_path = _resolve_path(args.data_file or config.DATA_FILE)
     df = pd.read_parquet(data_path) if args.skip_update else None
-    update_diagnostics: dict | None = None
     if df is not None:
         validate_market_data_frame(
             df,
@@ -733,17 +560,13 @@ def main():
             vix_ticker=args.history_vix_ticker,
         )
         added = sorted(set(df.index.get_level_values("ticker").unique()) - existing_tickers)
-        _update_universe_registry(args.universe_registry, added, source="yfinance")
-
-    if pending_exchange_map:
-        _update_exchange_map(args.exchange_map_file, pending_exchange_map)
-    if db_enabled():
-        exchange_map_payload = _load_exchange_map(args.exchange_map_file)
-        if exchange_map_payload:
-            db_replace_universe_map(exchange_map_payload)
+        if added:
+            for ticker in added:
+                universe_map.setdefault(str(ticker).strip().upper(), "UNKNOWN")
+            db_replace_universe_map(universe_map)
 
     if not args.skip_update:
-        updated_result = update_market_data(
+        df = update_market_data(
             data_path,
             lookback_days=args.lookback_days,
             interval=args.interval,
@@ -753,10 +576,8 @@ def main():
             exchange_list=[ex.strip() for ex in args.tv_exchanges.split(",") if ex.strip()],
             timeout=args.tv_timeout,
             require_all_tickers=not args.allow_partial_updates,
-            exchange_map_path=args.exchange_map_file,
-            return_diagnostics=True,
+            exchange_map=universe_map,
         )
-        df, update_diagnostics = updated_result
     if df is None:
         df = pd.read_parquet(data_path)
     validate_market_data_frame(
@@ -767,6 +588,16 @@ def main():
 
     if "sector" not in df.columns:
         raise ValueError("Sector column missing in data; re-run data extraction with sector enabled.")
+
+    all_tickers = sorted({str(t).strip().upper() for t in df.index.get_level_values("ticker").unique()})
+    refreshed_universe_map = {
+        ticker: universe_map.get(ticker, "UNKNOWN")
+        for ticker in all_tickers
+        if ticker
+    }
+    if refreshed_universe_map != universe_map:
+        universe_map = refreshed_universe_map
+        db_replace_universe_map(universe_map)
 
     sector = args.sector.strip()
     sector_df = df[df["sector"].astype(str).str.lower() == sector.lower()]
@@ -779,27 +610,21 @@ def main():
         if args.date
         else pd.to_datetime(sector_df.index.get_level_values("date").max()).tz_localize(None)
     )
-    price_snapshot: list[dict[str, float]] = []
-    if db_enabled():
-        price_snapshot = _build_price_snapshot(df, target_date)
+    price_snapshot: list[dict[str, float]] = _build_price_snapshot(df, target_date)
 
-    state_path = _resolve_path(args.state_file)
-    state = db_load_state() if db_enabled() else None
+    state = db_load_state()
     if state is None:
-        state = load_state(state_path, config.INITIAL_CAPITAL)
+        state = ProductionState(last_date=None, cash=config.INITIAL_CAPITAL, positions={}, prev_weights={})
     costs_backfilled = False
     if state.total_costs_usd == 0.0:
         backfill = 0.0
-        if db_enabled():
-            summaries = db_list_run_summaries()
-            if summaries:
-                for item in summaries:
-                    if item.get("daily_costs_usd") is not None:
-                        backfill += float(item.get("daily_costs_usd") or 0.0)
-                    else:
-                        backfill += float(item.get("total_costs_usd") or 0.0)
-        if not backfill:
-            backfill = _backfill_cumulative_costs(args.output_dir)
+        summaries = db_list_run_summaries()
+        if summaries:
+            for item in summaries:
+                if item.get("daily_costs_usd") is not None:
+                    backfill += float(item.get("daily_costs_usd") or 0.0)
+                else:
+                    backfill += float(item.get("total_costs_usd") or 0.0)
         if backfill:
             state.total_costs_usd = backfill
             costs_backfilled = True
@@ -820,23 +645,9 @@ def main():
     if state.last_date == target_date.strftime("%Y-%m-%d") and not args.force:
         if not args.dry_run:
             if total_cash or costs_backfilled:
-                save_state(state_path, state)
-                if db_enabled():
-                    db_upsert_state(state)
-                for entry in cash_entries:
-                    _log_cash_injection(
-                        args.cash_log,
-                        float(entry.get("amount", 0.0)),
-                        str(entry.get("note", "pending")),
-                        args.state_file,
-                        source=str(entry.get("source", "pending")),
-                        created_at=str(entry.get("created_at")) if entry.get("created_at") else None,
-                    )
+                db_upsert_state(state)
             if pending_entries:
-                if db_enabled():
-                    db_clear_pending_adjustments()
-                else:
-                    _mark_pending_applied(args.pending_file, args.pending_applied_file, pending_entries)
+                db_clear_pending_adjustments()
             if total_cash:
                 print(f"Cash added and state updated for {state.last_date}.")
                 return
@@ -848,10 +659,11 @@ def main():
     broker_missing: list[str] = []
     broker_account_row: dict | None = None
     broker_positions_rows: list[dict] = []
+    excluded_tickers = db_load_excluded_tickers()
     state_for_trades = state
     if trading212_enabled():
         broker_context = _build_trading212_context(state)
-        tradable_df = _apply_universe_filter(sector_df)
+        tradable_df = _apply_universe_filter_with_exclusions(sector_df, excluded_tickers)
         _ensure_trading212_universe(
             tradable_df,
             broker_context.get("by_ticker") or {},
@@ -868,6 +680,7 @@ def main():
         state=state_for_trades,
         regime_table=regime_table,
         strategy_selector=mapping_selector,
+        excluded_tickers=excluded_tickers,
     )
 
     summary["sector"] = sector
@@ -963,10 +776,7 @@ def main():
                 broker_execution_cost_usd = None
             summary["broker_execution_cost_usd"] = broker_execution_cost_usd
 
-            prior_broker_total, prior_broker_total_usd = _prior_broker_cost_totals(
-                args.output_dir,
-                summary["date"],
-            )
+            prior_broker_total, prior_broker_total_usd = _prior_broker_cost_totals(summary["date"])
             summary["broker_total_execution_cost"] = prior_broker_total + broker_execution_cost
             if broker_execution_cost_usd is None:
                 summary["broker_total_execution_cost_usd"] = None
@@ -988,65 +798,22 @@ def main():
         if fx_rate > 0:
             summary["broker_net_worth_usd"] = broker_net_worth_gbp / fx_rate
 
-    run_dir = Path(_resolve_path(args.output_dir)) / summary["date"]
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    if update_diagnostics is not None:
-        diagnostics_path = run_dir / args.update_diagnostics_file
-        with diagnostics_path.open("w") as f:
-            json.dump(update_diagnostics, f, indent=2)
-
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
-    trades_path = run_dir / "trades.csv"
-    trades_df.to_csv(trades_path, index=False)
-    if broker_context:
-        broker_orders_path = run_dir / "broker_orders.json"
-        with broker_orders_path.open("w") as f:
-            json.dump(
-                {
-                    "orders": broker_orders,
-                    "missing_tickers": summary.get("broker_missing_tickers", []),
-                },
-                f,
-                indent=2,
-            )
-
-    summary_path = run_dir / "summary.json"
-    with summary_path.open("w") as f:
-        json.dump(summary, f, indent=2)
 
     if not args.dry_run:
-        if db_enabled():
-            db_upsert_run_summary(summary)
-            db_replace_trades(summary["date"], trades)
-            if price_snapshot:
-                db_replace_prices(summary["date"], price_snapshot)
-            if broker_context and broker_account_row is not None:
-                db_upsert_broker_account(summary["date"], "trading212", broker_account_row)
-                db_replace_broker_positions(summary["date"], "trading212", broker_positions_rows)
-                db_replace_broker_orders(summary["date"], "trading212", broker_orders)
-        save_state(state_path, new_state)
-        if db_enabled():
-            db_upsert_state(new_state)
-        for entry in cash_entries:
-            _log_cash_injection(
-                args.cash_log,
-                float(entry.get("amount", 0.0)),
-                str(entry.get("note", "pending")),
-                args.state_file,
-                source=str(entry.get("source", "pending")),
-                created_at=str(entry.get("created_at")) if entry.get("created_at") else None,
-            )
+        db_upsert_run_summary(summary)
+        db_replace_trades(summary["date"], trades)
+        if price_snapshot:
+            db_replace_prices(summary["date"], price_snapshot)
+        if broker_context and broker_account_row is not None:
+            db_upsert_broker_account(summary["date"], "trading212", broker_account_row)
+            db_replace_broker_positions(summary["date"], "trading212", broker_positions_rows)
+            db_replace_broker_orders(summary["date"], "trading212", broker_orders)
+        db_upsert_state(new_state)
         if pending_entries:
-            if db_enabled():
-                db_clear_pending_adjustments()
-            else:
-                _mark_pending_applied(args.pending_file, args.pending_applied_file, pending_entries)
+            db_clear_pending_adjustments()
 
-    print(f"Trades saved to {trades_path}")
-    print(f"Summary saved to {summary_path}")
-    if update_diagnostics is not None:
-        print(f"Market update diagnostics saved to {run_dir / args.update_diagnostics_file}")
+    print(f"Run date: {summary['date']}")
     print(f"Trades: {summary['num_trades']} | Net Worth: ${summary['net_worth_usd']:,.2f}")
     print(f"Sector: {sector} | Regime scope: {args.regime_scope}")
 

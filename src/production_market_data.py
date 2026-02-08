@@ -42,6 +42,7 @@ def update_market_data(
     timeout: float | None = None,
     require_all_tickers: bool = True,
     exchange_map_path: str | Path | None = None,
+    exchange_map: dict[str, str] | None = None,
     batch_size: int = 200,
     max_batches: int = 3,
     return_diagnostics: bool = False,
@@ -66,8 +67,18 @@ def update_market_data(
     lookback_rows = max(lookback_days, 300, rolling_window + 50)
     exchange_list = exchange_list or ["NASDAQ", "NYSE", "AMEX"]
     interval_value = _resolve_tv_interval(interval)
-    exchange_map_path = exchange_map_path or config.TRADINGVIEW_EXCHANGE_MAP_FILE
-    exchange_map = _load_exchange_map(exchange_map_path)
+    if exchange_map is None:
+        exchange_map_path = exchange_map_path or config.TRADINGVIEW_EXCHANGE_MAP_FILE
+        exchange_map = _load_exchange_map(exchange_map_path)
+    else:
+        normalized_map: dict[str, str] = {}
+        for ticker, ex in exchange_map.items():
+            t = str(ticker).strip().upper()
+            if not t:
+                continue
+            exchange = str(ex or "").strip().upper()
+            normalized_map[t] = exchange or "UNKNOWN"
+        exchange_map = normalized_map
 
     sector_map = {}
     if "sector" in existing.columns:

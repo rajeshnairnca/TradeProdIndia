@@ -201,3 +201,13 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Updated `scripts/production/daily_run.py` to sync DB exclusions to the local excluded-tickers file at run start so universe filtering stays consistent in split-service deployments.
 - Added broker execution-cost reconciliation in `scripts/production/daily_run.py` using broker cash delta + buy/sell notional + external cash flow adjustments, persisted as daily and cumulative metrics.
 - Extended `production_runs` schema and DB summaries (`src/production_db.py`) with broker cost fields (`broker_execution_cost`, `broker_total_execution_cost`, USD counterparts, and reconciliation components) so app/API can compare broker-realized costs vs model costs over time.
+- Removed file-system fallback paths from production workflows so DB is the single source of truth: `scripts/production/daily_run.py` now requires DB config and reads/writes state/pending data only via Postgres.
+- Converted `scripts/production/api_server.py` to DB-only behavior across run/summary/trade/portfolio/universe/monitor/adjustment endpoints and made DB configuration mandatory at startup.
+- Updated `scripts/production/queue_adjustments.py` to require DB configuration and queue adjustments only in Postgres.
+- Updated `README.md` production notes to reflect DB-required behavior for production run/API paths.
+- Removed remaining local artifact/support-file writes from `scripts/production/daily_run.py` (no `runs/production` outputs, no cash-log/universe-registry/exchange-map/excluded sync files); run outputs now persist to DB only.
+- Added DB-native universe filtering/exclusion path in `scripts/production/daily_run.py` and `src/production.py` (`generate_trades_for_date(..., excluded_tickers=...)`) to avoid file-based excluded ticker reads in production runs.
+- Extended `src/production_market_data.py::update_market_data` with optional in-memory `exchange_map` input so daily runs can use DB universe mapping without reading a mapping file.
+- Fixed a payload corruption bug in `scripts/production/queue_adjustments.py` where `--add-tickers-exchange` reused the `entries` accumulator, which could enqueue non-dict pending adjustment rows.
+- Changed DB connection handling in `src/production_db.py` to explicit transaction commit/rollback (instead of autocommit) so multi-step replacement writes are atomic.
+- Narrowed `reset_production_data()` in `src/production_db.py` to clear run/state/trade/price/pending/broker runtime tables only, preserving universe map, excluded tickers, and universe monitor tables.

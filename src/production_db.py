@@ -21,9 +21,12 @@ def _connect():
     if not db_enabled():
         raise RuntimeError("DATABASE_URL/POSTGRES_URL not configured.")
     conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
     try:
         yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1573,10 +1576,6 @@ def reset_production_data() -> None:
                 production_pending_adjustments,
                 production_broker_account,
                 production_broker_positions,
-                production_broker_orders,
-                production_universe_map,
-                production_excluded_tickers,
-                production_universe_monitor_state,
-                production_universe_monitor_candidates;
+                production_broker_orders;
             """
         )

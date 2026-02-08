@@ -77,7 +77,8 @@ Useful options:
 - `--skip-update` to avoid TradingView calls (local dry runs)
 - `--print-trades` to emit trades to stdout
 - `--sector` and `--regime-scope` for sector-focused production runs
-- `--update-diagnostics-file` to persist per-ticker update statuses/reasons (missing analysis, no new bar, invalid OHLCV, etc.)
+
+`daily_run.py` is DB-backed and does not write production run artifacts to local `runs/production/`.
 
 Queue adjustments (cash or tickers):
 
@@ -85,7 +86,7 @@ Queue adjustments (cash or tickers):
 python3 scripts/production/queue_adjustments.py --add-cash 50000 --add-tickers NVDA,TSLA
 ```
 
-Backfill Postgres (if enabled):
+Backfill Postgres (requires `DATABASE_URL` / `POSTGRES_URL`):
 
 ```bash
 python3 scripts/production/backfill_db.py
@@ -106,6 +107,7 @@ Key endpoints:
 - `POST /queue-adjustments`, `GET /pending-adjustments`, `POST /clear-pending`, `DELETE /pending-adjustments`
 
 Set `API_KEY` to protect non-health routes (supports `X-API-Key` or `Authorization: Bearer`).
+The API is DB-only and requires `DATABASE_URL` / `POSTGRES_URL`.
 
 ## Data
 
@@ -142,9 +144,8 @@ Common env flags (see `src/config.py`):
 
 Production storage + API:
 
-- `DATABASE_URL` / `POSTGRES_URL` enables Postgres-backed runs/trades/state
+- `DATABASE_URL` / `POSTGRES_URL` is required for production runs, queueing adjustments, and API endpoints
 - `API_KEY` for API auth
-- `EXCHANGE_MAP_FILE`, `OUTPUT_DIR`, `STATE_FILE`, `PENDING_FILE` for API paths
 
 ## Notes
 

@@ -761,8 +761,9 @@ def generate_trades_for_date(
     regime_table: pd.DataFrame | None = None,
     apply_regime_overlays: bool = True,
     strategy_selector: Callable[[pd.Timestamp, dict, list[StrategySpec]], list[StrategySpec] | None] | None = None,
+    excluded_tickers: set[str] | None = None,
 ) -> tuple[list[dict], ProductionState, dict]:
-    df = _apply_universe_filter(df)
+    df = _apply_universe_filter(df, excluded_tickers=excluded_tickers)
     if df.empty:
         raise ValueError("No data left after applying the universe filter.")
 
@@ -955,8 +956,8 @@ def generate_trades_for_date(
     return trades, new_state, summary
 
 
-def _apply_universe_filter(df: pd.DataFrame) -> pd.DataFrame:
-    excluded = _load_excluded_tickers()
+def _apply_universe_filter(df: pd.DataFrame, excluded_tickers: set[str] | None = None) -> pd.DataFrame:
+    excluded = _load_excluded_tickers() if excluded_tickers is None else excluded_tickers
     universe_filter = config.UNIVERSE_FILTER
     if not universe_filter or universe_filter in ("all", "none"):
         filtered = df

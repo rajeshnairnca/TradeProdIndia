@@ -1,7 +1,5 @@
-import json
 import os
 import sys
-from pathlib import Path
 from typing import List, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -11,7 +9,6 @@ import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from src import config
 from src.production_db import (
     append_pending_adjustments as db_append_pending_adjustments,
     clear_pending_adjustments as db_clear_pending_adjustments,
@@ -39,113 +36,16 @@ from src.production_db import (
     reset_production_data as db_reset_production_data,
 )
 
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "runs/production")
-PENDING_FILE = os.getenv("PENDING_FILE", "runs/production/pending_adjustments.jsonl")
-STATE_FILE = os.getenv("STATE_FILE", "runs/production/state.json")
-EXCHANGE_MAP_FILE = os.getenv("EXCHANGE_MAP_FILE", config.TRADINGVIEW_EXCHANGE_MAP_FILE)
-EXCLUDED_TICKERS_FILE = os.getenv("EXCLUDED_TICKERS_FILE", config.EXCLUDED_TICKERS_FILE)
-UNIVERSE_MONITOR_OUTPUT_DIR = os.getenv("UNIVERSE_MONITOR_OUTPUT_DIR", "runs/universe_monitor")
 API_KEY = os.getenv("API_KEY", "").strip()
 
-
-def _db_ready() -> bool:
-    if not db_enabled():
-        return False
-    db_init()
-    return True
-
-
-def _resolve_path(path: str) -> str:
-    resolved = config.resolve_path(path)
-    if os.path.isabs(resolved):
-        return resolved
-    return os.path.join(PROJECT_ROOT, resolved)
-
-
-def _latest_run_dir() -> Path:
-    base = Path(_resolve_path(OUTPUT_DIR))
-    if not base.exists():
-        raise HTTPException(status_code=404, detail="No production output directory found.")
-    dirs = [d for d in base.iterdir() if d.is_dir()]
-    if not dirs:
-        raise HTTPException(status_code=404, detail="No production runs found.")
-    return sorted(dirs, key=lambda d: d.name)[-1]
-
-
-def _list_run_dirs() -> list[Path]:
-    base = Path(_resolve_path(OUTPUT_DIR))
-    if not base.exists():
-        return []
-    return sorted([d for d in base.iterdir() if d.is_dir()], key=lambda d: d.name)
-
-
-def _latest_universe_monitor_dir() -> Path:
-    base = Path(_resolve_path(UNIVERSE_MONITOR_OUTPUT_DIR))
-    if not base.exists():
-        raise HTTPException(status_code=404, detail="No universe monitor output directory found.")
-    dirs = [d for d in base.iterdir() if d.is_dir()]
-    if not dirs:
-        raise HTTPException(status_code=404, detail="No universe monitor runs found.")
-    return sorted(dirs, key=lambda d: d.name)[-1]
-
-
-def _load_exchange_map(path: str) -> dict[str, str]:
-    resolved = _resolve_path(path)
-    exchange_path = Path(resolved)
-    if not exchange_path.exists():
-        return {}
-    try:
-        payload = json.loads(exchange_path.read_text())
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    mapping: dict[str, str] = {}
-    for key, value in payload.items():
-        ticker = str(key).strip().upper()
-        exchange = str(value).strip().upper()
-        if not ticker:
-            continue
-        mapping[ticker] = exchange or "UNKNOWN"
-    return mapping
-
-
-def _load_excluded_tickers(path: str) -> set[str]:
-    resolved = _resolve_path(path)
-    excluded_path = Path(resolved)
-    if not excluded_path.exists():
-        return set()
-    try:
-        lines = excluded_path.read_text().splitlines()
-    except OSError:
-        return set()
-    return {line.strip().upper() for line in lines if line.strip()}
-
-
-def _write_excluded_tickers(path: str, tickers: set[str]) -> None:
-    resolved = _resolve_path(path)
-    excluded_path = Path(resolved)
-    excluded_path.parent.mkdir(parents=True, exist_ok=True)
-    if not tickers:
-        excluded_path.write_text("")
-        return
-    excluded_path.write_text("\n".join(sorted(tickers)) + "\n")
-
+if not db_enabled():
+    raise RuntimeError(
+        "Database is required for the production API. Set DATABASE_URL or POSTGRES_URL."
+    )
+db_init()
 
 def _load_effective_excluded_tickers() -> tuple[set[str], str]:
-    if _db_ready():
-        return db_load_excluded_tickers(), "db"
-    return _load_excluded_tickers(EXCLUDED_TICKERS_FILE), "file"
-
-
-def _load_state(path: str) -> dict | None:
-    state_path = Path(_resolve_path(path))
-    if not state_path.exists():
-        return None
-    try:
-        return json.loads(state_path.read_text())
-    except json.JSONDecodeError:
-        return None
+    return db_load_excluded_tickers(), "db"
 
 
 def _xirr(cashflows: list[tuple[pd.Timestamp, float]]) -> float | None:
@@ -242,26 +142,18 @@ def health():
 
 @app.get("/latest-run", dependencies=[Depends(_require_api_key)])
 def latest_run():
-    if _db_ready():
-        latest = db_latest_run_date()
-        if latest:
-            return {"latest_run": latest}
-    run_dir = _latest_run_dir()
-    return {"latest_run": run_dir.name}
+    latest = db_latest_run_date()
+    if not latest:
+        raise HTTPException(status_code=404, detail="No production runs found.")
+    return {"latest_run": latest}
 
 
 @app.get("/latest-summary", dependencies=[Depends(_require_api_key)])
 def latest_summary():
-    if _db_ready():
-        payload = db_latest_summary()
-        if payload:
-            return payload
-    run_dir = _latest_run_dir()
-    summary_path = run_dir / "summary.json"
-    if not summary_path.exists():
-        raise HTTPException(status_code=404, detail="summary.json not found.")
-    with summary_path.open("r") as f:
-        return json.load(f)
+    payload = db_latest_summary()
+    if not payload:
+        raise HTTPException(status_code=404, detail="Latest summary not found.")
+    return payload
 
 
 @app.get("/summaries", dependencies=[Depends(_require_api_key)])
@@ -277,21 +169,7 @@ def summaries(
     start_dt = pd.to_datetime(start) if start else None
     end_dt = pd.to_datetime(end) if end else None
 
-    rows: list[dict] = []
-    if _db_ready():
-        rows = db_list_run_summaries()
-    if not rows:
-        for run_dir in _list_run_dirs():
-            summary_path = run_dir / "summary.json"
-            if not summary_path.exists():
-                continue
-            try:
-                payload = json.loads(summary_path.read_text())
-            except json.JSONDecodeError:
-                continue
-            if "date" not in payload or "net_worth_usd" not in payload:
-                continue
-            rows.append(payload)
+    rows: list[dict] = db_list_run_summaries()
 
     if not rows:
         return {"count": 0, "summaries": []}
@@ -332,18 +210,10 @@ def summaries(
 
 @app.get("/latest-trades", dependencies=[Depends(_require_api_key)])
 def latest_trades(limit: int = 0):
-    if _db_ready():
-        trades = db_latest_trades(limit=limit)
-        if trades:
-            return {"trades": trades}
-    run_dir = _latest_run_dir()
-    trades_path = run_dir / "trades.csv"
-    if not trades_path.exists():
-        raise HTTPException(status_code=404, detail="trades.csv not found.")
-    df = pd.read_csv(trades_path)
-    if limit and limit > 0:
-        df = df.head(limit)
-    return {"trades": df.to_dict(orient="records")}
+    rows = db_latest_trades(limit=limit)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Latest trades not found.")
+    return {"trades": rows}
 
 
 @app.get("/trades", dependencies=[Depends(_require_api_key)])
@@ -353,62 +223,13 @@ def trades(limit: int = 200, offset: int = 0):
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >= 0")
 
-    if _db_ready():
-        total, records = db_list_trades(limit, offset)
-        if total > 0:
-            return {"total": total, "limit": limit, "offset": offset, "trades": records}
-
-    frames: list[pd.DataFrame] = []
-    for run_dir in _list_run_dirs():
-        trades_path = run_dir / "trades.csv"
-        if not trades_path.exists():
-            continue
-        df = pd.read_csv(trades_path)
-        if df.empty:
-            continue
-        if "run_date" not in df.columns:
-            df["run_date"] = run_dir.name
-        frames.append(df)
-
-    if not frames:
-        return {"total": 0, "limit": limit, "offset": offset, "trades": []}
-
-    all_trades = pd.concat(frames, ignore_index=True)
-    if "date" in all_trades.columns:
-        all_trades = all_trades.sort_values(["date", "ticker"], ascending=[False, True])
-    else:
-        all_trades = all_trades.sort_values(["run_date", "ticker"], ascending=[False, True])
-
-    total = int(len(all_trades))
-    if limit == 0:
-        page = all_trades.iloc[offset:]
-    else:
-        page = all_trades.iloc[offset : offset + limit]
-    return {
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "trades": page.to_dict(orient="records"),
-    }
+    total, records = db_list_trades(limit, offset)
+    return {"total": total, "limit": limit, "offset": offset, "trades": records}
 
 
 @app.get("/cagr", dependencies=[Depends(_require_api_key)])
 def cagr_summary():
-    summaries = []
-    if _db_ready():
-        summaries = db_list_run_summaries()
-    if not summaries:
-        for run_dir in _list_run_dirs():
-            summary_path = run_dir / "summary.json"
-            if not summary_path.exists():
-                continue
-            try:
-                payload = json.loads(summary_path.read_text())
-            except json.JSONDecodeError:
-                continue
-            if "date" not in payload or "net_worth_usd" not in payload:
-                continue
-            summaries.append(payload)
+    summaries = db_list_run_summaries()
 
     if len(summaries) < 2:
         return {
@@ -529,75 +350,27 @@ def cagr_summary():
 @app.get("/portfolio", dependencies=[Depends(_require_api_key)])
 def portfolio_snapshot():
     state = None
-    if _db_ready():
-        db_state = db_load_state()
-        if db_state:
-            state = {
-                "last_date": db_state.last_date,
-                "cash": db_state.cash,
-                "positions": db_state.positions,
-                "prev_weights": db_state.prev_weights,
-                "total_costs_usd": db_state.total_costs_usd,
-            }
+    db_state = db_load_state()
+    if db_state:
+        state = {
+            "last_date": db_state.last_date,
+            "cash": db_state.cash,
+            "positions": db_state.positions,
+            "prev_weights": db_state.prev_weights,
+            "total_costs_usd": db_state.total_costs_usd,
+        }
     if not state:
-        state = _load_state(STATE_FILE)
-    if not state:
-        raise HTTPException(status_code=404, detail="State file not found.")
+        raise HTTPException(status_code=404, detail="Portfolio state not found.")
 
     cash = float(state.get("cash", 0.0))
     positions = state.get("positions", {}) or {}
     if not isinstance(positions, dict):
         positions = {}
 
-    as_of = None
-    price_map: dict[str, float] = {}
-    if _db_ready():
-        as_of, price_map = db_latest_prices(list(positions.keys()))
+    as_of, price_map = db_latest_prices(list(positions.keys()))
+    if as_of is None:
+        raise HTTPException(status_code=404, detail="No price snapshot found in database.")
 
-    if as_of is not None:
-        portfolio_rows = []
-        missing_prices = []
-        portfolio_value = 0.0
-        for ticker, shares in positions.items():
-            try:
-                shares_val = int(shares)
-            except (TypeError, ValueError):
-                shares_val = 0
-            ticker_key = str(ticker).strip().upper()
-            price = price_map.get(ticker_key)
-            value = None
-            if price is not None:
-                value = price * shares_val
-                portfolio_value += value
-            else:
-                missing_prices.append(str(ticker))
-            portfolio_rows.append(
-                {
-                    "ticker": str(ticker),
-                    "shares": shares_val,
-                    "quantity": shares_val,
-                    "price_usd": price,
-                    "value_usd": value,
-                }
-            )
-        return {
-            "as_of": as_of,
-            "cash_usd": cash,
-            "portfolio_value_usd": portfolio_value,
-            "net_worth_usd": cash + portfolio_value,
-            "positions": portfolio_rows,
-            "missing_prices": missing_prices,
-        }
-
-    data_path = _resolve_path(config.DATA_FILE)
-    if not Path(data_path).exists():
-        raise HTTPException(status_code=404, detail="Data file not found.")
-
-    df = pd.read_parquet(data_path, columns=["Close"])
-    if not isinstance(df.index, pd.MultiIndex) or "ticker" not in df.index.names:
-        raise HTTPException(status_code=500, detail="Unexpected data index format.")
-
-    latest_date = df.index.get_level_values("date").max()
     portfolio_rows = []
     missing_prices = []
     portfolio_value = 0.0
@@ -607,17 +380,13 @@ def portfolio_snapshot():
             shares_val = int(shares)
         except (TypeError, ValueError):
             shares_val = 0
-        price = None
+        ticker_key = str(ticker).strip().upper()
+        price = price_map.get(ticker_key)
         value = None
-        try:
-            series = df.xs(str(ticker), level="ticker")["Close"]
-            if not series.empty:
-                price = float(series.iloc[-1])
-                value = price * shares_val
-                portfolio_value += value
-        except (KeyError, TypeError, ValueError):
-            price = None
-        if price is None:
+        if price is not None:
+            value = price * shares_val
+            portfolio_value += value
+        else:
             missing_prices.append(str(ticker))
         portfolio_rows.append(
             {
@@ -630,7 +399,7 @@ def portfolio_snapshot():
         )
 
     return {
-        "as_of": str(pd.to_datetime(latest_date).date()) if latest_date is not None else None,
+        "as_of": as_of,
         "cash_usd": cash,
         "portfolio_value_usd": portfolio_value,
         "net_worth_usd": cash + portfolio_value,
@@ -641,43 +410,22 @@ def portfolio_snapshot():
 
 @app.get("/universe", dependencies=[Depends(_require_api_key)])
 def universe_listing():
-    if _db_ready():
-        mapping = db_load_universe_map()
-        if mapping:
-            universe = [{"ticker": k, "exchange": v} for k, v in sorted(mapping.items())]
-            return {"count": len(universe), "universe": universe}
-    mapping = _load_exchange_map(EXCHANGE_MAP_FILE)
+    mapping = db_load_universe_map()
     if not mapping:
-        raise HTTPException(status_code=404, detail="Exchange map not found.")
+        raise HTTPException(status_code=404, detail="Universe mapping not found.")
     universe = [{"ticker": k, "exchange": v} for k, v in sorted(mapping.items())]
     return {"count": len(universe), "universe": universe}
 
 
-def _as_bool_mask(df: pd.DataFrame, column: str) -> pd.Series:
-    if column not in df.columns:
-        return pd.Series(False, index=df.index)
-    series = df[column]
-    if pd.api.types.is_bool_dtype(series):
-        return series.fillna(False)
-    return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "on"})
-
-
 @app.get("/universe-monitor/summary", dependencies=[Depends(_require_api_key)])
 def universe_monitor_summary():
-    if _db_ready():
-        payload = db_latest_universe_monitor_summary()
-        if payload:
-            full_payload = payload.get("payload")
-            if isinstance(full_payload, dict):
-                return full_payload
-            return payload
-
-    run_dir = _latest_universe_monitor_dir()
-    summary_path = run_dir / "summary.json"
-    if not summary_path.exists():
+    payload = db_latest_universe_monitor_summary()
+    if not payload:
         raise HTTPException(status_code=404, detail="Universe monitor summary not found.")
-    with summary_path.open("r") as f:
-        return json.load(f)
+    full_payload = payload.get("payload")
+    if isinstance(full_payload, dict):
+        return full_payload
+    return payload
 
 
 @app.get("/universe-monitor/candidates", dependencies=[Depends(_require_api_key)])
@@ -692,92 +440,19 @@ def universe_monitor_candidates(
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >= 0")
 
-    if _db_ready():
-        total, records = db_list_universe_monitor_candidates(
-            limit=limit,
-            offset=offset,
-            watchlist=watchlist,
-            potential=potential,
-        )
-        if total > 0:
-            return {
-                "total": total,
-                "limit": limit,
-                "offset": offset,
-                "watchlist": watchlist,
-                "potential": potential,
-                "candidates": records,
-            }
-
-    run_dir = _latest_universe_monitor_dir()
-    csv_path = run_dir / "tech_candidates_all.csv"
-    if not csv_path.exists():
-        raise HTTPException(status_code=404, detail="Universe monitor candidates CSV not found.")
-
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        return {
-            "total": 0,
-            "limit": limit,
-            "offset": offset,
-            "watchlist": watchlist,
-            "potential": potential,
-            "candidates": [],
-        }
-
-    if watchlist:
-        df = df[
-            _as_bool_mask(df, "tv_pass")
-            & _as_bool_mask(df, "tech_sector")
-            & _as_bool_mask(df, "market_cap_pass")
-        ]
-    if potential:
-        min_pass_days = 0
-        summary_path = run_dir / "summary.json"
-        if summary_path.exists():
-            try:
-                payload = json.loads(summary_path.read_text())
-                min_pass_days = int(payload.get("min_pass_days") or 0)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                min_pass_days = 0
-        if "pass_streak" not in df.columns:
-            df["pass_streak"] = 0
-        df["pass_streak"] = pd.to_numeric(df["pass_streak"], errors="coerce").fillna(0)
-        df = df[_as_bool_mask(df, "monitor_pass") & (df["pass_streak"] >= min_pass_days)]
-
-    sort_cols = []
-    ascending = []
-    if "pass_streak" in df.columns:
-        sort_cols.append("pass_streak")
-        ascending.append(False)
-    if "monitor_pass" in df.columns:
-        sort_cols.append("monitor_pass")
-        ascending.append(False)
-    if "recommend_all" in df.columns:
-        sort_cols.append("recommend_all")
-        ascending.append(False)
-    if "dollar_volume" in df.columns:
-        sort_cols.append("dollar_volume")
-        ascending.append(False)
-    if "ticker" in df.columns:
-        sort_cols.append("ticker")
-        ascending.append(True)
-    if sort_cols:
-        df = df.sort_values(sort_cols, ascending=ascending, kind="stable")
-
-    total = int(len(df))
-    if limit == 0:
-        page = df.iloc[offset:]
-    else:
-        page = df.iloc[offset : offset + limit]
-    page = page.where(pd.notna(page), None)
+    total, records = db_list_universe_monitor_candidates(
+        limit=limit,
+        offset=offset,
+        watchlist=watchlist,
+        potential=potential,
+    )
     return {
         "total": total,
         "limit": limit,
         "offset": offset,
         "watchlist": watchlist,
         "potential": potential,
-        "candidates": page.to_dict(orient="records"),
+        "candidates": records,
     }
 
 
@@ -793,19 +468,17 @@ def universe_monitor_potential(limit: int = 200, offset: int = 0):
 
 @app.get("/broker-summary", dependencies=[Depends(_require_api_key)])
 def broker_summary(broker: str = "trading212"):
-    if _db_ready():
-        summary = db_latest_broker_account(broker)
-        if summary:
-            return summary
+    summary = db_latest_broker_account(broker)
+    if summary:
+        return summary
     raise HTTPException(status_code=404, detail="Broker summary not found.")
 
 
 @app.get("/broker-positions", dependencies=[Depends(_require_api_key)])
 def broker_positions(broker: str = "trading212"):
-    if _db_ready():
-        positions = db_latest_broker_positions(broker)
-        if positions:
-            return {"count": len(positions), "positions": positions}
+    positions = db_latest_broker_positions(broker)
+    if positions:
+        return {"count": len(positions), "positions": positions}
     raise HTTPException(status_code=404, detail="Broker positions not found.")
 
 
@@ -815,19 +488,17 @@ def broker_orders(broker: str = "trading212", limit: int = 200, offset: int = 0)
         raise HTTPException(status_code=400, detail="limit must be >= 0")
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >= 0")
-    if _db_ready():
-        total, records = db_list_broker_orders(broker, limit, offset)
-        if total > 0:
-            return {"total": total, "limit": limit, "offset": offset, "orders": records}
+    total, records = db_list_broker_orders(broker, limit, offset)
+    if total > 0:
+        return {"total": total, "limit": limit, "offset": offset, "orders": records}
     return {"total": 0, "limit": limit, "offset": offset, "orders": []}
 
 
 @app.get("/latest-broker-orders", dependencies=[Depends(_require_api_key)])
 def latest_broker_orders(broker: str = "trading212", limit: int = 0):
-    if _db_ready():
-        records = db_latest_broker_orders(broker, limit=limit)
-        if records:
-            return {"orders": records}
+    records = db_latest_broker_orders(broker, limit=limit)
+    if records:
+        return {"orders": records}
     raise HTTPException(status_code=404, detail="Broker orders not found.")
 
 
@@ -844,54 +515,15 @@ def exclude_tickers(payload: ExcludeTickersRequest):
         raise HTTPException(status_code=400, detail="No tickers provided.")
     excluded, source = _load_effective_excluded_tickers()
     excluded.update(tickers)
-    if _db_ready():
-        db_replace_excluded_tickers(excluded)
-    _write_excluded_tickers(EXCLUDED_TICKERS_FILE, excluded)
+    db_replace_excluded_tickers(excluded)
     return {"count": len(excluded), "excluded_tickers": sorted(excluded), "source": source}
 
 
 @app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])
 def stale_tickers(date: Optional[str] = None):
-    if _db_ready():
-        mapping = db_load_universe_map()
-        if mapping:
-            if date:
-                try:
-                    target_date = pd.to_datetime(date).tz_localize(None)
-                except (TypeError, ValueError):
-                    raise HTTPException(status_code=400, detail="Invalid date format.")
-            else:
-                latest = db_latest_price_run_date()
-                if not latest:
-                    raise HTTPException(status_code=404, detail="No production price snapshots found.")
-                target_date = pd.to_datetime(latest).tz_localize(None)
-
-            target_run_date = str(pd.to_datetime(target_date).date())
-            tickers = set(mapping.keys())
-            excluded, _ = _load_effective_excluded_tickers()
-            if excluded:
-                tickers -= excluded
-            observed = db_price_tickers_for_date(target_run_date)
-            if observed:
-                tickers -= observed
-            return {
-                "as_of": target_run_date,
-                "count": len(tickers),
-                "stale_tickers": sorted(tickers),
-                "source": "db",
-            }
-
-    data_path = _resolve_path(config.DATA_FILE)
-    if not Path(data_path).exists():
-        raise HTTPException(status_code=404, detail="Data file not found.")
-
-    mapping = _load_exchange_map(EXCHANGE_MAP_FILE)
+    mapping = db_load_universe_map()
     if not mapping:
-        raise HTTPException(status_code=404, detail="Exchange map not found.")
-
-    df = pd.read_parquet(data_path, columns=["Close"])
-    if not isinstance(df.index, pd.MultiIndex) or "ticker" not in df.index.names:
-        raise HTTPException(status_code=500, detail="Unexpected data index format.")
+        raise HTTPException(status_code=404, detail="Universe mapping not found.")
 
     if date:
         try:
@@ -899,27 +531,25 @@ def stale_tickers(date: Optional[str] = None):
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid date format.")
     else:
-        target_date = df.index.get_level_values("date").max()
-    if target_date is None:
-        raise HTTPException(status_code=404, detail="No dates found in data.")
-    target_date = pd.to_datetime(target_date).tz_localize(None)
+        latest = db_latest_price_run_date()
+        if not latest:
+            raise HTTPException(status_code=404, detail="No production price snapshots found.")
+        target_date = pd.to_datetime(latest).tz_localize(None)
 
+    target_run_date = str(pd.to_datetime(target_date).date())
     tickers = set(mapping.keys())
     excluded, _ = _load_effective_excluded_tickers()
     if excluded:
         tickers -= excluded
-    date_values = df.index.get_level_values("date")
-    day_data = df.loc[date_values == target_date]
-    if not day_data.empty:
-        day_data = day_data.reset_index()
-        if "ticker" in day_data.columns:
-            tickers -= set(day_data["ticker"].astype(str).str.upper().tolist())
+    observed = db_price_tickers_for_date(target_run_date)
+    if observed:
+        tickers -= observed
 
     return {
-        "as_of": str(pd.to_datetime(target_date).date()),
+        "as_of": target_run_date,
         "count": len(tickers),
         "stale_tickers": sorted(tickers),
-        "source": "file",
+        "source": "db",
     }
 
 
@@ -962,58 +592,26 @@ def queue_adjustments(payload: AdjustmentRequest):
     if not entries:
         raise HTTPException(status_code=400, detail="No adjustments provided.")
 
-    if _db_ready():
-        db_append_pending_adjustments(entries)
-    else:
-        pending_path = Path(_resolve_path(PENDING_FILE))
-        pending_path.parent.mkdir(parents=True, exist_ok=True)
-        with pending_path.open("a") as f:
-            for entry in entries:
-                f.write(json.dumps(entry) + "\n")
+    db_append_pending_adjustments(entries)
 
     return {"queued": len(entries)}
 
 
 @app.get("/pending-adjustments", dependencies=[Depends(_require_api_key)])
 def list_pending_adjustments():
-    entries: list[dict] = []
-    if _db_ready():
-        entries = db_load_pending_adjustments()
-    else:
-        pending_path = Path(_resolve_path(PENDING_FILE))
-        if not pending_path.exists():
-            return {"pending": []}
-        with pending_path.open("r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    entries: list[dict] = db_load_pending_adjustments()
     return {"pending": entries}
 
 
 @app.post("/clear-pending", dependencies=[Depends(_require_api_key)])
 def clear_pending_adjustments():
-    if _db_ready():
-        db_clear_pending_adjustments()
-    else:
-        pending_path = Path(_resolve_path(PENDING_FILE))
-        pending_path.parent.mkdir(parents=True, exist_ok=True)
-        pending_path.write_text("")
+    db_clear_pending_adjustments()
     return {"cleared": True}
 
 
 @app.delete("/pending-adjustments", dependencies=[Depends(_require_api_key)])
 def delete_pending_adjustments():
-    if _db_ready():
-        db_clear_pending_adjustments()
-    else:
-        pending_path = Path(_resolve_path(PENDING_FILE))
-        pending_path.parent.mkdir(parents=True, exist_ok=True)
-        pending_path.write_text("")
+    db_clear_pending_adjustments()
     return {"cleared": True}
 
 
@@ -1021,7 +619,5 @@ def delete_pending_adjustments():
 def reset_production(payload: ResetRequest):
     if payload.confirm != "RESET_PRODUCTION_DATA":
         raise HTTPException(status_code=400, detail="Confirmation token missing or invalid.")
-    if not _db_ready():
-        raise HTTPException(status_code=400, detail="Database not configured.")
     db_reset_production_data()
     return {"reset": True}
