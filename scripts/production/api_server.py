@@ -30,9 +30,11 @@ from src.production_db import (
     list_broker_orders as db_list_broker_orders,
     list_trades as db_list_trades,
     list_universe_monitor_candidates as db_list_universe_monitor_candidates,
+    load_excluded_tickers as db_load_excluded_tickers,
     load_universe_map as db_load_universe_map,
     load_pending_adjustments as db_load_pending_adjustments,
     price_tickers_for_date as db_price_tickers_for_date,
+    replace_excluded_tickers as db_replace_excluded_tickers,
     load_state as db_load_state,
     reset_production_data as db_reset_production_data,
 )
@@ -128,6 +130,12 @@ def _write_excluded_tickers(path: str, tickers: set[str]) -> None:
         excluded_path.write_text("")
         return
     excluded_path.write_text("\n".join(sorted(tickers)) + "\n")
+
+
+def _load_effective_excluded_tickers() -> tuple[set[str], str]:
+    if _db_ready():
+        return db_load_excluded_tickers(), "db"
+    return _load_excluded_tickers(EXCLUDED_TICKERS_FILE), "file"
 
 
 def _load_state(path: str) -> dict | None:
@@ -825,8 +833,8 @@ def latest_broker_orders(broker: str = "trading212", limit: int = 0):
 
 @app.get("/excluded-tickers", dependencies=[Depends(_require_api_key)])
 def list_excluded_tickers():
-    excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
-    return {"count": len(excluded), "excluded_tickers": sorted(excluded)}
+    excluded, source = _load_effective_excluded_tickers()
+    return {"count": len(excluded), "excluded_tickers": sorted(excluded), "source": source}
 
 
 @app.post("/exclude-tickers", dependencies=[Depends(_require_api_key)])
@@ -834,10 +842,12 @@ def exclude_tickers(payload: ExcludeTickersRequest):
     tickers = [str(t).strip().upper() for t in (payload.tickers or []) if str(t).strip()]
     if not tickers:
         raise HTTPException(status_code=400, detail="No tickers provided.")
-    excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+    excluded, source = _load_effective_excluded_tickers()
     excluded.update(tickers)
+    if _db_ready():
+        db_replace_excluded_tickers(excluded)
     _write_excluded_tickers(EXCLUDED_TICKERS_FILE, excluded)
-    return {"count": len(excluded), "excluded_tickers": sorted(excluded)}
+    return {"count": len(excluded), "excluded_tickers": sorted(excluded), "source": source}
 
 
 @app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])
@@ -858,7 +868,7 @@ def stale_tickers(date: Optional[str] = None):
 
             target_run_date = str(pd.to_datetime(target_date).date())
             tickers = set(mapping.keys())
-            excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+            excluded, _ = _load_effective_excluded_tickers()
             if excluded:
                 tickers -= excluded
             observed = db_price_tickers_for_date(target_run_date)
@@ -895,7 +905,7 @@ def stale_tickers(date: Optional[str] = None):
     target_date = pd.to_datetime(target_date).tz_localize(None)
 
     tickers = set(mapping.keys())
-    excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+    excluded, _ = _load_effective_excluded_tickers()
     if excluded:
         tickers -= excluded
     date_values = df.index.get_level_values("date")

@@ -25,6 +25,7 @@ from src.production_db import (
     db_enabled,
     init_db as db_init,
     list_run_summaries as db_list_run_summaries,
+    load_excluded_tickers as db_load_excluded_tickers,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
     replace_universe_map as db_replace_universe_map,
@@ -81,6 +82,7 @@ DEFAULT_CASH_LOG = "runs/production/cash_injections.csv"
 DEFAULT_PENDING_FILE = "runs/production/pending_adjustments.jsonl"
 DEFAULT_PENDING_APPLIED_FILE = "runs/production/pending_adjustments_applied.jsonl"
 DEFAULT_EXCHANGE_MAP_FILE = config.TRADINGVIEW_EXCHANGE_MAP_FILE
+DEFAULT_EXCLUDED_TICKERS_FILE = config.EXCLUDED_TICKERS_FILE
 
 
 def parse_args():
@@ -465,6 +467,82 @@ def _backfill_cumulative_costs(output_dir: str) -> float:
     return total
 
 
+def _broker_notionals(orders: list[dict]) -> tuple[float, float]:
+    buy_notional = 0.0
+    sell_notional = 0.0
+    for order in orders:
+        price = _safe_float(order.get("exec_price"))
+        if price <= 0:
+            continue
+        filled_qty = _safe_float(order.get("filled_quantity"))
+        if filled_qty <= 0:
+            filled_qty = abs(_safe_float(order.get("quantity")))
+        if filled_qty <= 0:
+            continue
+        notional = abs(filled_qty * price)
+        action = str(order.get("action") or "").strip().upper()
+        if action == "BUY":
+            buy_notional += notional
+        elif action == "SELL":
+            sell_notional += notional
+        elif _safe_float(order.get("quantity")) < 0:
+            sell_notional += notional
+        else:
+            buy_notional += notional
+    return buy_notional, sell_notional
+
+
+def _prior_broker_cost_totals(output_dir: str, target_date: str) -> tuple[float, float]:
+    total_broker = 0.0
+    total_usd = 0.0
+    if db_enabled():
+        rows = db_list_run_summaries()
+        for row in rows:
+            row_date = str(row.get("date") or "")
+            if not row_date or row_date >= target_date:
+                continue
+            daily_broker = _safe_float(row.get("broker_execution_cost"), default=0.0)
+            daily_usd = row.get("broker_execution_cost_usd")
+            if daily_usd is None:
+                currency = str(row.get("broker_currency") or "").strip().upper()
+                fx_rate = _safe_float(row.get("broker_fx_rate_gbp_per_usd"), default=0.0)
+                if currency == "USD":
+                    daily_usd = daily_broker
+                elif fx_rate > 0:
+                    daily_usd = daily_broker / fx_rate
+                else:
+                    daily_usd = 0.0
+            total_broker += daily_broker
+            total_usd += _safe_float(daily_usd, default=0.0)
+        return total_broker, total_usd
+
+    base = Path(_resolve_path(output_dir))
+    if not base.exists():
+        return 0.0, 0.0
+    for run_dir in sorted(d for d in base.iterdir() if d.is_dir() and d.name < target_date):
+        summary_path = run_dir / "summary.json"
+        if not summary_path.exists():
+            continue
+        try:
+            row = json.loads(summary_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        daily_broker = _safe_float(row.get("broker_execution_cost"), default=0.0)
+        daily_usd = row.get("broker_execution_cost_usd")
+        if daily_usd is None:
+            currency = str(row.get("broker_currency") or "").strip().upper()
+            fx_rate = _safe_float(row.get("broker_fx_rate_gbp_per_usd"), default=0.0)
+            if currency == "USD":
+                daily_usd = daily_broker
+            elif fx_rate > 0:
+                daily_usd = daily_broker / fx_rate
+            else:
+                daily_usd = 0.0
+        total_broker += daily_broker
+        total_usd += _safe_float(daily_usd, default=0.0)
+    return total_broker, total_usd
+
+
 def _mark_pending_applied(pending_path: str, applied_path: str, entries: list[dict]) -> None:
     if not entries:
         return
@@ -519,6 +597,18 @@ def _load_exchange_map(path: str) -> dict[str, str]:
     return out
 
 
+def _sync_excluded_tickers_from_db(path: str) -> None:
+    if not db_enabled():
+        return
+    tickers = db_load_excluded_tickers()
+    excluded_path = Path(_resolve_path(path))
+    excluded_path.parent.mkdir(parents=True, exist_ok=True)
+    if not tickers:
+        excluded_path.write_text("")
+        return
+    excluded_path.write_text("\n".join(sorted(tickers)) + "\n")
+
+
 def main():
     args = parse_args()
     strategy_roots = args.strategy_roots or ["alphas"]
@@ -560,6 +650,7 @@ def main():
 
     if db_enabled():
         db_init()
+        _sync_excluded_tickers_from_db(DEFAULT_EXCLUDED_TICKERS_FILE)
 
     pending_entries: list[dict] = []
     pending_cash_entries: list[dict] = []
@@ -815,17 +906,86 @@ def main():
             post_positions,
             broker_context.get("account_currency") or "GBP",
         )
-        broker_cash_gbp = _safe_float(broker_account_row.get("cash"))
+        broker_cash_before = _safe_float(broker_context.get("broker_cash_gbp"))
+        broker_cash_after = _safe_float(broker_account_row.get("cash"))
         broker_net_worth_gbp = _safe_float(broker_account_row.get("net_worth"))
         broker_portfolio_value = _safe_float(broker_account_row.get("investments"))
-        summary["broker_cash"] = broker_cash_gbp
+        summary["broker_cash"] = broker_cash_after
+        summary["broker_cash_before"] = broker_cash_before
+        summary["broker_cash_after"] = broker_cash_after
         summary["broker_portfolio_value"] = broker_portfolio_value
         summary["broker_net_worth"] = broker_net_worth_gbp
         summary["broker_cash_weight"] = (
-            broker_cash_gbp / broker_net_worth_gbp if broker_net_worth_gbp > 0 else 0.0
+            broker_cash_after / broker_net_worth_gbp if broker_net_worth_gbp > 0 else 0.0
         )
-        fx_rate = broker_context.get("fx_rate_gbp_per_usd")
-        if fx_rate:
+        buy_notional, sell_notional = _broker_notionals(broker_orders)
+        summary["broker_buy_notional"] = buy_notional
+        summary["broker_sell_notional"] = sell_notional
+
+        fx_rate = _safe_float(broker_context.get("fx_rate_gbp_per_usd"), default=0.0)
+        broker_currency = str(summary.get("broker_currency") or "").strip().upper()
+        can_convert_flow = abs(float(total_cash)) <= 1e-12 or broker_currency == "USD" or fx_rate > 0
+        if args.dry_run:
+            summary["broker_external_flow"] = None
+            summary["broker_external_flow_usd"] = float(total_cash)
+            summary["broker_execution_cost"] = None
+            summary["broker_execution_cost_usd"] = None
+            summary["broker_total_execution_cost"] = None
+            summary["broker_total_execution_cost_usd"] = None
+            summary["broker_cost_warning"] = (
+                "Broker execution cost is not computed during dry-run."
+            )
+        elif can_convert_flow:
+            if broker_currency == "USD":
+                external_flow_broker = float(total_cash)
+            elif fx_rate > 0:
+                external_flow_broker = float(total_cash) * fx_rate
+            else:
+                external_flow_broker = 0.0
+            summary["broker_external_flow"] = external_flow_broker
+            summary["broker_external_flow_usd"] = float(total_cash)
+
+            broker_execution_cost = (
+                broker_cash_before
+                + sell_notional
+                - buy_notional
+                - broker_cash_after
+                - external_flow_broker
+            )
+            if abs(broker_execution_cost) <= 1e-9:
+                broker_execution_cost = 0.0
+            summary["broker_execution_cost"] = broker_execution_cost
+            if broker_currency == "USD":
+                broker_execution_cost_usd: float | None = broker_execution_cost
+            elif fx_rate > 0:
+                broker_execution_cost_usd = broker_execution_cost / fx_rate
+            else:
+                broker_execution_cost_usd = None
+            summary["broker_execution_cost_usd"] = broker_execution_cost_usd
+
+            prior_broker_total, prior_broker_total_usd = _prior_broker_cost_totals(
+                args.output_dir,
+                summary["date"],
+            )
+            summary["broker_total_execution_cost"] = prior_broker_total + broker_execution_cost
+            if broker_execution_cost_usd is None:
+                summary["broker_total_execution_cost_usd"] = None
+            else:
+                summary["broker_total_execution_cost_usd"] = (
+                    prior_broker_total_usd + broker_execution_cost_usd
+                )
+        else:
+            summary["broker_external_flow"] = None
+            summary["broker_external_flow_usd"] = float(total_cash)
+            summary["broker_execution_cost"] = None
+            summary["broker_execution_cost_usd"] = None
+            summary["broker_total_execution_cost"] = None
+            summary["broker_total_execution_cost_usd"] = None
+            summary["broker_cost_warning"] = (
+                "Unable to convert cash adjustments to broker currency for execution-cost reconciliation."
+            )
+
+        if fx_rate > 0:
             summary["broker_net_worth_usd"] = broker_net_worth_gbp / fx_rate
 
     run_dir = Path(_resolve_path(args.output_dir)) / summary["date"]

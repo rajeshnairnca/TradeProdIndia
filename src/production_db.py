@@ -53,10 +53,20 @@ def init_db() -> None:
                 broker_name text,
                 broker_currency text,
                 broker_cash double precision,
+                broker_cash_before double precision,
+                broker_cash_after double precision,
                 broker_portfolio_value double precision,
                 broker_net_worth double precision,
                 broker_cash_weight double precision,
-                broker_discrepancies jsonb
+                broker_discrepancies jsonb,
+                broker_buy_notional double precision,
+                broker_sell_notional double precision,
+                broker_external_flow double precision,
+                broker_external_flow_usd double precision,
+                broker_execution_cost double precision,
+                broker_execution_cost_usd double precision,
+                broker_total_execution_cost double precision,
+                broker_total_execution_cost_usd double precision
             );
             """
         )
@@ -70,6 +80,12 @@ def init_db() -> None:
             "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_cash double precision;"
         )
         cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_cash_before double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_cash_after double precision;"
+        )
+        cur.execute(
             "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_portfolio_value double precision;"
         )
         cur.execute(
@@ -80,6 +96,30 @@ def init_db() -> None:
         )
         cur.execute(
             "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_discrepancies jsonb;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_buy_notional double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_sell_notional double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_external_flow double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_external_flow_usd double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_execution_cost double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_execution_cost_usd double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_total_execution_cost double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_total_execution_cost_usd double precision;"
         )
         cur.execute(
             """
@@ -118,6 +158,14 @@ def init_db() -> None:
                 ticker text PRIMARY KEY,
                 exchange text,
                 updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_excluded_tickers (
+                ticker text PRIMARY KEY,
+                created_at timestamptz DEFAULT now()
             );
             """
         )
@@ -206,6 +254,9 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_universe_map_exchange_idx ON production_universe_map (exchange);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_excluded_tickers_ticker_idx ON production_excluded_tickers (ticker);"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_broker_orders_run_date_idx ON production_broker_orders (run_date);"
@@ -319,12 +370,22 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 broker_name,
                 broker_currency,
                 broker_cash,
+                broker_cash_before,
+                broker_cash_after,
                 broker_portfolio_value,
                 broker_net_worth,
                 broker_cash_weight,
-                broker_discrepancies
+                broker_discrepancies,
+                broker_buy_notional,
+                broker_sell_notional,
+                broker_external_flow,
+                broker_external_flow_usd,
+                broker_execution_cost,
+                broker_execution_cost_usd,
+                broker_total_execution_cost,
+                broker_total_execution_cost_usd
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (run_date) DO UPDATE SET
                 num_trades = EXCLUDED.num_trades,
                 net_worth_usd = EXCLUDED.net_worth_usd,
@@ -341,10 +402,20 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 broker_name = EXCLUDED.broker_name,
                 broker_currency = EXCLUDED.broker_currency,
                 broker_cash = EXCLUDED.broker_cash,
+                broker_cash_before = EXCLUDED.broker_cash_before,
+                broker_cash_after = EXCLUDED.broker_cash_after,
                 broker_portfolio_value = EXCLUDED.broker_portfolio_value,
                 broker_net_worth = EXCLUDED.broker_net_worth,
                 broker_cash_weight = EXCLUDED.broker_cash_weight,
-                broker_discrepancies = EXCLUDED.broker_discrepancies;
+                broker_discrepancies = EXCLUDED.broker_discrepancies,
+                broker_buy_notional = EXCLUDED.broker_buy_notional,
+                broker_sell_notional = EXCLUDED.broker_sell_notional,
+                broker_external_flow = EXCLUDED.broker_external_flow,
+                broker_external_flow_usd = EXCLUDED.broker_external_flow_usd,
+                broker_execution_cost = EXCLUDED.broker_execution_cost,
+                broker_execution_cost_usd = EXCLUDED.broker_execution_cost_usd,
+                broker_total_execution_cost = EXCLUDED.broker_total_execution_cost,
+                broker_total_execution_cost_usd = EXCLUDED.broker_total_execution_cost_usd;
             """,
             (
                 run_date,
@@ -363,12 +434,22 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 summary.get("broker_name"),
                 summary.get("broker_currency"),
                 summary.get("broker_cash"),
+                summary.get("broker_cash_before"),
+                summary.get("broker_cash_after"),
                 summary.get("broker_portfolio_value"),
                 summary.get("broker_net_worth"),
                 summary.get("broker_cash_weight"),
                 psycopg2.extras.Json(summary.get("broker_discrepancies"))
                 if summary.get("broker_discrepancies") is not None
                 else None,
+                summary.get("broker_buy_notional"),
+                summary.get("broker_sell_notional"),
+                summary.get("broker_external_flow"),
+                summary.get("broker_external_flow_usd"),
+                summary.get("broker_execution_cost"),
+                summary.get("broker_execution_cost_usd"),
+                summary.get("broker_total_execution_cost"),
+                summary.get("broker_total_execution_cost_usd"),
             ),
         )
 
@@ -575,6 +656,52 @@ def load_universe_map() -> dict[str, str]:
         return out
 
 
+def load_excluded_tickers() -> set[str]:
+    if not db_enabled():
+        return set()
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticker
+            FROM production_excluded_tickers;
+            """
+        )
+        return {
+            str(row[0]).strip().upper()
+            for row in cur.fetchall()
+            if row and row[0] and str(row[0]).strip()
+        }
+
+
+def replace_excluded_tickers(tickers: Iterable[str]) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    rows = []
+    for ticker in tickers:
+        t = str(ticker).strip().upper()
+        if not t:
+            continue
+        rows.append((t,))
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE production_excluded_tickers;")
+        if not rows:
+            return
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO production_excluded_tickers (
+                ticker
+            )
+            VALUES %s;
+            """,
+            rows,
+        )
+
+
 def upsert_state(state: ProductionState) -> None:
     if not db_enabled():
         return
@@ -715,10 +842,20 @@ def list_run_summaries() -> list[dict[str, Any]]:
                    broker_name,
                    broker_currency,
                    broker_cash,
+                   broker_cash_before,
+                   broker_cash_after,
                    broker_portfolio_value,
                    broker_net_worth,
                    broker_cash_weight,
-                   broker_discrepancies
+                   broker_discrepancies,
+                   broker_buy_notional,
+                   broker_sell_notional,
+                   broker_external_flow,
+                   broker_external_flow_usd,
+                   broker_execution_cost,
+                   broker_execution_cost_usd,
+                   broker_total_execution_cost,
+                   broker_total_execution_cost_usd
             FROM production_runs
             ORDER BY run_date ASC;
             """
@@ -761,10 +898,20 @@ def latest_summary() -> dict[str, Any] | None:
                    broker_name,
                    broker_currency,
                    broker_cash,
+                   broker_cash_before,
+                   broker_cash_after,
                    broker_portfolio_value,
                    broker_net_worth,
                    broker_cash_weight,
-                   broker_discrepancies
+                   broker_discrepancies,
+                   broker_buy_notional,
+                   broker_sell_notional,
+                   broker_external_flow,
+                   broker_external_flow_usd,
+                   broker_execution_cost,
+                   broker_execution_cost_usd,
+                   broker_total_execution_cost,
+                   broker_total_execution_cost_usd
             FROM production_runs
             ORDER BY run_date DESC
             LIMIT 1;
@@ -1428,6 +1575,7 @@ def reset_production_data() -> None:
                 production_broker_positions,
                 production_broker_orders,
                 production_universe_map,
+                production_excluded_tickers,
                 production_universe_monitor_state,
                 production_universe_monitor_candidates;
             """

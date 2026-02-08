@@ -197,3 +197,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Updated `scripts/backtesting/tech_universe_monitor.py` to write monitor results to Postgres by default when DB is configured, plus `--skip-file-output`/`--skip-db` controls.
 - Added DB-backed universe mapping (`production_universe_map`) and wired the cron runner (`scripts/production/daily_run.py`) to refresh it from the exchange-map file each run.
 - Updated API stale/universe endpoints to use DB-first data (`/stale-tickers` now reads latest DB price snapshots + DB universe map, with file/parquet fallback), which fixes split-service deployments where the API service has no shared parquet volume.
+- Added DB-backed excluded tickers (`production_excluded_tickers`) and updated API endpoints to read/write exclusions from Postgres by default, mirroring to file for compatibility.
+- Updated `scripts/production/daily_run.py` to sync DB exclusions to the local excluded-tickers file at run start so universe filtering stays consistent in split-service deployments.
+- Added broker execution-cost reconciliation in `scripts/production/daily_run.py` using broker cash delta + buy/sell notional + external cash flow adjustments, persisted as daily and cumulative metrics.
+- Extended `production_runs` schema and DB summaries (`src/production_db.py`) with broker cost fields (`broker_execution_cost`, `broker_total_execution_cost`, USD counterparts, and reconciliation components) so app/API can compare broker-realized costs vs model costs over time.
