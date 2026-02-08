@@ -27,6 +27,7 @@ from src.production_db import (
     list_run_summaries as db_list_run_summaries,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
+    replace_universe_map as db_replace_universe_map,
     replace_broker_orders as db_replace_broker_orders,
     replace_broker_positions as db_replace_broker_positions,
     replace_trades as db_replace_trades,
@@ -498,6 +499,26 @@ def _update_exchange_map(path: str, updates: dict[str, str]) -> None:
     )
 
 
+def _load_exchange_map(path: str) -> dict[str, str]:
+    exchange_path = Path(_resolve_path(path))
+    if not exchange_path.exists():
+        return {}
+    try:
+        payload = json.loads(exchange_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, str] = {}
+    for ticker, exchange in payload.items():
+        t = str(ticker).strip().upper()
+        ex = str(exchange).strip().upper()
+        if not t:
+            continue
+        out[t] = ex or "UNKNOWN"
+    return out
+
+
 def main():
     args = parse_args()
     strategy_roots = args.strategy_roots or ["alphas"]
@@ -625,6 +646,10 @@ def main():
 
     if pending_exchange_map:
         _update_exchange_map(args.exchange_map_file, pending_exchange_map)
+    if db_enabled():
+        exchange_map_payload = _load_exchange_map(args.exchange_map_file)
+        if exchange_map_payload:
+            db_replace_universe_map(exchange_map_payload)
 
     if not args.skip_update:
         updated_result = update_market_data(

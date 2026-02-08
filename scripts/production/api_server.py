@@ -19,6 +19,7 @@ from src.production_db import (
     init_db as db_init,
     latest_run_date as db_latest_run_date,
     latest_prices as db_latest_prices,
+    latest_price_run_date as db_latest_price_run_date,
     latest_summary as db_latest_summary,
     latest_trades as db_latest_trades,
     latest_broker_account as db_latest_broker_account,
@@ -29,7 +30,9 @@ from src.production_db import (
     list_broker_orders as db_list_broker_orders,
     list_trades as db_list_trades,
     list_universe_monitor_candidates as db_list_universe_monitor_candidates,
+    load_universe_map as db_load_universe_map,
     load_pending_adjustments as db_load_pending_adjustments,
+    price_tickers_for_date as db_price_tickers_for_date,
     load_state as db_load_state,
     reset_production_data as db_reset_production_data,
 )
@@ -630,6 +633,11 @@ def portfolio_snapshot():
 
 @app.get("/universe", dependencies=[Depends(_require_api_key)])
 def universe_listing():
+    if _db_ready():
+        mapping = db_load_universe_map()
+        if mapping:
+            universe = [{"ticker": k, "exchange": v} for k, v in sorted(mapping.items())]
+            return {"count": len(universe), "universe": universe}
     mapping = _load_exchange_map(EXCHANGE_MAP_FILE)
     if not mapping:
         raise HTTPException(status_code=404, detail="Exchange map not found.")
@@ -834,6 +842,35 @@ def exclude_tickers(payload: ExcludeTickersRequest):
 
 @app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])
 def stale_tickers(date: Optional[str] = None):
+    if _db_ready():
+        mapping = db_load_universe_map()
+        if mapping:
+            if date:
+                try:
+                    target_date = pd.to_datetime(date).tz_localize(None)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="Invalid date format.")
+            else:
+                latest = db_latest_price_run_date()
+                if not latest:
+                    raise HTTPException(status_code=404, detail="No production price snapshots found.")
+                target_date = pd.to_datetime(latest).tz_localize(None)
+
+            target_run_date = str(pd.to_datetime(target_date).date())
+            tickers = set(mapping.keys())
+            excluded = _load_excluded_tickers(EXCLUDED_TICKERS_FILE)
+            if excluded:
+                tickers -= excluded
+            observed = db_price_tickers_for_date(target_run_date)
+            if observed:
+                tickers -= observed
+            return {
+                "as_of": target_run_date,
+                "count": len(tickers),
+                "stale_tickers": sorted(tickers),
+                "source": "db",
+            }
+
     data_path = _resolve_path(config.DATA_FILE)
     if not Path(data_path).exists():
         raise HTTPException(status_code=404, detail="Data file not found.")
@@ -872,6 +909,7 @@ def stale_tickers(date: Optional[str] = None):
         "as_of": str(pd.to_datetime(target_date).date()),
         "count": len(tickers),
         "stale_tickers": sorted(tickers),
+        "source": "file",
     }
 
 

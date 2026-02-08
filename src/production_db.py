@@ -114,6 +114,15 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS production_universe_map (
+                ticker text PRIMARY KEY,
+                exchange text,
+                updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS production_state (
                 id integer PRIMARY KEY,
                 last_date date,
@@ -194,6 +203,9 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_prices_run_date_idx ON production_prices (run_date);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_map_exchange_idx ON production_universe_map (exchange);"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_broker_orders_run_date_idx ON production_broker_orders (run_date);"
@@ -484,6 +496,83 @@ def latest_prices(tickers: Iterable[str]) -> tuple[str | None, dict[str, float]]
                 continue
             prices[str(ticker).strip().upper()] = float(price)
         return str(run_date), prices
+
+
+def latest_price_run_date() -> str | None:
+    if not db_enabled():
+        return None
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT run_date FROM production_prices ORDER BY run_date DESC LIMIT 1;")
+        row = cur.fetchone()
+        return str(row[0]) if row and row[0] else None
+
+
+def price_tickers_for_date(run_date: str) -> set[str]:
+    if not db_enabled():
+        return set()
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticker
+            FROM production_prices
+            WHERE run_date = %s;
+            """,
+            (run_date,),
+        )
+        return {str(row[0]).strip().upper() for row in cur.fetchall() if row and row[0]}
+
+
+def replace_universe_map(mapping: dict[str, str]) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    rows: list[tuple[str, str]] = []
+    for ticker, exchange in mapping.items():
+        t = str(ticker).strip().upper()
+        ex = str(exchange).strip().upper()
+        if not t:
+            continue
+        rows.append((t, ex or "UNKNOWN"))
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("TRUNCATE TABLE production_universe_map;")
+        if not rows:
+            return
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO production_universe_map (
+                ticker,
+                exchange
+            )
+            VALUES %s;
+            """,
+            rows,
+        )
+
+
+def load_universe_map() -> dict[str, str]:
+    if not db_enabled():
+        return {}
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ticker, exchange
+            FROM production_universe_map;
+            """
+        )
+        out: dict[str, str] = {}
+        for ticker, exchange in cur.fetchall():
+            if not ticker:
+                continue
+            out[str(ticker).strip().upper()] = str(exchange or "UNKNOWN").strip().upper()
+        return out
 
 
 def upsert_state(state: ProductionState) -> None:
@@ -1338,6 +1427,7 @@ def reset_production_data() -> None:
                 production_broker_account,
                 production_broker_positions,
                 production_broker_orders,
+                production_universe_map,
                 production_universe_monitor_state,
                 production_universe_monitor_candidates;
             """
