@@ -14,6 +14,7 @@ from .portfolio import get_target_weights
 from .regime import get_regime_state, regime_gross_target, regime_top_k
 from .strategy import StrategySpec
 from .universe import NASDAQ100_TICKERS
+from .universe_quality import apply_quality_filter
 from .utils import calculate_performance_metrics
 
 
@@ -47,6 +48,7 @@ class RuleBasedBacktester:
         excluded = _load_excluded_tickers()
         if excluded:
             self.df = self.df[~self.df.index.get_level_values("ticker").isin(excluded)]
+        self.df, _ = apply_quality_filter(self.df)
         if self.df.empty:
             raise ValueError("No data left after applying universe filter.")
         self.regime_table = regime_table

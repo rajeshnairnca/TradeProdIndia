@@ -186,3 +186,4 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Cleaned local/generated clutter from the working tree: removed `__pycache__/`, `*.pyc`, `.pytest_cache`, and project-level `.DS_Store` files (except permission-restricted `.git` internals).
 - Removed run artifacts under `runs/` per cleanup request.
 - Updated stale guidance in `AGENTS.md` (removed references to `_candidates/` and `scripts/orchestration/orchestrator.py`; refreshed testing guidance to use the current pytest suite).
+- Added `params_inventory.json` at repo root with a generated inventory of environment variables (shell, `.env`, defaults, resolved values), config constants, and CLI parameters/defaults across project entrypoints.

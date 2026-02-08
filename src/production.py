@@ -15,6 +15,7 @@ from .portfolio import get_target_weights
 from .regime import get_regime_state, regime_gross_target, regime_top_k
 from .strategy import StrategySpec
 from .universe import NASDAQ100_TICKERS
+from .universe_quality import apply_quality_filter
 
 REQUIRED_INDICATOR_COLS = [
     "RSI_14",
@@ -965,9 +966,10 @@ def _apply_universe_filter(df: pd.DataFrame) -> pd.DataFrame:
     else:
         allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
         filtered = df[df.index.get_level_values("ticker").isin(allowed)]
-    if not excluded:
-        return filtered
-    return filtered[~filtered.index.get_level_values("ticker").isin(excluded)]
+    if excluded:
+        filtered = filtered[~filtered.index.get_level_values("ticker").isin(excluded)]
+    filtered, _ = apply_quality_filter(filtered)
+    return filtered
 
 
 def _load_excluded_tickers() -> set[str]:
