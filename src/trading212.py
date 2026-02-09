@@ -221,12 +221,15 @@ def resolve_t212_ticker(
     by_symbol: dict[str, list[dict[str, Any]]],
     overrides: dict[str, str],
     preferred_currency: str | None = None,
+    by_ticker: dict[str, dict[str, Any]] | None = None,
 ) -> str | None:
     tv = str(tv_ticker).strip().upper()
     if not tv:
         return None
     if tv in overrides:
-        return overrides[tv]
+        override = str(overrides[tv]).strip().upper()
+        if override and (by_ticker is None or override in by_ticker):
+            return override
     candidates = by_symbol.get(tv, [])
     if not candidates:
         return None

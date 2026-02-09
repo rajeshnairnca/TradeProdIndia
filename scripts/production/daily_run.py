@@ -277,7 +277,13 @@ def _ensure_trading212_universe(
     missing: list[str] = []
     mapping: dict[str, str] = {}
     for ticker in tickers:
-        mapped = resolve_t212_ticker(ticker, by_symbol, overrides, preferred_currency)
+        mapped = resolve_t212_ticker(
+            ticker,
+            by_symbol,
+            overrides,
+            preferred_currency=preferred_currency,
+            by_ticker=by_ticker,
+        )
         if not mapped or mapped not in by_ticker:
             missing.append(ticker)
         else:
@@ -297,6 +303,7 @@ def _execute_trading212_orders(
     dry_run: bool,
 ) -> tuple[list[dict], list[str]]:
     client: Trading212Client = context["client"]
+    by_ticker = context["by_ticker"]
     by_symbol = context["by_symbol"]
     overrides = context["overrides"]
     missing: list[str] = []
@@ -308,7 +315,7 @@ def _execute_trading212_orders(
         ticker = str(trade.get("ticker") or "").strip().upper()
         if not ticker:
             continue
-        t212_ticker = resolve_t212_ticker(ticker, by_symbol, overrides)
+        t212_ticker = resolve_t212_ticker(ticker, by_symbol, overrides, by_ticker=by_ticker)
         if not t212_ticker:
             missing.append(ticker)
             continue
