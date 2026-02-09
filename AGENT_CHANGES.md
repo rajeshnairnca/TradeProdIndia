@@ -192,6 +192,9 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Hardened Trading212 symbol resolution in `src/trading212.py`: `resolve_t212_ticker(...)` now treats overrides as authoritative only when the override ticker exists in the current instrument index, and otherwise falls back to symbol-based matching.
 - Updated Trading212 mapping calls in `scripts/production/daily_run.py` (both universe preflight validation and order routing) to pass the instrument index (`by_ticker`) into ticker resolution, preventing stale override entries from blocking mapping.
 - Added `tests/test_trading212.py` with coverage for valid-override behavior and stale-override fallback behavior (including the `DAY`/`CDAY` style mismatch scenario).
+- Hardened Trading212 order polling for production runs: `src/trading212.py` now raises structured `Trading212ApiError`, URL-encodes order IDs in `get_order`, and treats immediate `404 Order not found` after placement as transient during `wait_for_fill` retries.
+- Added defensive order-id extraction in `scripts/production/daily_run.py` (`id`, `orderId`, `order_id`, nested `order.id`) before polling.
+- Extended `tests/test_trading212.py` with order-polling regression tests covering transient `404` retry behavior and non-404 propagation.
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.

@@ -7,10 +7,32 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
 from . import config
+
+
+class Trading212ApiError(RuntimeError):
+    def __init__(
+        self,
+        status_code: int,
+        response_text: str,
+        method: str,
+        url: str,
+        reason: str | None = None,
+    ) -> None:
+        self.status_code = int(status_code)
+        self.response_text = response_text
+        self.method = method.upper()
+        self.url = url
+        self.reason = (reason or "").strip()
+        reason_text = f" {self.reason}" if self.reason else ""
+        super().__init__(
+            f"Trading212 API error {self.status_code}{reason_text}: "
+            f"{self.method} {self.url} -> {self.response_text}"
+        )
 
 
 @dataclass
@@ -79,7 +101,13 @@ class Trading212Client:
             timeout=self.timeout,
         )
         if response.status_code >= 400:
-            raise RuntimeError(f"Trading212 API error {response.status_code}: {response.text}")
+            raise Trading212ApiError(
+                status_code=response.status_code,
+                response_text=response.text,
+                method=method,
+                url=url,
+                reason=response.reason,
+            )
         if not response.text:
             return None
         return response.json()
@@ -122,7 +150,8 @@ class Trading212Client:
         return data if isinstance(data, dict) else {}
 
     def get_order(self, order_id: int | str) -> dict[str, Any]:
-        data = self._request("GET", f"/equity/orders/{order_id}")
+        quoted_order_id = quote(str(order_id), safe="")
+        data = self._request("GET", f"/equity/orders/{quoted_order_id}")
         return data if isinstance(data, dict) else {}
 
     def wait_for_fill(
@@ -137,7 +166,19 @@ class Trading212Client:
         deadline = time.time() + float(timeout)
         last = {}
         while time.time() <= deadline:
-            last = self.get_order(order_id)
+            try:
+                last = self.get_order(order_id)
+            except Trading212ApiError as exc:
+                if exc.status_code == 404:
+                    # Newly-created orders can briefly return 404 before they are queryable.
+                    last = {
+                        "id": str(order_id),
+                        "status": "PENDING",
+                        "poll_error": "Order not found yet",
+                    }
+                    time.sleep(float(poll))
+                    continue
+                raise
             status = str(last.get("status", "")).upper()
             filled_qty = _safe_float(last.get("filledQuantity"))
             if status == "FILLED":

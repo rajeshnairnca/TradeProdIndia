@@ -218,6 +218,22 @@ def _float_close(a: float, b: float, tol: float = 1e-6) -> bool:
     return abs(a - b) <= tol
 
 
+def _extract_order_id(order_response: dict) -> int | str | None:
+    direct = order_response.get("id")
+    if direct is not None and str(direct).strip():
+        return direct
+    for key in ("orderId", "order_id"):
+        value = order_response.get(key)
+        if value is not None and str(value).strip():
+            return value
+    nested = order_response.get("order")
+    if isinstance(nested, dict):
+        nested_id = nested.get("id")
+        if nested_id is not None and str(nested_id).strip():
+            return nested_id
+    return None
+
+
 def _build_trading212_context(state: ProductionState) -> dict:
     client = Trading212Client()
     instruments = load_instruments_cache(client)
@@ -325,7 +341,7 @@ def _execute_trading212_orders(
             ticker=t212_ticker,
             quantity=shares,
         )
-        order_id = order_resp.get("id")
+        order_id = _extract_order_id(order_resp)
         if order_id is None:
             raise ValueError(f"Trading212 order failed for {ticker}: {order_resp}")
         filled = client.wait_for_fill(order_id, expected_qty=abs(shares))
