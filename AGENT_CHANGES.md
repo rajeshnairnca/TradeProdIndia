@@ -196,6 +196,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added defensive order-id extraction in `scripts/production/daily_run.py` (`id`, `orderId`, `order_id`, nested `order.id`) before polling.
 - Extended `tests/test_trading212.py` with order-polling regression tests covering transient `404` retry behavior and non-404 propagation.
 - Increased default Trading212 fill wait window in `src/config.py` (`TRADING212_ORDER_TIMEOUT` from 60s to 300s) to reduce false failures on slow broker status transitions.
+- Increased default Trading212 order poll interval in `src/config.py` (`TRADING212_ORDER_POLL_SEC` from 2s to 5s) to reduce API polling pressure.
 - Improved unfilled-order failure message in `scripts/production/daily_run.py` to include actionable guidance (`TRADING212_ORDER_TIMEOUT`, market-hours scheduling, `TRADING212_EXTENDED_HOURS`).
 
 ## 2026-02-08
