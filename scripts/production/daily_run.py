@@ -348,9 +348,14 @@ def _execute_trading212_orders(
         status = str(filled.get("status", "")).upper()
         filled_qty = _safe_float(filled.get("filledQuantity"))
         if status != "FILLED" or not _float_close(filled_qty, abs(shares)):
+            timeout_sec = _safe_float(config.TRADING212_ORDER_TIMEOUT, default=0.0)
+            guidance = (
+                f"Increase TRADING212_ORDER_TIMEOUT (current={timeout_sec:.0f}s), "
+                "run during market hours, or set TRADING212_EXTENDED_HOURS=true."
+            )
             raise ValueError(
                 f"Trading212 order not fully filled for {ticker}: status={status}, "
-                f"filled={filled_qty}, expected={abs(shares)}"
+                f"filled={filled_qty}, expected={abs(shares)}. {guidance}"
             )
         filled_value = _safe_float(filled.get("filledValue"))
         exec_price = None

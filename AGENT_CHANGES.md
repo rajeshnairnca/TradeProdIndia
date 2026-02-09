@@ -195,6 +195,8 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Hardened Trading212 order polling for production runs: `src/trading212.py` now raises structured `Trading212ApiError`, URL-encodes order IDs in `get_order`, and treats immediate `404 Order not found` after placement as transient during `wait_for_fill` retries.
 - Added defensive order-id extraction in `scripts/production/daily_run.py` (`id`, `orderId`, `order_id`, nested `order.id`) before polling.
 - Extended `tests/test_trading212.py` with order-polling regression tests covering transient `404` retry behavior and non-404 propagation.
+- Increased default Trading212 fill wait window in `src/config.py` (`TRADING212_ORDER_TIMEOUT` from 60s to 300s) to reduce false failures on slow broker status transitions.
+- Improved unfilled-order failure message in `scripts/production/daily_run.py` to include actionable guidance (`TRADING212_ORDER_TIMEOUT`, market-hours scheduling, `TRADING212_EXTENDED_HOURS`).
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.
