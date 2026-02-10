@@ -414,6 +414,7 @@ def _execute_trading212_orders(
                     phase=phase,
                     ticker=ticker,
                     order_id=order_id,
+                    response_status=order_resp.get("status") if isinstance(order_resp, dict) else None,
                     response_keys=sorted(order_resp.keys()) if isinstance(order_resp, dict) else [],
                 )
                 if order_id is None:

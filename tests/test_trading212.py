@@ -149,3 +149,29 @@ def test_request_does_not_retry_post_on_429(monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(Trading212ApiError):
         client.place_market_order("AAPL_US_EQ", 1.0)
     assert calls["count"] == 1
+
+
+def test_wait_for_orders_uses_get_order_fallback_for_missing_bulk_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Trading212Client(
+        credentials=Trading212Credentials(api_key="k", api_secret="s"),
+        base_url="https://demo.trading212.com/api/v0",
+        timeout=0.1,
+    )
+    bulk_calls = {"count": 0}
+
+    def fake_get_orders() -> list[dict]:
+        bulk_calls["count"] += 1
+        return []
+
+    def fake_get_order(order_id: int | str) -> dict:
+        return {"id": str(order_id), "status": "FILLED", "filledQuantity": 1.0}
+
+    monkeypatch.setattr(client, "get_orders", fake_get_orders)
+    monkeypatch.setattr(client, "get_order", fake_get_order)
+    monkeypatch.setattr("src.trading212.time.sleep", lambda _: None)
+
+    snapshots = client.wait_for_orders(["abc-1"], timeout_sec=0.2, poll_sec=0.0)
+    assert snapshots["abc-1"]["status"] == "FILLED"
+    assert bulk_calls["count"] >= 3

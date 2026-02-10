@@ -207,6 +207,10 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Added GET request retry/backoff handling in `src/trading212.py` for temporary broker/API throttling (`429`) and transient server errors (`5xx`), with configurable retry limits/backoff via new config keys (`TRADING212_HTTP_MAX_RETRIES`, `TRADING212_HTTP_RETRY_BASE_SEC`, `TRADING212_HTTP_RETRY_MAX_SEC`).
 - Hardened post-trade broker snapshot refresh in `scripts/production/daily_run.py` so rate-limited snapshot calls no longer crash the run; the workflow now logs snapshot failures and falls back to pre-trade snapshot data when necessary.
 - Extended `tests/test_trading212.py` with retry behavior coverage (GET retry-on-429 success path and no-retry-on-POST 429 safety check).
+- Improved bulk order monitoring reliability in `src/trading212.py::wait_for_orders(...)`: when `GET /equity/orders` does not include pending/filled IDs, the monitor now periodically falls back to `GET /equity/orders/{id}` for unresolved order IDs and emits periodic monitor progress logs.
+- Added additional Trading212 placement logging in `scripts/production/daily_run.py` to include the immediate broker response status value (`response_status`) for each placed order.
+- Added regression coverage in `tests/test_trading212.py` for the bulk-monitor fallback path when bulk-list responses omit tracked order IDs.
+- Added centralized per-call Trading212 HTTP logging in `src/trading212.py::_request(...)` with explicit request start/success/error lines including method, URL, status, latency, retryability, and compact payload/error previews so Railway logs show the result of every broker API call.
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.

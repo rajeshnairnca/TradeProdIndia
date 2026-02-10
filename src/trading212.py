@@ -100,6 +100,14 @@ class Trading212Client:
         max_sleep = max(base_sleep, float(config.TRADING212_HTTP_RETRY_MAX_SEC))
         attempt = 0
         while True:
+            start = time.monotonic()
+            print(
+                (
+                    f"[Trading212Client] request_start method={method_upper} url={url} "
+                    f"attempt={attempt + 1}/{retries + 1}"
+                ),
+                flush=True,
+            )
             response = self._session.request(
                 method=method_upper,
                 url=url,
@@ -108,14 +116,52 @@ class Trading212Client:
                 headers=headers,
                 timeout=self.timeout,
             )
+            elapsed_ms = round((time.monotonic() - start) * 1000.0, 1)
             if response.status_code < 400:
                 if not response.text:
+                    print(
+                        (
+                            f"[Trading212Client] request_success method={method_upper} url={url} "
+                            f"status={response.status_code} elapsed_ms={elapsed_ms} body=empty"
+                        ),
+                        flush=True,
+                    )
                     return None
-                return response.json()
+                try:
+                    parsed = response.json()
+                except ValueError:
+                    preview = _preview_text(response.text)
+                    print(
+                        (
+                            f"[Trading212Client] request_success method={method_upper} url={url} "
+                            f"status={response.status_code} elapsed_ms={elapsed_ms} body_type=text "
+                            f"body_preview={preview}"
+                        ),
+                        flush=True,
+                    )
+                    return response.text
+                summary = _payload_summary(parsed)
+                print(
+                    (
+                        f"[Trading212Client] request_success method={method_upper} url={url} "
+                        f"status={response.status_code} elapsed_ms={elapsed_ms} {summary}"
+                    ),
+                    flush=True,
+                )
+                return parsed
             can_retry = (
                 method_upper == "GET"
                 and response.status_code in {429, 500, 502, 503, 504}
                 and attempt < retries
+            )
+            error_preview = _preview_text(response.text)
+            print(
+                (
+                    f"[Trading212Client] request_error method={method_upper} url={url} "
+                    f"status={response.status_code} elapsed_ms={elapsed_ms} retryable={str(can_retry).lower()} "
+                    f"body_preview={error_preview}"
+                ),
+                flush=True,
             )
             if not can_retry:
                 raise Trading212ApiError(
@@ -241,8 +287,12 @@ class Trading212Client:
         poll = poll_sec if poll_sec is not None else config.TRADING212_ORDER_POLL_SEC
         deadline = time.time() + float(timeout)
         remaining = set(normalized_ids)
+        missing_rounds: dict[str, int] = {order_id: 0 for order_id in normalized_ids}
+        round_idx = 0
+        fallback_every = 3
 
         while time.time() <= deadline and remaining:
+            round_idx += 1
             try:
                 orders = self.get_orders()
             except Trading212ApiError as exc:
@@ -256,14 +306,40 @@ class Trading212Client:
                 if oid is None:
                     continue
                 by_id[str(oid)] = order
+            unresolved = []
             for order_id in list(remaining):
                 payload = by_id.get(order_id)
                 if payload is None:
+                    missing_rounds[order_id] = missing_rounds.get(order_id, 0) + 1
+                    unresolved.append(order_id)
                     continue
+                missing_rounds[order_id] = 0
                 snapshots[order_id] = payload
                 status = str(payload.get("status", "")).upper()
                 if status in {"FILLED", "REJECTED", "CANCELLED"}:
                     remaining.remove(order_id)
+
+            if unresolved and round_idx % fallback_every == 0:
+                for order_id in list(unresolved):
+                    try:
+                        payload = self.get_order(order_id)
+                    except Trading212ApiError as exc:
+                        if exc.status_code == 404:
+                            continue
+                        raise
+                    snapshots[order_id] = payload
+                    status = str(payload.get("status", "")).upper()
+                    if status in {"FILLED", "REJECTED", "CANCELLED"} and order_id in remaining:
+                        remaining.remove(order_id)
+
+            if round_idx == 1 or round_idx % 6 == 0:
+                print(
+                    (
+                        f"[Trading212Client] bulk order monitor round={round_idx} "
+                        f"remaining={len(remaining)} timeout_sec={float(timeout):.0f}"
+                    ),
+                    flush=True,
+                )
             if remaining:
                 time.sleep(float(poll))
         return snapshots
@@ -298,6 +374,24 @@ def _retry_after_seconds(value: str | None) -> float | None:
         return max(0.0, delta)
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
+
+
+def _preview_text(text: str, limit: int = 240) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "...[truncated]"
+
+
+def _payload_summary(payload: Any) -> str:
+    if isinstance(payload, dict):
+        keys = sorted(payload.keys())
+        preview_keys = keys[:8]
+        suffix = "" if len(keys) <= 8 else ",..."
+        return f"body_type=dict keys={','.join(preview_keys)}{suffix}"
+    if isinstance(payload, list):
+        return f"body_type=list items={len(payload)}"
+    return f"body_type={type(payload).__name__}"
 
 
 def load_instruments_cache(client: Trading212Client) -> list[dict[str, Any]]:
