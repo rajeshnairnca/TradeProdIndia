@@ -198,6 +198,12 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Increased default Trading212 fill wait window in `src/config.py` (`TRADING212_ORDER_TIMEOUT` from 60s to 300s) to reduce false failures on slow broker status transitions.
 - Increased default Trading212 order poll interval in `src/config.py` (`TRADING212_ORDER_POLL_SEC` from 2s to 5s) to reduce API polling pressure.
 - Improved unfilled-order failure message in `scripts/production/daily_run.py` to include actionable guidance (`TRADING212_ORDER_TIMEOUT`, market-hours scheduling, `TRADING212_EXTENDED_HOURS`).
+- Updated Trading212 order execution flow in `scripts/production/daily_run.py` so non-filled/errored broker orders are captured as issues (instead of crashing), order placement halts after the first unresolved order in a run, and persisted state is synced from post-trade broker snapshot when broker issues occur to avoid model/broker drift on subsequent runs.
+- Added focused execution-flow tests in `tests/test_daily_run_trading212_execution.py` with a lightweight `psycopg2` stub so these unit tests run even in environments without Postgres driver dependencies.
+- Added high-visibility stage logging throughout `scripts/production/daily_run.py` with UTC timestamps and structured context (startup, DB init, data loading/updating, state load, broker context, universe validation, trade generation, order execution milestones, snapshot refresh, DB persistence, completion, and fatal exception logging with traceback) to make Railway runtime failures and stalls pinpointable.
+- Reworked Trading212 execution in `scripts/production/daily_run.py` to run in two phases (`SELL` first, then `BUY`), placing each phase's orders first and then monitoring those placed IDs in bulk.
+- Added bulk orders API support in `src/trading212.py` (`get_orders()` -> `GET /equity/orders`) plus `wait_for_orders(...)` for timeout/poll-driven bulk status tracking of multiple order IDs.
+- Updated execution tests to validate bulk monitoring behavior and `SELL`-before-`BUY` placement ordering.
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.

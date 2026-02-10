@@ -133,6 +133,14 @@ class Trading212Client:
             return data["items"]
         return []
 
+    def get_orders(self) -> list[dict[str, Any]]:
+        data = self._request("GET", "/equity/orders")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            return [item for item in data["items"] if isinstance(item, dict)]
+        return []
+
     def place_market_order(
         self,
         ticker: str,
@@ -188,6 +196,50 @@ class Trading212Client:
                 return last
             time.sleep(float(poll))
         return last
+
+    def wait_for_orders(
+        self,
+        order_ids: list[int | str],
+        timeout_sec: float | None = None,
+        poll_sec: float | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        normalized_ids = [str(order_id) for order_id in order_ids if str(order_id).strip()]
+        snapshots: dict[str, dict[str, Any]] = {
+            order_id: {"id": order_id, "status": "PENDING"} for order_id in normalized_ids
+        }
+        if not normalized_ids:
+            return snapshots
+
+        timeout = timeout_sec if timeout_sec is not None else config.TRADING212_ORDER_TIMEOUT
+        poll = poll_sec if poll_sec is not None else config.TRADING212_ORDER_POLL_SEC
+        deadline = time.time() + float(timeout)
+        remaining = set(normalized_ids)
+
+        while time.time() <= deadline and remaining:
+            try:
+                orders = self.get_orders()
+            except Trading212ApiError as exc:
+                if exc.status_code == 404:
+                    time.sleep(float(poll))
+                    continue
+                raise
+            by_id: dict[str, dict[str, Any]] = {}
+            for order in orders:
+                oid = order.get("id")
+                if oid is None:
+                    continue
+                by_id[str(oid)] = order
+            for order_id in list(remaining):
+                payload = by_id.get(order_id)
+                if payload is None:
+                    continue
+                snapshots[order_id] = payload
+                status = str(payload.get("status", "")).upper()
+                if status in {"FILLED", "REJECTED", "CANCELLED"}:
+                    remaining.remove(order_id)
+            if remaining:
+                time.sleep(float(poll))
+        return snapshots
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

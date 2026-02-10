@@ -2,6 +2,9 @@ import argparse
 import json
 import os
 import sys
+import time
+import traceback
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -75,6 +78,18 @@ DEFAULT_REGIME_MAPPING = {
     "sideways_high_vol": "rule_range_reversion",
     "sideways_low_vol": "rule_trend_strength",
 }
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _log(message: str, **fields) -> None:
+    payload = f"[{_utc_now()}] {message}"
+    if fields:
+        payload = f"{payload} | {json.dumps(fields, default=str, sort_keys=True)}"
+    print(payload, flush=True)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Daily production run: update data + generate trades.")
@@ -235,13 +250,21 @@ def _extract_order_id(order_response: dict) -> int | str | None:
 
 
 def _build_trading212_context(state: ProductionState) -> dict:
+    _log("broker_context_build_start", broker="trading212")
     client = Trading212Client()
     instruments = load_instruments_cache(client)
     overrides = load_ticker_overrides()
     by_ticker, by_symbol = build_instrument_index(instruments)
+    _log(
+        "broker_instruments_loaded",
+        instruments=len(instruments),
+        overrides=len(overrides),
+        symbols=len(by_symbol),
+    )
 
     summary_raw = client.get_account_summary()
     positions_raw = client.get_positions()
+    _log("broker_snapshot_loaded", positions=len(positions_raw))
 
     account_currency = str(
         summary_raw.get("currencyCode") or summary_raw.get("currency") or "GBP"
@@ -262,6 +285,12 @@ def _build_trading212_context(state: ProductionState) -> dict:
         broker_positions,
         state.cash,
         broker_cash_usd,
+    )
+    _log(
+        "broker_context_build_complete",
+        account_currency=account_currency,
+        broker_positions=len(broker_positions),
+        fx_rate_gbp_per_usd=fx_rate,
     )
     return {
         "client": client,
@@ -290,6 +319,7 @@ def _ensure_trading212_universe(
     preferred_currency: str | None = None,
 ) -> dict[str, str]:
     tickers = sorted(set(df.index.get_level_values("ticker").unique()))
+    _log("broker_universe_validation_start", candidate_tickers=len(tickers))
     missing: list[str] = []
     mapping: dict[str, str] = {}
     for ticker in tickers:
@@ -306,10 +336,12 @@ def _ensure_trading212_universe(
             mapping[ticker] = mapped
     if missing:
         preview = ", ".join(missing[:10])
+        _log("broker_universe_validation_failed", missing=len(missing), preview=preview)
         raise ValueError(
             "Missing Trading212 mappings for tickers. "
             f"Missing {len(missing)} (first 10): {preview}"
         )
+    _log("broker_universe_validation_complete", mapped=len(mapping))
     return mapping
 
 
@@ -317,13 +349,16 @@ def _execute_trading212_orders(
     trades: list[dict],
     context: dict,
     dry_run: bool,
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[dict], list[str], list[dict]]:
     client: Trading212Client = context["client"]
     by_ticker = context["by_ticker"]
     by_symbol = context["by_symbol"]
     overrides = context["overrides"]
     missing: list[str] = []
     orders: list[dict] = []
+    issues: list[dict] = []
+    mapped_trades: list[dict] = []
+    _log("broker_order_execution_start", trades=len(trades), dry_run=bool(dry_run), phases=["SELL", "BUY"])
     for trade in trades:
         shares = _safe_float(trade.get("shares"))
         if abs(shares) <= 1e-6:
@@ -331,50 +366,215 @@ def _execute_trading212_orders(
         ticker = str(trade.get("ticker") or "").strip().upper()
         if not ticker:
             continue
+        action = str(trade.get("action") or "").strip().upper()
+        phase = "SELL" if action == "SELL" or shares < 0 else "BUY"
         t212_ticker = resolve_t212_ticker(ticker, by_symbol, overrides, by_ticker=by_ticker)
         if not t212_ticker:
             missing.append(ticker)
+            _log("broker_order_mapping_missing", ticker=ticker)
             continue
-        if dry_run:
-            continue
-        order_resp = client.place_market_order(
-            ticker=t212_ticker,
-            quantity=shares,
-        )
-        order_id = _extract_order_id(order_resp)
-        if order_id is None:
-            raise ValueError(f"Trading212 order failed for {ticker}: {order_resp}")
-        filled = client.wait_for_fill(order_id, expected_qty=abs(shares))
-        status = str(filled.get("status", "")).upper()
-        filled_qty = _safe_float(filled.get("filledQuantity"))
-        if status != "FILLED" or not _float_close(filled_qty, abs(shares)):
-            timeout_sec = _safe_float(config.TRADING212_ORDER_TIMEOUT, default=0.0)
-            guidance = (
-                f"Increase TRADING212_ORDER_TIMEOUT (current={timeout_sec:.0f}s), "
-                "run during market hours, or set TRADING212_EXTENDED_HOURS=true."
-            )
-            raise ValueError(
-                f"Trading212 order not fully filled for {ticker}: status={status}, "
-                f"filled={filled_qty}, expected={abs(shares)}. {guidance}"
-            )
-        filled_value = _safe_float(filled.get("filledValue"))
-        exec_price = None
-        if filled_qty > 0 and filled_value > 0:
-            exec_price = filled_value / filled_qty
-        orders.append(
+        mapped_trades.append(
             {
                 "ticker": ticker,
-                "action": trade.get("action"),
-                "quantity": shares,
-                "filled_quantity": filled_qty,
-                "exec_price": exec_price,
-                "currency": filled.get("currency") or context.get("account_currency"),
-                "status": status,
-                "order_id": str(order_id),
-                "payload": filled,
+                "action": action or ("SELL" if shares < 0 else "BUY"),
+                "shares": shares,
+                "phase": phase,
+                "t212_ticker": t212_ticker,
             }
         )
-    return orders, missing
+        if dry_run:
+            _log("broker_order_dry_run_skip", ticker=ticker, quantity=shares, t212_ticker=t212_ticker)
+    if dry_run:
+        _log("broker_order_execution_complete", orders=0, missing_mappings=len(missing), issues=0)
+        return orders, missing, issues
+
+    halt_execution = False
+    for phase in ("SELL", "BUY"):
+        if halt_execution:
+            break
+        phase_trades = [item for item in mapped_trades if item["phase"] == phase]
+        if not phase_trades:
+            continue
+        _log("broker_phase_place_start", phase=phase, orders=len(phase_trades))
+        placed: list[dict] = []
+        for item in phase_trades:
+            ticker = item["ticker"]
+            shares = _safe_float(item["shares"])
+            t212_ticker = str(item["t212_ticker"])
+            try:
+                _log("broker_order_place_start", phase=phase, ticker=ticker, quantity=shares, t212_ticker=t212_ticker)
+                order_resp = client.place_market_order(
+                    ticker=t212_ticker,
+                    quantity=shares,
+                )
+                order_id = _extract_order_id(order_resp)
+                _log(
+                    "broker_order_place_response",
+                    phase=phase,
+                    ticker=ticker,
+                    order_id=order_id,
+                    response_keys=sorted(order_resp.keys()) if isinstance(order_resp, dict) else [],
+                )
+                if order_id is None:
+                    issue = {
+                        "phase": phase,
+                        "ticker": ticker,
+                        "error": "missing_order_id",
+                        "details": order_resp,
+                    }
+                    issues.append(issue)
+                    orders.append(
+                        {
+                            "ticker": ticker,
+                            "action": item["action"],
+                            "quantity": shares,
+                            "filled_quantity": 0.0,
+                            "exec_price": None,
+                            "currency": context.get("account_currency"),
+                            "status": "FAILED",
+                            "order_id": None,
+                            "payload": {"issue": issue, "response": order_resp},
+                        }
+                    )
+                    _log("broker_order_issue", phase=phase, ticker=ticker, error="missing_order_id")
+                    halt_execution = True
+                    break
+                placed.append(
+                    {
+                        "phase": phase,
+                        "ticker": ticker,
+                        "action": item["action"],
+                        "shares": shares,
+                        "order_id": str(order_id),
+                    }
+                )
+            except Exception as exc:
+                issue = {
+                    "phase": phase,
+                    "ticker": ticker,
+                    "error": "order_execution_error",
+                    "details": str(exc),
+                }
+                issues.append(issue)
+                _log(
+                    "broker_order_exception",
+                    phase=phase,
+                    ticker=ticker,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                orders.append(
+                    {
+                        "ticker": ticker,
+                        "action": item["action"],
+                        "quantity": shares,
+                        "filled_quantity": 0.0,
+                        "exec_price": None,
+                        "currency": context.get("account_currency"),
+                        "status": "FAILED",
+                        "order_id": None,
+                        "payload": {"issue": issue},
+                    }
+                )
+                halt_execution = True
+                break
+        if halt_execution:
+            break
+        if not placed:
+            continue
+
+        order_ids = [item["order_id"] for item in placed]
+        _log("broker_phase_monitor_start", phase=phase, orders=len(order_ids), order_ids=order_ids)
+        try:
+            bulk_status = client.wait_for_orders(order_ids)
+        except Exception as exc:
+            issue = {
+                "phase": phase,
+                "error": "bulk_status_error",
+                "details": str(exc),
+                "order_ids": order_ids,
+            }
+            issues.append(issue)
+            _log(
+                "broker_phase_monitor_exception",
+                phase=phase,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                orders=len(order_ids),
+            )
+            for item in placed:
+                orders.append(
+                    {
+                        "ticker": item["ticker"],
+                        "action": item["action"],
+                        "quantity": item["shares"],
+                        "filled_quantity": 0.0,
+                        "exec_price": None,
+                        "currency": context.get("account_currency"),
+                        "status": "UNKNOWN",
+                        "order_id": item["order_id"],
+                        "payload": {"issue": issue},
+                    }
+                )
+            halt_execution = True
+            break
+
+        phase_has_unfilled = False
+        for item in placed:
+            order_id = item["order_id"]
+            filled = bulk_status.get(order_id) or {"id": order_id, "status": "PENDING"}
+            status = str(filled.get("status", "")).upper()
+            filled_qty = _safe_float(filled.get("filledQuantity"))
+            filled_value = _safe_float(filled.get("filledValue"))
+            exec_price = None
+            if filled_qty > 0 and filled_value > 0:
+                exec_price = filled_value / filled_qty
+            orders.append(
+                {
+                    "ticker": item["ticker"],
+                    "action": item["action"],
+                    "quantity": item["shares"],
+                    "filled_quantity": filled_qty,
+                    "exec_price": exec_price,
+                    "currency": filled.get("currency") or context.get("account_currency"),
+                    "status": status,
+                    "order_id": order_id,
+                    "payload": filled,
+                }
+            )
+            _log(
+                "broker_order_wait_result",
+                phase=phase,
+                ticker=item["ticker"],
+                order_id=order_id,
+                status=status,
+                filled_qty=filled_qty,
+                expected_qty=abs(_safe_float(item["shares"])),
+            )
+            if status != "FILLED" or not _float_close(filled_qty, abs(_safe_float(item["shares"]))):
+                issues.append(
+                    {
+                        "phase": phase,
+                        "ticker": item["ticker"],
+                        "order_id": order_id,
+                        "status": status,
+                        "filled_quantity": filled_qty,
+                        "expected_quantity": abs(_safe_float(item["shares"])),
+                        "details": "Order not fully filled; halting further order placement for this run.",
+                    }
+                )
+                phase_has_unfilled = True
+        if phase_has_unfilled:
+            _log("broker_phase_unfilled", phase=phase, details="Halting execution after this phase.")
+            halt_execution = True
+
+    _log(
+        "broker_order_execution_complete",
+        orders=len(orders),
+        missing_mappings=len(missing),
+        issues=len(issues),
+    )
+    return orders, missing, issues
 
 
 def _build_broker_positions_rows(
@@ -463,14 +663,25 @@ def _prior_broker_cost_totals(target_date: str) -> tuple[float, float]:
 
 def main():
     args = parse_args()
+    _log(
+        "daily_run_start",
+        dry_run=bool(args.dry_run),
+        skip_update=bool(args.skip_update),
+        sector=args.sector,
+        regime_scope=args.regime_scope,
+        force=bool(args.force),
+    )
     if not db_enabled():
         raise RuntimeError(
             "Database is required for production runs. Set DATABASE_URL or POSTGRES_URL."
         )
+    _log("db_init_start")
     db_init()
+    _log("db_init_complete")
 
     strategy_roots = args.strategy_roots or ["alphas"]
     strategy_names = args.strategies or list_strategy_names(strategy_roots)
+    _log("strategy_discovery_complete", strategy_roots=strategy_roots, discovered=len(strategy_names))
     if not strategy_names:
         raise ValueError("No strategies found.")
 
@@ -505,12 +716,14 @@ def main():
 
     if not strategies:
         raise ValueError("No valid strategies loaded.")
+    _log("strategy_load_complete", loaded=len(strategies))
 
     pending_entries: list[dict] = []
     pending_cash_entries: list[dict] = []
     pending_tickers: list[str] = []
     pending_exchange_map: dict[str, str] = {}
     if not args.skip_pending:
+        _log("pending_adjustments_load_start")
         pending_entries = db_load_pending_adjustments()
         for entry in pending_entries:
             entry_type = str(entry.get("type", "")).lower()
@@ -542,6 +755,13 @@ def main():
                         ex = str(item.get("exchange", "")).strip().upper()
                         if t:
                             pending_exchange_map[t] = ex or "UNKNOWN"
+    _log(
+        "pending_adjustments_load_complete",
+        entries=len(pending_entries),
+        cash_entries=len(pending_cash_entries),
+        pending_tickers=len(pending_tickers),
+        pending_exchange_overrides=len(pending_exchange_map),
+    )
 
     universe_map = _normalize_exchange_map(db_load_universe_map())
     if pending_exchange_map:
@@ -549,6 +769,7 @@ def main():
         db_replace_universe_map(universe_map)
 
     data_path = _resolve_path(args.data_file or config.DATA_FILE)
+    _log("data_load_start", data_path=data_path, skip_update=bool(args.skip_update))
     df = pd.read_parquet(data_path) if args.skip_update else None
     if df is not None:
         validate_market_data_frame(
@@ -556,6 +777,7 @@ def main():
             source=data_path,
             required_columns=["Close", "Open", "High", "Low", "Volume"],
         )
+        _log("data_load_complete", rows=len(df), columns=len(df.columns))
 
     new_tickers: list[str] = []
     if args.add_tickers:
@@ -570,6 +792,7 @@ def main():
     if new_tickers:
         new_tickers = sorted(set(new_tickers))
     if new_tickers:
+        _log("universe_add_tickers_start", requested=len(new_tickers))
         if df is None:
             df = pd.read_parquet(data_path)
             validate_market_data_frame(
@@ -588,12 +811,15 @@ def main():
             vix_ticker=args.history_vix_ticker,
         )
         added = sorted(set(df.index.get_level_values("ticker").unique()) - existing_tickers)
+        _log("universe_add_tickers_complete", added=len(added))
         if added:
             for ticker in added:
                 universe_map.setdefault(str(ticker).strip().upper(), "UNKNOWN")
             db_replace_universe_map(universe_map)
 
     if not args.skip_update:
+        update_start = time.monotonic()
+        _log("market_update_start", lookback_days=args.lookback_days, interval=args.interval)
         df = update_market_data(
             data_path,
             lookback_days=args.lookback_days,
@@ -606,13 +832,17 @@ def main():
             require_all_tickers=not args.allow_partial_updates,
             exchange_map=universe_map,
         )
+        _log("market_update_complete", elapsed_sec=round(time.monotonic() - update_start, 2))
     if df is None:
+        _log("data_reload_start", data_path=data_path)
         df = pd.read_parquet(data_path)
+        _log("data_reload_complete", rows=len(df), columns=len(df.columns))
     validate_market_data_frame(
         df,
         source=data_path,
         required_columns=["Close", "Open", "High", "Low", "Volume", "sector"],
     )
+    _log("data_validation_complete", rows=len(df), columns=len(df.columns))
 
     if "sector" not in df.columns:
         raise ValueError("Sector column missing in data; re-run data extraction with sector enabled.")
@@ -639,6 +869,12 @@ def main():
         else pd.to_datetime(sector_df.index.get_level_values("date").max()).tz_localize(None)
     )
     price_snapshot: list[dict[str, float]] = _build_price_snapshot(df, target_date)
+    _log(
+        "target_selection_complete",
+        target_date=target_date.strftime("%Y-%m-%d"),
+        sector_rows=len(sector_df),
+        snapshot_prices=len(price_snapshot),
+    )
 
     state = db_load_state()
     if state is None:
@@ -656,6 +892,13 @@ def main():
         if backfill:
             state.total_costs_usd = backfill
             costs_backfilled = True
+    _log(
+        "state_load_complete",
+        last_date=state.last_date,
+        positions=len(state.positions),
+        cash=state.cash,
+        costs_backfilled=bool(costs_backfilled),
+    )
     cash_entries: list[dict] = []
     if args.add_cash:
         cash_entries.append(
@@ -685,11 +928,13 @@ def main():
     broker_context = None
     broker_orders: list[dict] = []
     broker_missing: list[str] = []
+    broker_order_issues: list[dict] = []
     broker_account_row: dict | None = None
     broker_positions_rows: list[dict] = []
     excluded_tickers = db_load_excluded_tickers()
     state_for_trades = state
     if trading212_enabled():
+        _log("broker_integration_enabled", broker="trading212")
         broker_context = _build_trading212_context(state)
         tradable_df = _apply_universe_filter_with_exclusions(sector_df, excluded_tickers)
         _ensure_trading212_universe(
@@ -699,7 +944,11 @@ def main():
             broker_context.get("overrides") or {},
             preferred_currency=config.TRADING212_PREFERRED_CURRENCY,
         )
+    else:
+        _log("broker_integration_disabled")
 
+    trade_gen_start = time.monotonic()
+    _log("trade_generation_start")
     regime_table = compute_market_regime_table(df if args.regime_scope == "global" else sector_df)
     trades, new_state, summary = generate_trades_for_date(
         sector_df,
@@ -709,6 +958,12 @@ def main():
         regime_table=regime_table,
         strategy_selector=mapping_selector,
         excluded_tickers=excluded_tickers,
+    )
+    _log(
+        "trade_generation_complete",
+        elapsed_sec=round(time.monotonic() - trade_gen_start, 2),
+        trades=len(trades),
+        new_positions=len(new_state.positions),
     )
 
     summary["sector"] = sector
@@ -720,10 +975,18 @@ def main():
         summary["broker_discrepancies"] = broker_context.get("discrepancies")
         summary["broker_fx_rates"] = broker_context.get("fx_rates")
         summary["broker_fx_rate_gbp_per_usd"] = broker_context.get("fx_rate_gbp_per_usd")
-        broker_orders, broker_missing = _execute_trading212_orders(
+        broker_exec_start = time.monotonic()
+        broker_orders, broker_missing, broker_order_issues = _execute_trading212_orders(
             trades,
             broker_context,
             args.dry_run,
+        )
+        _log(
+            "broker_order_execution_summary",
+            elapsed_sec=round(time.monotonic() - broker_exec_start, 2),
+            orders=len(broker_orders),
+            missing=len(broker_missing),
+            issues=len(broker_order_issues),
         )
         if broker_missing:
             missing = sorted(set(broker_missing))
@@ -732,13 +995,21 @@ def main():
                 "Trading212 mapping missing for generated trades. "
                 f"Missing {len(missing)} (first 10): {', '.join(missing[:10])}"
             )
+        if broker_order_issues:
+            summary["broker_order_issues"] = broker_order_issues
+            summary["broker_order_issue_count"] = len(broker_order_issues)
+            _log("broker_order_issues_recorded", count=len(broker_order_issues))
         if args.dry_run:
             post_summary = broker_context.get("summary_raw", {})
             post_positions = broker_context.get("positions_raw", [])
         else:
             client: Trading212Client = broker_context["client"]
+            _log("broker_post_trade_snapshot_start")
             post_summary = client.get_account_summary()
             post_positions = client.get_positions()
+            _log("broker_post_trade_snapshot_complete", positions=len(post_positions))
+        broker_context["post_summary"] = post_summary
+        broker_context["post_positions"] = post_positions
         broker_account_row = _build_broker_account_row(
             post_summary,
             broker_context.get("account_currency") or "GBP",
@@ -827,8 +1098,39 @@ def main():
             summary["broker_net_worth_usd"] = broker_net_worth_gbp / fx_rate
 
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
+    state_to_persist = new_state
+    if broker_context and broker_order_issues and not args.dry_run:
+        post_positions = broker_context.get("post_positions") or broker_context.get("positions_raw", [])
+        broker_positions_internal = positions_to_internal_positions(
+            post_positions,
+            broker_context.get("overrides") or {},
+        )
+        broker_currency = str(summary.get("broker_currency") or "").strip().upper()
+        fx_rate = _safe_float(summary.get("broker_fx_rate_gbp_per_usd"), default=0.0)
+        broker_cash_after = _safe_float(summary.get("broker_cash_after"), default=new_state.cash)
+        synced_cash_usd = new_state.cash
+        if broker_currency == "USD":
+            synced_cash_usd = broker_cash_after
+        elif fx_rate > 0:
+            synced_cash_usd = broker_cash_after / fx_rate
+        state_to_persist = ProductionState(
+            last_date=new_state.last_date,
+            cash=synced_cash_usd,
+            positions=broker_positions_internal,
+            prev_weights={},
+            total_costs_usd=new_state.total_costs_usd,
+        )
+        issue_preview = ", ".join(
+            sorted({str(item.get("ticker", "")).strip().upper() for item in broker_order_issues if item.get("ticker")})[:5]
+        )
+        print(
+            "Warning: One or more Trading212 orders were not fully executed. "
+            "Persisting state from broker snapshot to avoid drift."
+            + (f" Affected tickers: {issue_preview}" if issue_preview else "")
+        )
 
     if not args.dry_run:
+        _log("db_persist_start")
         db_upsert_run_summary(summary)
         db_replace_trades(summary["date"], trades)
         if price_snapshot:
@@ -837,13 +1139,15 @@ def main():
             db_upsert_broker_account(summary["date"], "trading212", broker_account_row)
             db_replace_broker_positions(summary["date"], "trading212", broker_positions_rows)
             db_replace_broker_orders(summary["date"], "trading212", broker_orders)
-        db_upsert_state(new_state)
+        db_upsert_state(state_to_persist)
         if pending_entries:
             db_clear_pending_adjustments()
+        _log("db_persist_complete")
 
     print(f"Run date: {summary['date']}")
     print(f"Trades: {summary['num_trades']} | Net Worth: ${summary['net_worth_usd']:,.2f}")
     print(f"Sector: {sector} | Regime scope: {args.regime_scope}")
+    _log("daily_run_complete", run_date=summary["date"], trades=summary["num_trades"])
 
     if args.print_trades:
         if trades_df.empty:
@@ -853,4 +1157,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        _log(
+            "daily_run_fatal",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        raise
