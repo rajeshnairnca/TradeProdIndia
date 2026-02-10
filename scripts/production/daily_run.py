@@ -250,6 +250,42 @@ def _extract_order_id(order_response: dict) -> int | str | None:
     return None
 
 
+def _position_quantity_for_ticker(positions: list[dict], ticker: str) -> float:
+    target = str(ticker or "").strip().upper()
+    if not target:
+        return 0.0
+    total = 0.0
+    for pos in positions:
+        instrument = pos.get("instrument") if isinstance(pos, dict) else {}
+        instrument = instrument if isinstance(instrument, dict) else {}
+        pos_ticker = str(pos.get("ticker") or instrument.get("ticker") or "").strip().upper()
+        if pos_ticker != target:
+            continue
+        total += _safe_float(pos.get("quantity"))
+    return total
+
+
+def _position_quantities_by_ticker(positions: list[dict]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        instrument = pos.get("instrument")
+        instrument = instrument if isinstance(instrument, dict) else {}
+        ticker = str(pos.get("ticker") or instrument.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        totals[ticker] = totals.get(ticker, 0.0) + _safe_float(pos.get("quantity"))
+    return totals
+
+
+def _expected_position_delta(action: str, shares: float) -> float:
+    action_upper = str(action or "").strip().upper()
+    if action_upper == "SELL" or shares < 0:
+        return -abs(_safe_float(shares))
+    return abs(_safe_float(shares))
+
+
 def _build_trading212_context(state: ProductionState) -> dict:
     _log("broker_context_build_start", broker="trading212")
     client = Trading212Client()
@@ -390,12 +426,14 @@ def _execute_trading212_orders(
         return orders, missing, issues
 
     halt_execution = False
+    position_qty_by_ticker = _position_quantities_by_ticker(context.get("positions_raw") or [])
     for phase in ("SELL", "BUY"):
         if halt_execution:
             break
         phase_trades = [item for item in mapped_trades if item["phase"] == phase]
         if not phase_trades:
             continue
+        phase_start_qty_by_ticker = dict(position_qty_by_ticker)
         _log("broker_phase_place_start", phase=phase, orders=len(phase_trades))
         placed: list[dict] = []
         for item in phase_trades:
@@ -447,6 +485,7 @@ def _execute_trading212_orders(
                         "ticker": ticker,
                         "action": item["action"],
                         "shares": shares,
+                        "t212_ticker": t212_ticker,
                         "order_id": str(order_id),
                     }
                 )
@@ -521,6 +560,77 @@ def _execute_trading212_orders(
             halt_execution = True
             break
 
+        by_t212_ticker: dict[str, list[dict]] = {}
+        unresolved_by_t212_ticker: dict[str, list[dict]] = {}
+        for item in placed:
+            order_id = item["order_id"]
+            expected_qty = abs(_safe_float(item["shares"]))
+            payload = bulk_status.get(order_id) or {"id": order_id, "status": "PENDING"}
+            status = str(payload.get("status", "")).upper()
+            filled_qty = _safe_float(payload.get("filledQuantity"))
+            t212_ticker = str(item.get("t212_ticker") or "").strip().upper()
+            if t212_ticker:
+                by_t212_ticker.setdefault(t212_ticker, []).append(item)
+                if status != "FILLED" or not _float_close(filled_qty, expected_qty):
+                    unresolved_by_t212_ticker.setdefault(t212_ticker, []).append(item)
+
+        for t212_ticker, unresolved_items in unresolved_by_t212_ticker.items():
+            pre_qty = _safe_float(phase_start_qty_by_ticker.get(t212_ticker))
+            phase_items = by_t212_ticker.get(t212_ticker, [])
+            expected_delta = sum(
+                _expected_position_delta(str(item.get("action") or ""), _safe_float(item.get("shares")))
+                for item in phase_items
+            )
+            expected_post_qty = pre_qty + expected_delta
+            _log(
+                "broker_position_reconcile_start",
+                phase=phase,
+                t212_ticker=t212_ticker,
+                unresolved_orders=len(unresolved_items),
+                pre_qty=pre_qty,
+                expected_post_qty=expected_post_qty,
+            )
+            try:
+                positions = client.get_positions(ticker=t212_ticker)
+            except Exception as exc:
+                _log(
+                    "broker_position_reconcile_exception",
+                    phase=phase,
+                    t212_ticker=t212_ticker,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                continue
+            post_qty = _position_quantity_for_ticker(positions, t212_ticker)
+            _log(
+                "broker_position_reconcile_result",
+                phase=phase,
+                t212_ticker=t212_ticker,
+                positions=len(positions),
+                post_qty=post_qty,
+                expected_post_qty=expected_post_qty,
+            )
+            if not _float_close(post_qty, expected_post_qty, tol=1e-4):
+                continue
+            for unresolved in unresolved_items:
+                order_id = unresolved["order_id"]
+                shares = _safe_float(unresolved.get("shares"))
+                payload = dict(bulk_status.get(order_id) or {"id": order_id})
+                payload["status"] = "FILLED"
+                payload["filledQuantity"] = abs(shares)
+                payload["resolution"] = "reconciled_via_positions_endpoint"
+                payload["positionQuantityBefore"] = pre_qty
+                payload["positionQuantityAfter"] = post_qty
+                payload["positionQuantityExpected"] = expected_post_qty
+                bulk_status[order_id] = payload
+                _log(
+                    "broker_position_reconcile_applied",
+                    phase=phase,
+                    ticker=unresolved["ticker"],
+                    order_id=order_id,
+                    t212_ticker=t212_ticker,
+                )
+
         phase_has_unfilled = False
         for item in placed:
             order_id = item["order_id"]
@@ -566,6 +676,16 @@ def _execute_trading212_orders(
                     }
                 )
                 phase_has_unfilled = True
+            else:
+                t212_ticker = str(item.get("t212_ticker") or "").strip().upper()
+                if t212_ticker:
+                    delta = _expected_position_delta(
+                        str(item.get("action") or ""),
+                        _safe_float(item.get("shares")),
+                    )
+                    position_qty_by_ticker[t212_ticker] = (
+                        _safe_float(position_qty_by_ticker.get(t212_ticker)) + delta
+                    )
         if phase_has_unfilled:
             _log("broker_phase_unfilled", phase=phase, details="Halting execution after this phase.")
             halt_execution = True

@@ -290,9 +290,11 @@ class Trading212Client:
         seen_order: dict[str, bool] = {order_id: False for order_id in normalized_ids}
         fallback_404_count: dict[str, int] = {order_id: 0 for order_id in normalized_ids}
         round_idx = 0
-        fallback_every = 6
+        fallback_every = 3
         fallback_batch_size = 2
-        fallback_404_terminal_threshold = 2
+        fallback_404_terminal_threshold_seen = 2
+        fallback_404_terminal_threshold_unseen = 3
+        fallback_cursor = 0
 
         while time.time() <= deadline and remaining:
             round_idx += 1
@@ -309,8 +311,10 @@ class Trading212Client:
                 if oid is None:
                     continue
                 by_id[str(oid)] = order
-            unresolved = []
-            for order_id in list(remaining):
+            unresolved: list[str] = []
+            for order_id in normalized_ids:
+                if order_id not in remaining:
+                    continue
                 payload = by_id.get(order_id)
                 if payload is None:
                     unresolved.append(order_id)
@@ -323,21 +327,37 @@ class Trading212Client:
                     remaining.remove(order_id)
 
             if unresolved and round_idx % fallback_every == 0:
-                for order_id in list(unresolved)[:fallback_batch_size]:
+                fallback_unresolved = list(unresolved)
+                fallback_count = min(fallback_batch_size, len(fallback_unresolved))
+                for _ in range(fallback_count):
+                    if not fallback_unresolved:
+                        break
+                    idx = fallback_cursor % len(fallback_unresolved)
+                    order_id = fallback_unresolved.pop(idx)
+                    fallback_cursor += 1
                     try:
                         payload = self.get_order(order_id)
                     except Trading212ApiError as exc:
                         if exc.status_code == 404:
                             fallback_404_count[order_id] = fallback_404_count.get(order_id, 0) + 1
+                            threshold = (
+                                fallback_404_terminal_threshold_seen
+                                if seen_order.get(order_id, False)
+                                else fallback_404_terminal_threshold_unseen
+                            )
                             if (
-                                seen_order.get(order_id, False)
-                                and fallback_404_count[order_id] >= fallback_404_terminal_threshold
+                                fallback_404_count[order_id] >= threshold
                                 and order_id in remaining
                             ):
+                                resolution = (
+                                    "not_returned_by_orders_endpoints_after_seen"
+                                    if seen_order.get(order_id, False)
+                                    else "not_returned_by_orders_endpoints"
+                                )
                                 snapshots[order_id] = {
                                     "id": order_id,
                                     "status": "UNKNOWN",
-                                    "resolution": "not_returned_by_orders_endpoints_after_seen",
+                                    "resolution": resolution,
                                 }
                                 remaining.remove(order_id)
                                 print(

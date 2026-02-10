@@ -36,12 +36,15 @@ class _FakeClient:
         self,
         bulk_statuses: list[dict[str, dict]] | None = None,
         raise_on_wait: Exception | None = None,
+        positions_by_ticker: dict[str, list[dict]] | None = None,
     ) -> None:
         self.place_calls = 0
         self.wait_calls = 0
+        self.position_calls = 0
         self.placed: list[dict] = []
         self.bulk_statuses = bulk_statuses or []
         self.raise_on_wait = raise_on_wait
+        self.positions_by_ticker = positions_by_ticker or {}
 
     def place_market_order(self, ticker: str, quantity: float) -> dict:
         self.place_calls += 1
@@ -61,8 +64,15 @@ class _FakeClient:
             for order_id in order_ids
         }
 
+    def get_positions(self, ticker: str | None = None) -> list[dict]:
+        self.position_calls += 1
+        if not ticker:
+            return []
+        rows = self.positions_by_ticker.get(str(ticker), [])
+        return [dict(row) for row in rows]
 
-def _context_with_two_tickers(client: _FakeClient) -> dict:
+
+def _context_with_two_tickers(client: _FakeClient, positions_raw: list[dict] | None = None) -> dict:
     by_ticker = {
         "AAPL_US_EQ": {"ticker": "AAPL_US_EQ", "currencyCode": "USD", "type": "STOCK"},
         "MSFT_US_EQ": {"ticker": "MSFT_US_EQ", "currencyCode": "USD", "type": "STOCK"},
@@ -77,6 +87,7 @@ def _context_with_two_tickers(client: _FakeClient) -> dict:
         "by_symbol": by_symbol,
         "overrides": {},
         "account_currency": "USD",
+        "positions_raw": positions_raw or [],
     }
 
 
@@ -135,3 +146,30 @@ def test_execute_orders_places_sells_before_buys() -> None:
     assert len(orders) == 2
     assert client.placed[0]["ticker"] == "MSFT_US_EQ"
     assert client.placed[1]["ticker"] == "AAPL_US_EQ"
+
+
+def test_execute_orders_reconciles_unresolved_status_with_positions_endpoint() -> None:
+    client = _FakeClient(
+        bulk_statuses=[
+            {"order-1": {"id": "order-1", "status": "NEW", "filledQuantity": 0.0}},
+        ],
+        positions_by_ticker={
+            "AAPL_US_EQ": [
+                {
+                    "ticker": "AAPL_US_EQ",
+                    "quantity": 3.0,
+                    "instrument": {"ticker": "AAPL_US_EQ"},
+                }
+            ]
+        },
+    )
+    context = _context_with_two_tickers(client, positions_raw=[])
+    trades = [{"ticker": "AAPL", "action": "BUY", "shares": 3}]
+    orders, missing, issues = _execute_trading212_orders(trades, context, dry_run=False)
+    assert missing == []
+    assert issues == []
+    assert len(orders) == 1
+    assert orders[0]["status"] == "FILLED"
+    assert orders[0]["filled_quantity"] == 3.0
+    assert orders[0]["payload"]["resolution"] == "reconciled_via_positions_endpoint"
+    assert client.position_calls >= 1

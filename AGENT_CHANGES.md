@@ -216,6 +216,9 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Extended `tests/test_trading212.py` with coverage for fallback `429` handling in bulk monitoring and positive backoff behavior when `Retry-After: 0` is returned.
 - Improved terminal resolution in `src/trading212.py::wait_for_orders(...)` for broker-side “seen then disappears” behavior: if an order was previously observed and repeated fallback lookups return `404`, it is now marked as terminal `UNKNOWN` (with explicit resolution metadata) instead of staying unresolved until timeout.
 - Added regression coverage in `tests/test_trading212.py` for the “seen in bulk list, then missing + fallback 404” resolution path.
+- Further hardened `src/trading212.py::wait_for_orders(...)` with fair round-robin fallback checks (avoids repeatedly probing only the same unresolved IDs), faster fallback cadence, and terminal `UNKNOWN` resolution for repeated fallback `404` responses even when an order ID was never seen in bulk listings.
+- Added Trading212 unresolved-order reconciliation in `scripts/production/daily_run.py`: when bulk order monitoring does not confirm fill, the run now queries `GET /equity/positions?ticker=...` and marks orders as `FILLED` if position quantity matches expected post-trade quantity, with explicit reconciliation logs/metadata.
+- Extended `tests/test_daily_run_trading212_execution.py` with a regression test that verifies unresolved `NEW` order status can be correctly reconciled to `FILLED` via the positions endpoint.
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.
