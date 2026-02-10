@@ -214,6 +214,8 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Adjusted Trading212 retry behavior in `src/trading212.py::_request(...)` to ignore zero-second `Retry-After` values and use exponential backoff instead, reducing immediate retry storms under broker rate limiting.
 - Tuned `src/trading212.py::wait_for_orders(...)` to reduce fallback pressure (`GET /equity/orders/{id}` less frequently and in small batches) and treat fallback `429` as transient rather than failing the whole monitor cycle.
 - Extended `tests/test_trading212.py` with coverage for fallback `429` handling in bulk monitoring and positive backoff behavior when `Retry-After: 0` is returned.
+- Improved terminal resolution in `src/trading212.py::wait_for_orders(...)` for broker-side “seen then disappears” behavior: if an order was previously observed and repeated fallback lookups return `404`, it is now marked as terminal `UNKNOWN` (with explicit resolution metadata) instead of staying unresolved until timeout.
+- Added regression coverage in `tests/test_trading212.py` for the “seen in bulk list, then missing + fallback 404” resolution path.
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.

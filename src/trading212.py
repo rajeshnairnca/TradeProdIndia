@@ -287,9 +287,12 @@ class Trading212Client:
         poll = poll_sec if poll_sec is not None else config.TRADING212_ORDER_POLL_SEC
         deadline = time.time() + float(timeout)
         remaining = set(normalized_ids)
+        seen_order: dict[str, bool] = {order_id: False for order_id in normalized_ids}
+        fallback_404_count: dict[str, int] = {order_id: 0 for order_id in normalized_ids}
         round_idx = 0
         fallback_every = 6
         fallback_batch_size = 2
+        fallback_404_terminal_threshold = 2
 
         while time.time() <= deadline and remaining:
             round_idx += 1
@@ -312,6 +315,8 @@ class Trading212Client:
                 if payload is None:
                     unresolved.append(order_id)
                     continue
+                seen_order[order_id] = True
+                fallback_404_count[order_id] = 0
                 snapshots[order_id] = payload
                 status = str(payload.get("status", "")).upper()
                 if status in {"FILLED", "REJECTED", "CANCELLED"}:
@@ -322,10 +327,33 @@ class Trading212Client:
                     try:
                         payload = self.get_order(order_id)
                     except Trading212ApiError as exc:
-                        if exc.status_code in {404, 429}:
+                        if exc.status_code == 404:
+                            fallback_404_count[order_id] = fallback_404_count.get(order_id, 0) + 1
+                            if (
+                                seen_order.get(order_id, False)
+                                and fallback_404_count[order_id] >= fallback_404_terminal_threshold
+                                and order_id in remaining
+                            ):
+                                snapshots[order_id] = {
+                                    "id": order_id,
+                                    "status": "UNKNOWN",
+                                    "resolution": "not_returned_by_orders_endpoints_after_seen",
+                                }
+                                remaining.remove(order_id)
+                                print(
+                                    (
+                                        f"[Trading212Client] bulk order monitor inferred terminal "
+                                        f"status=UNKNOWN for order_id={order_id} after repeated 404 fallback lookups"
+                                    ),
+                                    flush=True,
+                                )
+                            continue
+                        if exc.status_code == 429:
                             continue
                         raise
                     snapshots[order_id] = payload
+                    seen_order[order_id] = True
+                    fallback_404_count[order_id] = 0
                     status = str(payload.get("status", "")).upper()
                     if status in {"FILLED", "REJECTED", "CANCELLED"} and order_id in remaining:
                         remaining.remove(order_id)

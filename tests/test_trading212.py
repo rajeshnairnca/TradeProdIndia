@@ -211,6 +211,42 @@ def test_wait_for_orders_handles_fallback_429_as_transient(
     assert calls["get_order"] >= 2
 
 
+def test_wait_for_orders_marks_seen_then_missing_orders_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Trading212Client(
+        credentials=Trading212Credentials(api_key="k", api_secret="s"),
+        base_url="https://demo.trading212.com/api/v0",
+        timeout=0.1,
+    )
+    calls = {"get_orders": 0, "get_order": 0}
+
+    def fake_get_orders() -> list[dict]:
+        calls["get_orders"] += 1
+        if calls["get_orders"] == 1:
+            return [{"id": "abc-3", "status": "NEW"}]
+        return []
+
+    def fake_get_order(order_id: int | str) -> dict:
+        calls["get_order"] += 1
+        raise Trading212ApiError(
+            status_code=404,
+            response_text='{"detail":"Order not found"}',
+            method="GET",
+            url=f"https://demo.trading212.com/api/v0/equity/orders/{order_id}",
+            reason="Not Found",
+        )
+
+    monkeypatch.setattr(client, "get_orders", fake_get_orders)
+    monkeypatch.setattr(client, "get_order", fake_get_order)
+    monkeypatch.setattr("src.trading212.time.sleep", lambda _: None)
+
+    snapshots = client.wait_for_orders(["abc-3"], timeout_sec=0.5, poll_sec=0.0)
+    assert snapshots["abc-3"]["status"] == "UNKNOWN"
+    assert snapshots["abc-3"]["resolution"] == "not_returned_by_orders_endpoints_after_seen"
+    assert calls["get_order"] >= 2
+
+
 def test_request_uses_exponential_backoff_when_retry_after_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
