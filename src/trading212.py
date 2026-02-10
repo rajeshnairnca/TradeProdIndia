@@ -172,7 +172,7 @@ class Trading212Client:
                     reason=response.reason,
                 )
             retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
-            if retry_after is None:
+            if retry_after is None or retry_after <= 0:
                 retry_after = min(max_sleep, base_sleep * (2 ** attempt))
             retry_after = max(0.0, retry_after)
             print(
@@ -287,16 +287,16 @@ class Trading212Client:
         poll = poll_sec if poll_sec is not None else config.TRADING212_ORDER_POLL_SEC
         deadline = time.time() + float(timeout)
         remaining = set(normalized_ids)
-        missing_rounds: dict[str, int] = {order_id: 0 for order_id in normalized_ids}
         round_idx = 0
-        fallback_every = 3
+        fallback_every = 6
+        fallback_batch_size = 2
 
         while time.time() <= deadline and remaining:
             round_idx += 1
             try:
                 orders = self.get_orders()
             except Trading212ApiError as exc:
-                if exc.status_code == 404:
+                if exc.status_code in {404, 429}:
                     time.sleep(float(poll))
                     continue
                 raise
@@ -310,21 +310,19 @@ class Trading212Client:
             for order_id in list(remaining):
                 payload = by_id.get(order_id)
                 if payload is None:
-                    missing_rounds[order_id] = missing_rounds.get(order_id, 0) + 1
                     unresolved.append(order_id)
                     continue
-                missing_rounds[order_id] = 0
                 snapshots[order_id] = payload
                 status = str(payload.get("status", "")).upper()
                 if status in {"FILLED", "REJECTED", "CANCELLED"}:
                     remaining.remove(order_id)
 
             if unresolved and round_idx % fallback_every == 0:
-                for order_id in list(unresolved):
+                for order_id in list(unresolved)[:fallback_batch_size]:
                     try:
                         payload = self.get_order(order_id)
                     except Trading212ApiError as exc:
-                        if exc.status_code == 404:
+                        if exc.status_code in {404, 429}:
                             continue
                         raise
                     snapshots[order_id] = payload

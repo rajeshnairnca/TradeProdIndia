@@ -175,3 +175,68 @@ def test_wait_for_orders_uses_get_order_fallback_for_missing_bulk_entries(
     snapshots = client.wait_for_orders(["abc-1"], timeout_sec=0.2, poll_sec=0.0)
     assert snapshots["abc-1"]["status"] == "FILLED"
     assert bulk_calls["count"] >= 3
+
+
+def test_wait_for_orders_handles_fallback_429_as_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Trading212Client(
+        credentials=Trading212Credentials(api_key="k", api_secret="s"),
+        base_url="https://demo.trading212.com/api/v0",
+        timeout=0.1,
+    )
+    calls = {"get_order": 0}
+
+    def fake_get_orders() -> list[dict]:
+        return []
+
+    def fake_get_order(order_id: int | str) -> dict:
+        calls["get_order"] += 1
+        if calls["get_order"] < 2:
+            raise Trading212ApiError(
+                status_code=429,
+                response_text='{"errorMessage":"too many requests"}',
+                method="GET",
+                url=f"https://demo.trading212.com/api/v0/equity/orders/{order_id}",
+                reason="Too Many Requests",
+            )
+        return {"id": str(order_id), "status": "FILLED", "filledQuantity": 1.0}
+
+    monkeypatch.setattr(client, "get_orders", fake_get_orders)
+    monkeypatch.setattr(client, "get_order", fake_get_order)
+    monkeypatch.setattr("src.trading212.time.sleep", lambda _: None)
+
+    snapshots = client.wait_for_orders(["abc-2"], timeout_sec=0.5, poll_sec=0.0)
+    assert snapshots["abc-2"]["status"] == "FILLED"
+    assert calls["get_order"] >= 2
+
+
+def test_request_uses_exponential_backoff_when_retry_after_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Trading212Client(
+        credentials=Trading212Credentials(api_key="k", api_secret="s"),
+        base_url="https://demo.trading212.com/api/v0",
+        timeout=0.1,
+    )
+    responses = [
+        _FakeResponse(
+            status_code=429,
+            text='{"errorMessage":"too many requests"}',
+            reason="Too Many Requests",
+            headers={"Retry-After": "0"},
+        ),
+        _FakeResponse(status_code=200, text='{"currencyCode":"GBP"}', reason="OK"),
+    ]
+    sleeps: list[float] = []
+
+    def fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return responses.pop(0)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+    monkeypatch.setattr("src.trading212.time.sleep", lambda sec: sleeps.append(float(sec)))
+
+    data = client.get_account_summary()
+    assert data.get("currencyCode") == "GBP"
+    assert sleeps
+    assert sleeps[0] > 0.0
