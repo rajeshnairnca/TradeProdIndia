@@ -42,6 +42,7 @@ from src.strategy import list_strategy_names, load_strategies
 from src.universe import NASDAQ100_TICKERS
 from src.universe_quality import apply_quality_filter
 from src.trading212 import (
+    Trading212ApiError,
     Trading212Client,
     account_cash_available,
     account_net_worth,
@@ -1005,8 +1006,30 @@ def main():
         else:
             client: Trading212Client = broker_context["client"]
             _log("broker_post_trade_snapshot_start")
-            post_summary = client.get_account_summary()
-            post_positions = client.get_positions()
+            try:
+                post_summary = client.get_account_summary()
+            except Trading212ApiError as exc:
+                post_summary = broker_context.get("summary_raw", {}) or {}
+                summary["broker_snapshot_warning"] = (
+                    "Using pre-trade account summary due to post-trade snapshot rate limit/error."
+                )
+                _log(
+                    "broker_post_trade_summary_failed",
+                    status_code=exc.status_code,
+                    error=str(exc),
+                )
+            try:
+                post_positions = client.get_positions()
+            except Trading212ApiError as exc:
+                post_positions = broker_context.get("positions_raw", []) or []
+                summary["broker_snapshot_warning"] = (
+                    "Using pre-trade positions due to post-trade snapshot rate limit/error."
+                )
+                _log(
+                    "broker_post_trade_positions_failed",
+                    status_code=exc.status_code,
+                    error=str(exc),
+                )
             _log("broker_post_trade_snapshot_complete", positions=len(post_positions))
         broker_context["post_summary"] = post_summary
         broker_context["post_positions"] = post_positions

@@ -5,6 +5,8 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -82,6 +84,7 @@ class Trading212Client:
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Any:
+        method_upper = str(method).upper()
         if path.startswith("http://") or path.startswith("https://"):
             url = path
         else:
@@ -92,25 +95,49 @@ class Trading212Client:
             "Authorization": _auth_header(self.credentials),
             "Content-Type": "application/json",
         }
-        response = self._session.request(
-            method=method,
-            url=url,
-            params=params,
-            json=payload,
-            headers=headers,
-            timeout=self.timeout,
-        )
-        if response.status_code >= 400:
-            raise Trading212ApiError(
-                status_code=response.status_code,
-                response_text=response.text,
-                method=method,
+        retries = max(0, int(config.TRADING212_HTTP_MAX_RETRIES))
+        base_sleep = max(0.0, float(config.TRADING212_HTTP_RETRY_BASE_SEC))
+        max_sleep = max(base_sleep, float(config.TRADING212_HTTP_RETRY_MAX_SEC))
+        attempt = 0
+        while True:
+            response = self._session.request(
+                method=method_upper,
                 url=url,
-                reason=response.reason,
+                params=params,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
             )
-        if not response.text:
-            return None
-        return response.json()
+            if response.status_code < 400:
+                if not response.text:
+                    return None
+                return response.json()
+            can_retry = (
+                method_upper == "GET"
+                and response.status_code in {429, 500, 502, 503, 504}
+                and attempt < retries
+            )
+            if not can_retry:
+                raise Trading212ApiError(
+                    status_code=response.status_code,
+                    response_text=response.text,
+                    method=method_upper,
+                    url=url,
+                    reason=response.reason,
+                )
+            retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+            if retry_after is None:
+                retry_after = min(max_sleep, base_sleep * (2 ** attempt))
+            retry_after = max(0.0, retry_after)
+            print(
+                (
+                    f"[Trading212Client] retrying {method_upper} {url} after {retry_after:.2f}s "
+                    f"(status={response.status_code}, attempt={attempt + 1}/{retries})"
+                ),
+                flush=True,
+            )
+            time.sleep(retry_after)
+            attempt += 1
 
     def get_account_summary(self) -> dict[str, Any]:
         data = self._request("GET", "/equity/account/summary")
@@ -251,6 +278,26 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _float_close(a: float, b: float, tol: float = 1e-6) -> bool:
     return abs(a - b) <= tol
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
 
 
 def load_instruments_cache(client: Trading212Client) -> list[dict[str, Any]]:

@@ -204,6 +204,9 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Reworked Trading212 execution in `scripts/production/daily_run.py` to run in two phases (`SELL` first, then `BUY`), placing each phase's orders first and then monitoring those placed IDs in bulk.
 - Added bulk orders API support in `src/trading212.py` (`get_orders()` -> `GET /equity/orders`) plus `wait_for_orders(...)` for timeout/poll-driven bulk status tracking of multiple order IDs.
 - Updated execution tests to validate bulk monitoring behavior and `SELL`-before-`BUY` placement ordering.
+- Added GET request retry/backoff handling in `src/trading212.py` for temporary broker/API throttling (`429`) and transient server errors (`5xx`), with configurable retry limits/backoff via new config keys (`TRADING212_HTTP_MAX_RETRIES`, `TRADING212_HTTP_RETRY_BASE_SEC`, `TRADING212_HTTP_RETRY_MAX_SEC`).
+- Hardened post-trade broker snapshot refresh in `scripts/production/daily_run.py` so rate-limited snapshot calls no longer crash the run; the workflow now logs snapshot failures and falls back to pre-trade snapshot data when necessary.
+- Extended `tests/test_trading212.py` with retry behavior coverage (GET retry-on-429 success path and no-retry-on-POST 429 safety check).
 
 ## 2026-02-08
 - Added a standalone Technology candidate monitor workflow (`scripts/backtesting/tech_universe_monitor.py`) that scans a broad TradingView catalog, applies TradingView prechecks + sector filtering + existing universe quality gates, tracks pass streaks across runs, and outputs manual review/potential-addition lists without mutating production universe files.

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from src.trading212 import (
@@ -79,3 +81,71 @@ def test_wait_for_fill_raises_non_404_errors(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(client, "get_order", fake_get_order)
     with pytest.raises(Trading212ApiError):
         client.wait_for_fill(order_id=123, expected_qty=1.0, timeout_sec=0.1, poll_sec=0.0)
+
+
+class _FakeResponse:
+    def __init__(
+        self,
+        status_code: int,
+        text: str,
+        reason: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.reason = reason
+        self.headers = headers or {}
+
+    def json(self) -> dict:
+        return json.loads(self.text)
+
+
+def test_request_retries_get_429_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = Trading212Client(
+        credentials=Trading212Credentials(api_key="k", api_secret="s"),
+        base_url="https://demo.trading212.com/api/v0",
+        timeout=0.1,
+    )
+    responses = [
+        _FakeResponse(
+            status_code=429,
+            text='{"errorMessage":"too many requests"}',
+            reason="Too Many Requests",
+            headers={"Retry-After": "0"},
+        ),
+        _FakeResponse(status_code=200, text='{"currencyCode":"GBP"}', reason="OK"),
+    ]
+    calls = {"count": 0}
+
+    def fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        return responses.pop(0)
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+    monkeypatch.setattr("src.trading212.time.sleep", lambda _: None)
+    data = client.get_account_summary()
+    assert data.get("currencyCode") == "GBP"
+    assert calls["count"] == 2
+
+
+def test_request_does_not_retry_post_on_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = Trading212Client(
+        credentials=Trading212Credentials(api_key="k", api_secret="s"),
+        base_url="https://demo.trading212.com/api/v0",
+        timeout=0.1,
+    )
+    calls = {"count": 0}
+
+    def fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        return _FakeResponse(
+            status_code=429,
+            text='{"errorMessage":"too many requests"}',
+            reason="Too Many Requests",
+            headers={"Retry-After": "0"},
+        )
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+    with pytest.raises(Trading212ApiError):
+        client.place_market_order("AAPL_US_EQ", 1.0)
+    assert calls["count"] == 1
