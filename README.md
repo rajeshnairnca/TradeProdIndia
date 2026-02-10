@@ -92,6 +92,13 @@ Backfill Postgres (requires `DATABASE_URL` / `POSTGRES_URL`):
 python3 scripts/production/backfill_db.py
 ```
 
+Sync universe exchange mapping JSON into Postgres:
+
+```bash
+python3 scripts/production/sync_universe_map.py --dry-run
+python3 scripts/production/sync_universe_map.py
+```
+
 ## Production API
 
 Start the API server:

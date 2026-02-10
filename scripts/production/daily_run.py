@@ -5,6 +5,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
@@ -263,6 +264,304 @@ def _position_quantity_for_ticker(positions: list[dict], ticker: str) -> float:
             continue
         total += _safe_float(pos.get("quantity"))
     return total
+
+
+def _history_order_id(item: dict) -> str | None:
+    order = item.get("order")
+    if isinstance(order, dict):
+        order_id = order.get("id")
+        if order_id is not None and str(order_id).strip():
+            return str(order_id).strip()
+    for key in ("orderId", "order_id", "id"):
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _history_status(item: dict) -> str:
+    order = item.get("order")
+    if isinstance(order, dict):
+        status = str(order.get("status") or "").strip().upper()
+        if status:
+            return status
+    status = str(item.get("status") or "").strip().upper()
+    if status:
+        return status
+    fill = item.get("fill")
+    if isinstance(fill, dict) and _safe_float(fill.get("quantity")) > 0:
+        return "FILLED"
+    return "UNKNOWN"
+
+
+def _history_fill_snapshot(item: dict) -> dict:
+    fill = item.get("fill")
+    fill = fill if isinstance(fill, dict) else {}
+    order = item.get("order")
+    order = order if isinstance(order, dict) else {}
+    filled_qty = _safe_float(fill.get("quantity"))
+    if filled_qty <= 0:
+        filled_qty = _safe_float(item.get("filledQuantity"))
+    fill_price = _safe_float(fill.get("price"))
+    fill_value = _safe_float(fill.get("value"))
+    if fill_value <= 0:
+        fill_value = _safe_float(item.get("filledValue"))
+    if fill_value <= 0 and filled_qty > 0 and fill_price > 0:
+        fill_value = filled_qty * fill_price
+    payload: dict = {
+        "status": _history_status(item),
+        "historyStatusSource": "history.orders",
+    }
+    if filled_qty > 0:
+        payload["filledQuantity"] = filled_qty
+    if fill_value > 0:
+        payload["filledValue"] = fill_value
+    if fill_price > 0:
+        payload["resolutionPriceSource"] = "history.orders.fill.price"
+    currency = (
+        fill.get("currencyCode")
+        or fill.get("currency")
+        or item.get("currencyCode")
+        or item.get("currency")
+        or order.get("currencyCode")
+        or order.get("currency")
+    )
+    if currency:
+        payload["currency"] = str(currency)
+    return payload
+
+
+def _next_history_cursor(page: dict) -> str | None:
+    direct_keys = ("nextCursor", "nextPageCursor")
+    for key in direct_keys:
+        value = page.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    pagination = page.get("pagination")
+    if isinstance(pagination, dict):
+        for key in direct_keys:
+            value = pagination.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    for key in ("nextPagePath", "next"):
+        path = page.get(key)
+        if not path:
+            continue
+        parsed = urlparse(str(path))
+        query = parse_qs(parsed.query)
+        for query_key in ("cursor", "nextCursor", "pageToken"):
+            values = query.get(query_key)
+            if values and str(values[0]).strip():
+                return str(values[0]).strip()
+    return None
+
+
+def _load_history_order_updates(
+    client: Trading212Client,
+    order_ids: list[str],
+    page_limit: int = 50,
+    max_pages: int = 1,
+) -> dict[str, dict]:
+    target_ids = {str(order_id).strip() for order_id in order_ids if str(order_id).strip()}
+    if not target_ids:
+        return {}
+    updates: dict[str, dict] = {}
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    for page_idx in range(1, max_pages + 1):
+        if len(updates) >= len(target_ids):
+            break
+        page = client.get_historical_orders(limit=page_limit, cursor=cursor)
+        items = page.get("items")
+        if not isinstance(items, list):
+            items = []
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+            order_id = _history_order_id(raw_item)
+            if not order_id or order_id not in target_ids:
+                continue
+            updates[order_id] = _history_fill_snapshot(raw_item)
+        _log(
+            "broker_history_orders_page",
+            page=page_idx,
+            requested=len(target_ids),
+            found=len(updates),
+            items=len(items),
+        )
+        cursor = _next_history_cursor(page)
+        if not cursor:
+            break
+        if cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+    return updates
+
+
+def _monitor_orders_with_positions_and_history(
+    client: Trading212Client,
+    placed: list[dict],
+    phase: str,
+    phase_start_qty_by_ticker: dict[str, float],
+) -> dict[str, dict]:
+    tracked: dict[str, dict] = {
+        str(item["order_id"]): item for item in placed if str(item.get("order_id") or "").strip()
+    }
+    snapshots: dict[str, dict] = {
+        order_id: {"id": order_id, "status": "PENDING"} for order_id in tracked
+    }
+    unresolved: set[str] = set(tracked.keys())
+    if not unresolved:
+        return snapshots
+
+    timeout_sec = max(1.0, float(config.TRADING212_ORDER_TIMEOUT))
+    positions_poll_sec = max(1.0, float(getattr(config, "TRADING212_POSITIONS_POLL_SEC", 1.0)))
+    history_poll_sec = max(10.0, float(getattr(config, "TRADING212_HISTORY_POLL_SEC", 10.0)))
+    history_page_limit = max(1, int(getattr(config, "TRADING212_HISTORY_PAGE_LIMIT", 50)))
+    history_max_pages = max(1, int(getattr(config, "TRADING212_HISTORY_MAX_PAGES", 1)))
+
+    by_t212_ticker: dict[str, list[dict]] = {}
+    for item in placed:
+        t212_ticker = str(item.get("t212_ticker") or "").strip().upper()
+        if t212_ticker:
+            by_t212_ticker.setdefault(t212_ticker, []).append(item)
+    expected_post_qty: dict[str, float] = {}
+    for t212_ticker, ticker_items in by_t212_ticker.items():
+        expected_delta = sum(
+            _expected_position_delta(str(item.get("action") or ""), _safe_float(item.get("shares")))
+            for item in ticker_items
+        )
+        expected_post_qty[t212_ticker] = _safe_float(phase_start_qty_by_ticker.get(t212_ticker)) + expected_delta
+
+    _log(
+        "broker_phase_monitor_mode",
+        phase=phase,
+        mode="positions_plus_history",
+        positions_poll_sec=positions_poll_sec,
+        history_poll_sec=history_poll_sec,
+        history_page_limit=history_page_limit,
+    )
+    deadline = time.time() + timeout_sec
+    next_positions_at = 0.0
+    next_history_at = 0.0
+
+    while time.time() <= deadline and unresolved:
+        now = time.time()
+        did_work = False
+
+        if now >= next_positions_at:
+            positions = client.get_positions()
+            quantities = _position_quantities_by_ticker(positions)
+            for t212_ticker, ticker_items in by_t212_ticker.items():
+                remaining_items = [
+                    item for item in ticker_items if str(item.get("order_id") or "").strip() in unresolved
+                ]
+                if not remaining_items:
+                    continue
+                pre_qty = _safe_float(phase_start_qty_by_ticker.get(t212_ticker))
+                post_qty = _safe_float(quantities.get(t212_ticker))
+                expected_qty = _safe_float(expected_post_qty.get(t212_ticker))
+                _log(
+                    "broker_position_reconcile_result",
+                    phase=phase,
+                    t212_ticker=t212_ticker,
+                    post_qty=post_qty,
+                    expected_post_qty=expected_qty,
+                    unresolved_orders=len(remaining_items),
+                )
+                if not _float_close(post_qty, expected_qty, tol=1e-4):
+                    continue
+                for item in remaining_items:
+                    order_id = str(item["order_id"])
+                    shares = _safe_float(item.get("shares"))
+                    payload = dict(snapshots.get(order_id) or {"id": order_id})
+                    payload["status"] = "FILLED"
+                    payload["filledQuantity"] = abs(shares)
+                    payload["resolution"] = "reconciled_via_positions_endpoint"
+                    payload["positionQuantityBefore"] = pre_qty
+                    payload["positionQuantityAfter"] = post_qty
+                    payload["positionQuantityExpected"] = expected_qty
+                    snapshots[order_id] = payload
+                    unresolved.discard(order_id)
+                    _log(
+                        "broker_position_reconcile_applied",
+                        phase=phase,
+                        ticker=item["ticker"],
+                        order_id=order_id,
+                        t212_ticker=t212_ticker,
+                    )
+            next_positions_at = now + positions_poll_sec
+            did_work = True
+
+        if unresolved and now >= next_history_at:
+            updates = _load_history_order_updates(
+                client=client,
+                order_ids=sorted(unresolved),
+                page_limit=history_page_limit,
+                max_pages=history_max_pages,
+            )
+            for order_id, patch in updates.items():
+                current = dict(snapshots.get(order_id) or {"id": order_id})
+                for key, value in patch.items():
+                    if key == "status":
+                        current_status = str(current.get("status") or "").strip().upper()
+                        if current_status == "FILLED" and value != "FILLED":
+                            continue
+                    current[key] = value
+                if "resolution" not in current:
+                    current["resolution"] = "resolved_via_history_orders_endpoint"
+                snapshots[order_id] = current
+                status = str(current.get("status") or "").upper()
+                if status in {"FILLED", "REJECTED", "CANCELLED"}:
+                    unresolved.discard(order_id)
+                    _log(
+                        "broker_history_order_resolved",
+                        phase=phase,
+                        order_id=order_id,
+                        status=status,
+                    )
+            next_history_at = now + history_poll_sec
+            did_work = True
+
+        if unresolved:
+            if not did_work:
+                next_tick = min(next_positions_at, next_history_at)
+                sleep_for = max(0.05, min(0.5, next_tick - time.time()))
+                time.sleep(sleep_for)
+            continue
+
+    history_price_targets = [
+        order_id
+        for order_id, payload in snapshots.items()
+        if str(payload.get("status") or "").upper() == "FILLED"
+        and _safe_float(payload.get("filledQuantity")) > 0
+        and _safe_float(payload.get("filledValue")) <= 0
+    ]
+    if history_price_targets:
+        updates = _load_history_order_updates(
+            client=client,
+            order_ids=history_price_targets,
+            page_limit=history_page_limit,
+            max_pages=history_max_pages,
+        )
+        for order_id, patch in updates.items():
+            current = dict(snapshots.get(order_id) or {"id": order_id})
+            if _safe_float(current.get("filledValue")) > 0:
+                continue
+            if _safe_float(patch.get("filledValue")) > 0:
+                current["filledValue"] = patch["filledValue"]
+                if patch.get("resolutionPriceSource"):
+                    current["resolutionPriceSource"] = patch["resolutionPriceSource"]
+                snapshots[order_id] = current
+                _log(
+                    "broker_history_fill_price_applied",
+                    phase=phase,
+                    order_id=order_id,
+                    filled_qty=_safe_float(current.get("filledQuantity")),
+                    filled_value=_safe_float(current.get("filledValue")),
+                )
+
+    return snapshots
 
 
 def _position_quantities_by_ticker(positions: list[dict]) -> dict[str, float]:
@@ -527,11 +826,16 @@ def _execute_trading212_orders(
         order_ids = [item["order_id"] for item in placed]
         _log("broker_phase_monitor_start", phase=phase, orders=len(order_ids), order_ids=order_ids)
         try:
-            bulk_status = client.wait_for_orders(order_ids)
+            bulk_status = _monitor_orders_with_positions_and_history(
+                client=client,
+                placed=placed,
+                phase=phase,
+                phase_start_qty_by_ticker=phase_start_qty_by_ticker,
+            )
         except Exception as exc:
             issue = {
                 "phase": phase,
-                "error": "bulk_status_error",
+                "error": "order_monitor_error",
                 "details": str(exc),
                 "order_ids": order_ids,
             }
@@ -559,77 +863,6 @@ def _execute_trading212_orders(
                 )
             halt_execution = True
             break
-
-        by_t212_ticker: dict[str, list[dict]] = {}
-        unresolved_by_t212_ticker: dict[str, list[dict]] = {}
-        for item in placed:
-            order_id = item["order_id"]
-            expected_qty = abs(_safe_float(item["shares"]))
-            payload = bulk_status.get(order_id) or {"id": order_id, "status": "PENDING"}
-            status = str(payload.get("status", "")).upper()
-            filled_qty = _safe_float(payload.get("filledQuantity"))
-            t212_ticker = str(item.get("t212_ticker") or "").strip().upper()
-            if t212_ticker:
-                by_t212_ticker.setdefault(t212_ticker, []).append(item)
-                if status != "FILLED" or not _float_close(filled_qty, expected_qty):
-                    unresolved_by_t212_ticker.setdefault(t212_ticker, []).append(item)
-
-        for t212_ticker, unresolved_items in unresolved_by_t212_ticker.items():
-            pre_qty = _safe_float(phase_start_qty_by_ticker.get(t212_ticker))
-            phase_items = by_t212_ticker.get(t212_ticker, [])
-            expected_delta = sum(
-                _expected_position_delta(str(item.get("action") or ""), _safe_float(item.get("shares")))
-                for item in phase_items
-            )
-            expected_post_qty = pre_qty + expected_delta
-            _log(
-                "broker_position_reconcile_start",
-                phase=phase,
-                t212_ticker=t212_ticker,
-                unresolved_orders=len(unresolved_items),
-                pre_qty=pre_qty,
-                expected_post_qty=expected_post_qty,
-            )
-            try:
-                positions = client.get_positions(ticker=t212_ticker)
-            except Exception as exc:
-                _log(
-                    "broker_position_reconcile_exception",
-                    phase=phase,
-                    t212_ticker=t212_ticker,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
-                continue
-            post_qty = _position_quantity_for_ticker(positions, t212_ticker)
-            _log(
-                "broker_position_reconcile_result",
-                phase=phase,
-                t212_ticker=t212_ticker,
-                positions=len(positions),
-                post_qty=post_qty,
-                expected_post_qty=expected_post_qty,
-            )
-            if not _float_close(post_qty, expected_post_qty, tol=1e-4):
-                continue
-            for unresolved in unresolved_items:
-                order_id = unresolved["order_id"]
-                shares = _safe_float(unresolved.get("shares"))
-                payload = dict(bulk_status.get(order_id) or {"id": order_id})
-                payload["status"] = "FILLED"
-                payload["filledQuantity"] = abs(shares)
-                payload["resolution"] = "reconciled_via_positions_endpoint"
-                payload["positionQuantityBefore"] = pre_qty
-                payload["positionQuantityAfter"] = post_qty
-                payload["positionQuantityExpected"] = expected_post_qty
-                bulk_status[order_id] = payload
-                _log(
-                    "broker_position_reconcile_applied",
-                    phase=phase,
-                    ticker=unresolved["ticker"],
-                    order_id=order_id,
-                    t212_ticker=t212_ticker,
-                )
 
         phase_has_unfilled = False
         for item in placed:
@@ -734,29 +967,77 @@ def _build_broker_account_row(summary: dict, account_currency: str) -> dict:
     }
 
 
-def _broker_notionals(orders: list[dict]) -> tuple[float, float]:
+def _convert_between_usd_gbp(
+    amount: float,
+    source_currency: str,
+    target_currency: str,
+    fx_rate_gbp_per_usd: float,
+) -> float | None:
+    source = str(source_currency or "").strip().upper()
+    target = str(target_currency or "").strip().upper()
+    if not source:
+        source = target
+    if not source or not target:
+        return None
+    if source == target:
+        return amount
+    if fx_rate_gbp_per_usd <= 0:
+        return None
+    if source == "USD" and target == "GBP":
+        return amount * fx_rate_gbp_per_usd
+    if source == "GBP" and target == "USD":
+        return amount / fx_rate_gbp_per_usd
+    return None
+
+
+def _broker_notionals(
+    orders: list[dict],
+    broker_currency: str,
+    fx_rate_gbp_per_usd: float,
+) -> tuple[float, float, int, int]:
     buy_notional = 0.0
     sell_notional = 0.0
+    filled_orders = 0
+    covered_orders = 0
     for order in orders:
-        price = _safe_float(order.get("exec_price"))
-        if price <= 0:
-            continue
         filled_qty = _safe_float(order.get("filled_quantity"))
         if filled_qty <= 0:
             filled_qty = abs(_safe_float(order.get("quantity")))
         if filled_qty <= 0:
             continue
-        notional = abs(filled_qty * price)
+        filled_orders += 1
+        payload = order.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+
+        notional = _safe_float(payload.get("filledValue"))
+        if notional <= 0:
+            price = _safe_float(order.get("exec_price"))
+            if price > 0:
+                notional = abs(filled_qty * price)
+        if notional <= 0:
+            continue
+
+        order_currency = str(order.get("currency") or payload.get("currency") or "").strip().upper()
+        converted_notional = _convert_between_usd_gbp(
+            amount=abs(notional),
+            source_currency=order_currency,
+            target_currency=broker_currency,
+            fx_rate_gbp_per_usd=fx_rate_gbp_per_usd,
+        )
+        if converted_notional is None:
+            continue
+        covered_orders += 1
+
         action = str(order.get("action") or "").strip().upper()
         if action == "BUY":
-            buy_notional += notional
+            buy_notional += converted_notional
         elif action == "SELL":
-            sell_notional += notional
+            sell_notional += converted_notional
         elif _safe_float(order.get("quantity")) < 0:
-            sell_notional += notional
+            sell_notional += converted_notional
         else:
-            buy_notional += notional
-    return buy_notional, sell_notional
+            buy_notional += converted_notional
+    return buy_notional, sell_notional, filled_orders, covered_orders
 
 
 def _prior_broker_cost_totals(target_date: str) -> tuple[float, float]:
@@ -1174,12 +1455,19 @@ def main():
         summary["broker_cash_weight"] = (
             broker_cash_after / broker_net_worth_gbp if broker_net_worth_gbp > 0 else 0.0
         )
-        buy_notional, sell_notional = _broker_notionals(broker_orders)
+        buy_notional, sell_notional, filled_orders, covered_orders = _broker_notionals(
+            broker_orders,
+            broker_currency=str(summary.get("broker_currency") or "").strip().upper(),
+            fx_rate_gbp_per_usd=_safe_float(broker_context.get("fx_rate_gbp_per_usd"), default=0.0),
+        )
         summary["broker_buy_notional"] = buy_notional
         summary["broker_sell_notional"] = sell_notional
 
         fx_rate = _safe_float(broker_context.get("fx_rate_gbp_per_usd"), default=0.0)
         broker_currency = str(summary.get("broker_currency") or "").strip().upper()
+        summary["broker_notional_filled_orders"] = filled_orders
+        summary["broker_notional_covered_orders"] = covered_orders
+        notionals_complete = covered_orders >= filled_orders
         can_convert_flow = abs(float(total_cash)) <= 1e-12 or broker_currency == "USD" or fx_rate > 0
         if args.dry_run:
             summary["broker_external_flow"] = None
@@ -1190,6 +1478,17 @@ def main():
             summary["broker_total_execution_cost_usd"] = None
             summary["broker_cost_warning"] = (
                 "Broker execution cost is not computed during dry-run."
+            )
+        elif not notionals_complete:
+            summary["broker_external_flow"] = None
+            summary["broker_external_flow_usd"] = float(total_cash)
+            summary["broker_execution_cost"] = None
+            summary["broker_execution_cost_usd"] = None
+            summary["broker_total_execution_cost"] = None
+            summary["broker_total_execution_cost_usd"] = None
+            summary["broker_cost_warning"] = (
+                "Broker execution cost skipped because one or more filled broker orders are "
+                "missing fill notional or have unsupported currency conversion."
             )
         elif can_convert_flow:
             if broker_currency == "USD":

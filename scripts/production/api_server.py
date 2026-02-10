@@ -1,11 +1,13 @@
 import os
 import sys
+import time
 from typing import List, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(PROJECT_ROOT)
 
 import pandas as pd
+import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -37,12 +39,117 @@ from src.production_db import (
 )
 
 API_KEY = os.getenv("API_KEY", "").strip()
+FX_PROVIDER_URL = os.getenv("FX_PROVIDER_URL", "https://api.frankfurter.app/latest")
+FX_TIMEOUT_SECONDS = float(os.getenv("FX_TIMEOUT_SECONDS", "4.0"))
+FX_CACHE_TTL_SECONDS = int(os.getenv("FX_CACHE_TTL_SECONDS", "3600"))
+SUPPORTED_FX_CURRENCIES = {"USD", "GBP"}
+_fx_cache: dict[tuple[str, str], dict[str, object]] = {}
 
 if not db_enabled():
     raise RuntimeError(
         "Database is required for the production API. Set DATABASE_URL or POSTGRES_URL."
     )
 db_init()
+
+
+def _normalize_currency(code: str | None, default: str = "USD") -> str:
+    value = str(code or default).strip().upper()
+    if value not in SUPPORTED_FX_CURRENCIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported currency '{value}'. Supported: {sorted(SUPPORTED_FX_CURRENCIES)}",
+        )
+    return value
+
+
+def _to_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not pd.notna(parsed):
+        return None
+    return parsed
+
+
+def _derive_usd_to_gbp_from_db() -> float | None:
+    rows = db_list_run_summaries()
+    if not rows:
+        return None
+    candidate_pairs = (
+        ("broker_net_worth", "broker_net_worth_usd"),
+        ("broker_execution_cost", "broker_execution_cost_usd"),
+        ("broker_total_execution_cost", "broker_total_execution_cost_usd"),
+    )
+    for row in reversed(rows):
+        currency = str(row.get("broker_currency") or "").strip().upper()
+        if currency == "USD":
+            return 1.0
+        if currency != "GBP":
+            continue
+        for native_key, usd_key in candidate_pairs:
+            native = _to_float(row.get(native_key))
+            usd = _to_float(row.get(usd_key))
+            if native is None or usd is None or abs(usd) <= 1e-12:
+                continue
+            ratio = native / usd
+            if 0.1 <= ratio <= 10.0:
+                return ratio
+    return None
+
+
+def _fetch_usd_to_gbp_from_provider() -> float | None:
+    try:
+        response = requests.get(
+            FX_PROVIDER_URL,
+            params={"from": "USD", "to": "GBP"},
+            timeout=FX_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code < 200 or response.status_code >= 300:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    rates = payload.get("rates")
+    if not isinstance(rates, dict):
+        return None
+    rate = _to_float(rates.get("GBP"))
+    if rate is None or rate <= 0:
+        return None
+    return rate
+
+
+def _get_usd_to_gbp_rate() -> tuple[float | None, str]:
+    cache_key = ("USD", "GBP")
+    now = time.time()
+    cached = _fx_cache.get(cache_key)
+    if cached:
+        fetched_at = _to_float(cached.get("fetched_at_epoch"))
+        rate = _to_float(cached.get("rate"))
+        if (
+            fetched_at is not None
+            and rate is not None
+            and (now - fetched_at) <= FX_CACHE_TTL_SECONDS
+        ):
+            return rate, "cache"
+
+    provider_rate = _fetch_usd_to_gbp_from_provider()
+    if provider_rate is not None:
+        _fx_cache[cache_key] = {
+            "rate": provider_rate,
+            "fetched_at_epoch": now,
+        }
+        return provider_rate, "provider"
+
+    db_rate = _derive_usd_to_gbp_from_db()
+    if db_rate is not None:
+        return db_rate, "db_fallback"
+
+    return None, "unavailable"
+
 
 def _load_effective_excluded_tickers() -> tuple[set[str], str]:
     return db_load_excluded_tickers(), "db"
@@ -138,6 +245,43 @@ app = FastAPI(title="Trading Production API", version="0.1.0")
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/fx-rate", dependencies=[Depends(_require_api_key)])
+def fx_rate(base: str = "USD", quote: str = "GBP"):
+    base_code = _normalize_currency(base, default="USD")
+    quote_code = _normalize_currency(quote, default="GBP")
+    if base_code == quote_code:
+        return {
+            "base": base_code,
+            "quote": quote_code,
+            "rate": 1.0,
+            "source": "identity",
+        }
+
+    if {base_code, quote_code} != {"USD", "GBP"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Only USD/GBP exchange rates are currently supported.",
+        )
+
+    usd_to_gbp, source = _get_usd_to_gbp_rate()
+    if usd_to_gbp is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Unable to resolve USD/GBP FX rate from provider or database fallback. "
+                "Retry shortly."
+            ),
+        )
+
+    rate = usd_to_gbp if (base_code, quote_code) == ("USD", "GBP") else 1.0 / usd_to_gbp
+    return {
+        "base": base_code,
+        "quote": quote_code,
+        "rate": rate,
+        "source": source,
+    }
 
 
 @app.get("/latest-run", dependencies=[Depends(_require_api_key)])

@@ -214,6 +214,24 @@ class Trading212Client:
             return [item for item in data["items"] if isinstance(item, dict)]
         return []
 
+    def get_historical_orders(
+        self,
+        limit: int = 50,
+        cursor: str | None = None,
+        ticker: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": max(1, int(limit))}
+        if cursor:
+            params["cursor"] = str(cursor)
+        if ticker:
+            params["ticker"] = str(ticker)
+        data = self._request("GET", "/equity/history/orders", params=params)
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            return {"items": [item for item in data if isinstance(item, dict)]}
+        return {"items": []}
+
     def place_market_order(
         self,
         ticker: str,

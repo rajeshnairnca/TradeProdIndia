@@ -2,6 +2,18 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-10
+- Added `GET /fx-rate` in `scripts/production/api_server.py` to provide USD/GBP conversion rates for app-side currency normalization.
+- Wired the FX endpoint to a free external provider (`frankfurter.app`) with in-process TTL caching and a DB-derived fallback from historical broker summary ratios when the provider is unavailable.
+- Added strict currency validation and clear HTTP errors for unsupported/temporarily unavailable FX pairs in the API layer.
+- Replaced the temporary positions-price fallback in `scripts/production/daily_run.py` with Trading212 historical-order fill price backfill (`GET /equity/history/orders`) keyed by `order_id`, so persisted `exec_price` reflects order-level fills instead of position averages.
+- Removed `/equity/orders` and `/equity/orders/{id}` polling from production order monitoring; phase execution now resolves orders via `/equity/positions` (quantity reconciliation) + `/equity/history/orders` (status/fill notional/price).
+- Added explicit Trading212 monitor pacing config in `src/config.py` for endpoint limits: `TRADING212_POSITIONS_POLL_SEC` (default `1.0`), `TRADING212_HISTORY_POLL_SEC` (default `10.0`), `TRADING212_HISTORY_PAGE_LIMIT` (default `50`), and `TRADING212_HISTORY_MAX_PAGES` (default `1`).
+- Extended `tests/test_daily_run_trading212_execution.py` to validate that position reconciliation still resolves fill status/quantity while `exec_price` is sourced from `history.orders.fill.price`.
+- Fixed broker execution-cost calculation in `scripts/production/daily_run.py` to compute notionals from order `filledValue`/`exec_price` with explicit USD↔GBP conversion into broker-account currency before cost reconciliation.
+- Added cost-safety guard in `scripts/production/daily_run.py`: when one or more filled broker orders lack usable notional/currency conversion, broker execution cost totals are skipped and a warning is persisted instead of storing inflated values.
+- Added regression coverage in `tests/test_daily_run_trading212_execution.py` for broker notional conversion and incomplete-notional handling.
+
 ## 2026-02-02
 - Sanitized VIX merge columns in `src/production.py` to coalesce legacy `*_x`/`*_y` fields and prevent duplicate-column merge errors during `update_market_data`.
 - Dropped preexisting VIX columns from update rows before merging fresh VIX stats in `src/production.py` to avoid suffix collisions.
