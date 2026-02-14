@@ -88,6 +88,11 @@ def update_market_data(
             .set_index("ticker")["sector"]
             .to_dict()
         )
+    ticker_index = existing.index.get_level_values("ticker")
+    date_index = pd.DatetimeIndex(existing.index.get_level_values("date"))
+    if date_index.tz is not None:
+        date_index = date_index.tz_convert(None)
+    last_date_by_ticker = pd.Series(date_index.to_numpy(), index=ticker_index).groupby(level=0, sort=False).max()
 
     updated_rows: list[dict] = []
     updated_tickers: set[str] = set()
@@ -125,8 +130,17 @@ def update_market_data(
         bar_time = pd.to_datetime(bar_time) if bar_time is not None else pd.Timestamp.utcnow()
         bar_date = _to_naive_timestamp(bar_time).normalize()
 
-        existing_ticker = existing.xs(ticker, level="ticker", drop_level=False)
-        last_ticker_date = _to_naive_timestamp(existing_ticker.index.get_level_values("date").max())
+        last_ticker_date = last_date_by_ticker.get(ticker)
+        if last_ticker_date is None or pd.isna(last_ticker_date):
+            diagnostics[ticker] = _diag_item(
+                ticker=ticker,
+                status="error",
+                reason="missing_local_history",
+                symbol=symbol,
+                bar_date=_fmt_date(bar_date),
+            )
+            continue
+        last_ticker_date = _to_naive_timestamp(last_ticker_date)
         if bar_date <= last_ticker_date:
             resolved_tickers.add(ticker)
             diagnostics[ticker] = _diag_item(
@@ -157,6 +171,7 @@ def update_market_data(
             )
             continue
 
+        existing_ticker = existing.xs(ticker, level="ticker", drop_level=False)
         row = _build_updated_row(
             ticker=ticker,
             existing_ticker=existing_ticker,
@@ -246,17 +261,30 @@ def update_market_data(
 
     if "vix_return" in updates_df.columns:
         vix_return_series = vix_series.pct_change()
-        updates_df["vix_beta_sensitivity"] = updates_df.apply(
-            lambda row: _compute_vix_beta(
-                ticker=row["ticker"],
-                new_date=row["date"],
+        log_return_cache: dict[str, pd.Series | None] = {}
+
+        def _cached_vix_beta(row: pd.Series) -> float:
+            ticker = str(row.get("ticker") or "").strip().upper()
+            if not ticker:
+                return np.nan
+            lr_series = log_return_cache.get(ticker)
+            if ticker not in log_return_cache:
+                try:
+                    lr_series = existing.xs(ticker, level="ticker")["log_return"].copy()
+                except KeyError:
+                    lr_series = None
+                else:
+                    lr_series.index = pd.to_datetime(lr_series.index).tz_localize(None)
+                log_return_cache[ticker] = lr_series
+            return _compute_vix_beta_from_series(
+                lr_series=lr_series,
+                new_date=row.get("date"),
                 new_log_return=row.get("log_return"),
-                existing=existing,
                 vix_return_series=vix_return_series,
                 rolling_window=rolling_window,
-            ),
-            axis=1,
-        )
+            )
+
+        updates_df["vix_beta_sensitivity"] = updates_df.apply(_cached_vix_beta, axis=1)
 
     updates_df = _normalize_features_cross_sectional(updates_df, REQUIRED_INDICATOR_COLS)
     updates_df = _normalize_additional_zscores(
@@ -820,18 +848,35 @@ def _compute_vix_beta(
     vix_return_series: pd.Series,
     rolling_window: int,
 ) -> float:
-    if new_log_return is None or pd.isna(new_log_return) or vix_return_series.empty:
-        return np.nan
     try:
         lr_series = existing.xs(ticker, level="ticker")["log_return"].copy()
     except KeyError:
         return np.nan
     lr_series.index = pd.to_datetime(lr_series.index).tz_localize(None)
-    lr_series.loc[new_date] = float(new_log_return)
+    return _compute_vix_beta_from_series(
+        lr_series=lr_series,
+        new_date=new_date,
+        new_log_return=new_log_return,
+        vix_return_series=vix_return_series,
+        rolling_window=rolling_window,
+    )
+
+
+def _compute_vix_beta_from_series(
+    lr_series: pd.Series | None,
+    new_date: pd.Timestamp,
+    new_log_return: float | None,
+    vix_return_series: pd.Series,
+    rolling_window: int,
+) -> float:
+    if lr_series is None or new_log_return is None or pd.isna(new_log_return) or vix_return_series.empty:
+        return np.nan
+    local_series = lr_series.copy()
+    local_series.loc[new_date] = float(new_log_return)
     aligned = pd.DataFrame(
         {
-            "lr": lr_series,
-            "vr": vix_return_series.reindex(lr_series.index),
+            "lr": local_series,
+            "vr": vix_return_series.reindex(local_series.index),
         }
     ).dropna(subset=["lr", "vr"])
     if len(aligned) < rolling_window:
@@ -929,12 +974,6 @@ def _add_swing_features(df: pd.DataFrame) -> pd.DataFrame:
         df["dist_sma20"] = (df["Close"] - df["SMA_20"]) / (df["SMA_20"] + 1e-9)
     if "Volume" in df.columns and "SMA20_Volume" in df.columns:
         df["rvol_20"] = df["Volume"] / (df["SMA20_Volume"] + 1e-9)
-
-    for col in ["dist_sma50", "dist_sma20", "rvol_20"]:
-        if col in df.columns:
-            df[f"{col}_z"] = df.groupby("date")[col].transform(
-                lambda x: (x - x.mean()) / (x.std() + 1e-9)
-            )
 
     if "date" in df.columns:
         for col in ["dist_sma50", "dist_sma20", "rvol_20"]:

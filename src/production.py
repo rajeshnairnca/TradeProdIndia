@@ -776,8 +776,6 @@ def generate_trades_for_date(
         raise ValueError("No strategies provided.")
 
     universe = df.index.get_level_values("ticker").unique().tolist()
-    strategy_scores = _precompute_scores(df, strategies_list)
-
     state_snapshot = get_regime_state(regime_table, target_date)
     selected = None
     if strategy_selector is not None:
@@ -787,6 +785,7 @@ def generate_trades_for_date(
     else:
         active_strategies = list(selected)
 
+    strategy_scores = _precompute_scores(df, active_strategies)
     active_strategy_names = [strategy.name for strategy in active_strategies]
     combined_scores = _combine_scores(strategy_scores, active_strategies, target_date, universe)
 

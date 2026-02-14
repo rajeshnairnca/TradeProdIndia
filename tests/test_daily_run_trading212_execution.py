@@ -28,7 +28,14 @@ if "psycopg2" not in sys.modules:
     sys.modules["psycopg2"] = fake_psycopg2
     sys.modules["psycopg2.extras"] = fake_extras
 
-from scripts.production.daily_run import _broker_notionals, _execute_trading212_orders
+from scripts.production.daily_run import (
+    _broker_notionals,
+    _execute_trading212_orders,
+    _state_from_broker_context,
+    _state_from_broker_snapshot,
+)
+from scripts.production import daily_run as daily_run_module
+from src.production import ProductionState
 
 
 class _FakeClient:
@@ -270,3 +277,105 @@ def test_broker_notionals_marks_uncovered_when_notional_or_currency_missing() ->
     assert sell_notional == 0.0
     assert filled_orders == 2
     assert covered_orders == 0
+
+
+def test_state_from_broker_context_uses_broker_cash_and_positions() -> None:
+    state = ProductionState(
+        last_date="2025-01-01",
+        cash=100.0,
+        positions={"AAPL": 1},
+        prev_weights={"AAPL": 0.6},
+        total_costs_usd=42.0,
+    )
+    context = {
+        "broker_cash_usd": 250.5,
+        "broker_positions": {"AAPL": 2.0, "MSFT": 0.0, "": 1.0, "NVDA": -1.5},
+    }
+    out = _state_from_broker_context(state, context)
+    assert out.cash == 250.5
+    assert out.positions == {"AAPL": 2.0, "NVDA": -1.5}
+    assert out.prev_weights == {}
+    assert out.total_costs_usd == 42.0
+
+
+def test_state_from_broker_context_falls_back_to_state_cash_when_missing() -> None:
+    state = ProductionState(
+        last_date="2025-01-01",
+        cash=123.0,
+        positions={"AAPL": 1},
+        prev_weights={},
+        total_costs_usd=0.0,
+    )
+    out = _state_from_broker_context(state, context={})
+    assert out.cash == 123.0
+    assert out.positions == {}
+
+
+def test_state_from_broker_context_logs_fractional_positions(monkeypatch) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def _capture(message: str, **fields) -> None:
+        events.append((message, fields))
+
+    monkeypatch.setattr(daily_run_module, "_log", _capture)
+    state = ProductionState(
+        last_date="2025-01-01",
+        cash=100.0,
+        positions={},
+        prev_weights={},
+        total_costs_usd=0.0,
+    )
+    _state_from_broker_context(
+        state,
+        {"broker_cash_usd": 100.0, "broker_positions": {"AAPL": 1.25, "MSFT": 2.0}},
+    )
+    assert any(msg == "broker_fractional_positions_detected" for msg, _ in events)
+
+
+def test_state_from_broker_snapshot_syncs_cash_and_positions() -> None:
+    new_state = ProductionState(
+        last_date="2025-01-02",
+        cash=50.0,
+        positions={"AAPL": 1},
+        prev_weights={"AAPL": 0.5},
+        total_costs_usd=7.0,
+    )
+    summary = {
+        "broker_currency": "GBP",
+        "broker_fx_rate_gbp_per_usd": 0.8,
+        "broker_cash_after": 80.0,
+    }
+    context = {"overrides": {}}
+    post_positions = [
+        {"ticker": "AAPL_US_EQ", "quantity": 3.0, "instrument": {"ticker": "AAPL_US_EQ"}},
+        {"ticker": "MSFT_US_EQ", "quantity": 1.0, "instrument": {"ticker": "MSFT_US_EQ"}},
+    ]
+    out = _state_from_broker_snapshot(new_state, summary, context, post_positions)
+    assert out.last_date == "2025-01-02"
+    assert out.cash == 100.0
+    assert out.positions == {"AAPL": 3.0, "MSFT": 1.0}
+    assert out.prev_weights == {"AAPL": 0.5}
+    assert out.total_costs_usd == 7.0
+
+
+def test_state_from_broker_context_computes_prev_weights_from_broker_holdings() -> None:
+    state = ProductionState(
+        last_date="2025-01-01",
+        cash=10.0,
+        positions={},
+        prev_weights={},
+        total_costs_usd=3.0,
+    )
+    context = {
+        "broker_cash_usd": 100.0,
+        "broker_positions": {"AAPL": 2.0, "MSFT": 1.0},
+    }
+    price_lookup = {"AAPL": 50.0, "MSFT": 100.0}
+    out = _state_from_broker_context(state, context, price_lookup=price_lookup)
+    assert out.cash == 100.0
+    assert out.positions == {"AAPL": 2.0, "MSFT": 1.0}
+    assert out.prev_weights == {
+        "AAPL": 100.0 / 300.0,
+        "MSFT": 100.0 / 300.0,
+    }
+    assert out.total_costs_usd == 3.0

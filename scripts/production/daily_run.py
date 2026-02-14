@@ -202,26 +202,38 @@ def _build_price_snapshot(df: pd.DataFrame, target_date: pd.Timestamp) -> list[d
     if df is None or df.empty or "Close" not in df.columns:
         return []
     date_key = pd.to_datetime(target_date).tz_localize(None)
-    date_values = df.index.get_level_values("date")
-    day_data = df.loc[date_values == date_key]
+    try:
+        day_data = df.xs(date_key, level="date")
+    except KeyError:
+        return []
     if day_data.empty:
         return []
-    day_data = day_data.reset_index()
-    if "ticker" not in day_data.columns or "Close" not in day_data.columns:
+    close = pd.to_numeric(day_data["Close"], errors="coerce")
+    tickers = day_data.index.astype(str).str.strip().str.upper()
+    valid_mask = close.notna() & (tickers != "")
+    if not valid_mask.any():
         return []
-    prices: list[dict[str, float]] = []
-    for _, row in day_data[["ticker", "Close"]].iterrows():
-        if pd.isna(row["Close"]):
+    valid_tickers = tickers[valid_mask].to_numpy()
+    valid_prices = close[valid_mask].astype(float).to_numpy()
+    return [
+        {"ticker": ticker, "close_price": float(price)}
+        for ticker, price in zip(valid_tickers, valid_prices)
+    ]
+
+
+def _price_lookup_from_snapshot(snapshot: list[dict[str, float]]) -> dict[str, float]:
+    lookup: dict[str, float] = {}
+    for item in snapshot:
+        if not isinstance(item, dict):
             continue
-        ticker = str(row["ticker"]).strip().upper()
+        ticker = str(item.get("ticker") or "").strip().upper()
         if not ticker:
             continue
-        try:
-            price = float(row["Close"])
-        except (TypeError, ValueError):
+        price = _safe_float(item.get("close_price"), default=0.0)
+        if price <= 0:
             continue
-        prices.append({"ticker": ticker, "close_price": price})
-    return prices
+        lookup[ticker] = price
+    return lookup
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -605,22 +617,44 @@ def _build_trading212_context(state: ProductionState) -> dict:
     account_currency = str(
         summary_raw.get("currencyCode") or summary_raw.get("currency") or "GBP"
     ).upper()
-    broker_cash_gbp = account_cash_available(summary_raw)
-    broker_net_worth_gbp = account_net_worth(summary_raw)
+    broker_cash_account = account_cash_available(summary_raw)
+    broker_net_worth_account = account_net_worth(summary_raw)
     broker_positions = positions_to_internal_positions(positions_raw, overrides)
     fx_rates = extract_fx_rates(positions_raw, account_currency=account_currency)
     fx_rate = fx_rates.get("USD") or config.TRADING212_FX_RATE_USD_GBP
+    if account_currency == "USD":
+        fx_rate = 1.0
+    if account_currency not in {"USD", "GBP"}:
+        raise ValueError(
+            f"Unsupported Trading212 account currency '{account_currency}'. Only USD/GBP are supported."
+        )
     if not fx_rate:
         raise ValueError(
             "Unable to derive GBP/USD FX rate for Trading212. "
             "Set TRADING212_FX_RATE_USD_GBP to proceed."
         )
-    broker_cash_usd = broker_cash_gbp / fx_rate
+    broker_cash_usd = _convert_between_usd_gbp(
+        amount=broker_cash_account,
+        source_currency=account_currency,
+        target_currency="USD",
+        fx_rate_gbp_per_usd=fx_rate,
+    )
+    if broker_cash_usd is None:
+        raise ValueError(
+            "Unable to convert Trading212 cash balance to USD. "
+            f"account_currency={account_currency} fx_rate_gbp_per_usd={fx_rate}"
+        )
+    broker_net_worth_usd = _convert_between_usd_gbp(
+        amount=broker_net_worth_account,
+        source_currency=account_currency,
+        target_currency="USD",
+        fx_rate_gbp_per_usd=fx_rate,
+    )
     discrepancies = compare_positions(
         state.positions,
         broker_positions,
         state.cash,
-        broker_cash_usd,
+        float(broker_cash_usd),
     )
     _log(
         "broker_context_build_complete",
@@ -637,14 +671,115 @@ def _build_trading212_context(state: ProductionState) -> dict:
         "summary_raw": summary_raw,
         "positions_raw": positions_raw,
         "account_currency": account_currency,
-        "broker_cash_gbp": broker_cash_gbp,
-        "broker_cash_usd": broker_cash_usd,
-        "broker_net_worth_gbp": broker_net_worth_gbp,
+        "broker_cash": broker_cash_account,
+        "broker_cash_gbp": broker_cash_account,
+        "broker_cash_usd": float(broker_cash_usd),
+        "broker_net_worth": broker_net_worth_account,
+        "broker_net_worth_gbp": broker_net_worth_account,
+        "broker_net_worth_usd": float(broker_net_worth_usd) if broker_net_worth_usd is not None else None,
         "broker_positions": broker_positions,
         "fx_rates": fx_rates,
         "fx_rate_gbp_per_usd": fx_rate,
         "discrepancies": discrepancies,
     }
+
+
+def _state_from_broker_context(
+    state: ProductionState,
+    context: dict,
+    price_lookup: dict[str, float] | None = None,
+) -> ProductionState:
+    broker_positions_raw = context.get("broker_positions")
+    broker_positions: dict[str, int | float] = {}
+    fractional_tickers: list[str] = []
+    if isinstance(broker_positions_raw, dict):
+        for ticker, quantity in broker_positions_raw.items():
+            ticker_key = str(ticker or "").strip().upper()
+            if not ticker_key:
+                continue
+            qty = _safe_float(quantity)
+            if abs(qty) <= 1e-9:
+                continue
+            if abs(qty - round(qty)) > 1e-6:
+                fractional_tickers.append(ticker_key)
+            broker_positions[ticker_key] = qty
+    if fractional_tickers:
+        preview = ", ".join(sorted(set(fractional_tickers))[:10])
+        _log(
+            "broker_fractional_positions_detected",
+            count=len(set(fractional_tickers)),
+            preview=preview,
+        )
+    broker_cash_usd = _safe_float(context.get("broker_cash_usd"), default=state.cash)
+    prev_weights: dict[str, float] = {}
+    if price_lookup:
+        priced_values: dict[str, float] = {}
+        missing_price_tickers: list[str] = []
+        for ticker, quantity in broker_positions.items():
+            price = _safe_float(price_lookup.get(ticker), default=0.0)
+            if price <= 0:
+                missing_price_tickers.append(ticker)
+                continue
+            priced_values[ticker] = _safe_float(quantity) * price
+        if missing_price_tickers:
+            preview = ", ".join(sorted(set(missing_price_tickers))[:10])
+            _log(
+                "broker_prev_weights_missing_prices",
+                count=len(set(missing_price_tickers)),
+                preview=preview,
+            )
+        net_worth = broker_cash_usd + float(sum(priced_values.values()))
+        if net_worth > 1e-9:
+            prev_weights = {
+                ticker: float(value / net_worth)
+                for ticker, value in priced_values.items()
+                if abs(value / net_worth) > 1e-9
+            }
+            _log(
+                "broker_prev_weights_computed",
+                weights=len(prev_weights),
+                net_worth_usd=net_worth,
+            )
+        else:
+            _log("broker_prev_weights_skipped", reason="non_positive_net_worth")
+    else:
+        _log("broker_prev_weights_skipped", reason="missing_price_lookup")
+    return ProductionState(
+        last_date=state.last_date,
+        cash=broker_cash_usd,
+        positions=broker_positions,
+        prev_weights=prev_weights,
+        total_costs_usd=state.total_costs_usd,
+    )
+
+
+def _state_from_broker_snapshot(
+    new_state: ProductionState,
+    summary: dict,
+    context: dict,
+    post_positions: list[dict],
+) -> ProductionState:
+    broker_positions_internal = positions_to_internal_positions(
+        post_positions,
+        context.get("overrides") or {},
+    )
+    broker_currency = str(summary.get("broker_currency") or "").strip().upper()
+    fx_rate = _safe_float(summary.get("broker_fx_rate_gbp_per_usd"), default=0.0)
+    broker_cash_after = _safe_float(summary.get("broker_cash_after"), default=new_state.cash)
+
+    synced_cash_usd = new_state.cash
+    if broker_currency == "USD":
+        synced_cash_usd = broker_cash_after
+    elif broker_currency == "GBP" and fx_rate > 0:
+        synced_cash_usd = broker_cash_after / fx_rate
+
+    return ProductionState(
+        last_date=new_state.last_date,
+        cash=synced_cash_usd,
+        positions=broker_positions_internal,
+        prev_weights=dict(new_state.prev_weights),
+        total_costs_usd=new_state.total_costs_usd,
+    )
 
 
 def _ensure_trading212_universe(
@@ -1272,6 +1407,7 @@ def main():
         else pd.to_datetime(sector_df.index.get_level_values("date").max()).tz_localize(None)
     )
     price_snapshot: list[dict[str, float]] = _build_price_snapshot(df, target_date)
+    price_lookup = _price_lookup_from_snapshot(price_snapshot)
     _log(
         "target_selection_complete",
         target_date=target_date.strftime("%Y-%m-%d"),
@@ -1347,6 +1483,20 @@ def main():
             broker_context.get("overrides") or {},
             preferred_currency=config.TRADING212_PREFERRED_CURRENCY,
         )
+        if config.TRADING212_USE_BROKER_STATE_FOR_SIGNALS:
+            state_for_trades = _state_from_broker_context(
+                state,
+                broker_context,
+                price_lookup=price_lookup,
+            )
+            _log(
+                "broker_state_for_signals_enabled",
+                cash_usd=state_for_trades.cash,
+                positions=len(state_for_trades.positions),
+                prev_weights=len(state_for_trades.prev_weights),
+            )
+        else:
+            _log("broker_state_for_signals_disabled")
     else:
         _log("broker_integration_disabled")
 
@@ -1443,7 +1593,7 @@ def main():
             post_positions,
             broker_context.get("account_currency") or "GBP",
         )
-        broker_cash_before = _safe_float(broker_context.get("broker_cash_gbp"))
+        broker_cash_before = _safe_float(broker_context.get("broker_cash"))
         broker_cash_after = _safe_float(broker_account_row.get("cash"))
         broker_net_worth_gbp = _safe_float(broker_account_row.get("net_worth"))
         broker_portfolio_value = _safe_float(broker_account_row.get("investments"))
@@ -1542,35 +1692,29 @@ def main():
 
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
     state_to_persist = new_state
-    if broker_context and broker_order_issues and not args.dry_run:
+    if broker_context and not args.dry_run:
         post_positions = broker_context.get("post_positions") or broker_context.get("positions_raw", [])
-        broker_positions_internal = positions_to_internal_positions(
-            post_positions,
-            broker_context.get("overrides") or {},
+        state_to_persist = _state_from_broker_snapshot(
+            new_state=new_state,
+            summary=summary,
+            context=broker_context,
+            post_positions=post_positions,
         )
-        broker_currency = str(summary.get("broker_currency") or "").strip().upper()
-        fx_rate = _safe_float(summary.get("broker_fx_rate_gbp_per_usd"), default=0.0)
-        broker_cash_after = _safe_float(summary.get("broker_cash_after"), default=new_state.cash)
-        synced_cash_usd = new_state.cash
-        if broker_currency == "USD":
-            synced_cash_usd = broker_cash_after
-        elif fx_rate > 0:
-            synced_cash_usd = broker_cash_after / fx_rate
-        state_to_persist = ProductionState(
-            last_date=new_state.last_date,
-            cash=synced_cash_usd,
-            positions=broker_positions_internal,
-            prev_weights={},
-            total_costs_usd=new_state.total_costs_usd,
-        )
-        issue_preview = ", ".join(
-            sorted({str(item.get("ticker", "")).strip().upper() for item in broker_order_issues if item.get("ticker")})[:5]
-        )
-        print(
-            "Warning: One or more Trading212 orders were not fully executed. "
-            "Persisting state from broker snapshot to avoid drift."
-            + (f" Affected tickers: {issue_preview}" if issue_preview else "")
-        )
+        if broker_order_issues:
+            issue_preview = ", ".join(
+                sorted(
+                    {
+                        str(item.get("ticker", "")).strip().upper()
+                        for item in broker_order_issues
+                        if item.get("ticker")
+                    }
+                )[:5]
+            )
+            print(
+                "Warning: One or more Trading212 orders were not fully executed. "
+                "Persisting state from broker snapshot to avoid drift."
+                + (f" Affected tickers: {issue_preview}" if issue_preview else "")
+            )
 
     if not args.dry_run:
         _log("db_persist_start")

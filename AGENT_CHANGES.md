@@ -255,3 +255,24 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Fixed a payload corruption bug in `scripts/production/queue_adjustments.py` where `--add-tickers-exchange` reused the `entries` accumulator, which could enqueue non-dict pending adjustment rows.
 - Changed DB connection handling in `src/production_db.py` to explicit transaction commit/rollback (instead of autocommit) so multi-step replacement writes are atomic.
 - Narrowed `reset_production_data()` in `src/production_db.py` to clear run/state/trade/price/pending/broker runtime tables only, preserving universe map, excluded tickers, and universe monitor tables.
+
+## 2026-02-14
+- Optimized trade generation in `src/production.py` to precompute scores only for active strategies selected for the current regime, avoiding unnecessary scoring work for inactive strategies.
+- Optimized price snapshot building in `scripts/production/daily_run.py` by replacing row-wise iteration (`iterrows`) with a vectorized ticker/close extraction path.
+- Optimized `src/production_market_data.py::update_market_data` by precomputing per-ticker last local dates once and only slicing ticker history when a new bar actually exists.
+- Optimized VIX beta enrichment in `src/production_market_data.py` with per-ticker log-return caching and a reusable `_compute_vix_beta_from_series(...)` helper to cut repeated `xs(...)` work.
+- Removed duplicated cross-sectional z-score passes in `src/production_market_data.py::_add_swing_features`, eliminating redundant groupby transforms during feature preparation.
+- Fixed a compatibility regression in `scripts/production/daily_run.py::_build_price_snapshot` by replacing `Index.ne("")` with `(index != "")`, preserving behavior on the project pandas version.
+- Restored prior `generate_trades_for_date(...)` behavior in `src/production.py` for custom selector edge-cases (`strategy_selector` returning an empty list) by removing the new hard failure so results remain baseline-compatible.
+- Added broker-aware signal-state support in `scripts/production/daily_run.py`: when Trading212 integration is enabled and `TRADING212_USE_BROKER_STATE_FOR_SIGNALS=true` (default), trade generation now uses broker-derived USD cash and broker positions as the input `ProductionState`.
+- Added `TRADING212_USE_BROKER_STATE_FOR_SIGNALS` config flag in `src/config.py` to allow disabling broker-state-driven signal generation without disabling broker execution.
+- Hardened Trading212 account-currency handling in `scripts/production/daily_run.py::_build_trading212_context(...)` by supporting USD accounts directly, preserving USD conversion for discrepancy checks, and validating unsupported currencies explicitly.
+- Added `_state_from_broker_context(...)` adapter in `scripts/production/daily_run.py` to keep broker-awareness in the production/execution layer while leaving strategy scoring logic unchanged.
+- Added unit coverage in `tests/test_daily_run_trading212_execution.py` for broker-state adapter behavior (broker cash/positions adoption and fallback behavior).
+- Updated broker-aware signal input in `scripts/production/daily_run.py::_state_from_broker_context(...)` to clear `prev_weights`, preventing stale local-weight smoothing bias when broker state is the source of truth.
+- Added broker position-integrity monitoring in `scripts/production/daily_run.py::_state_from_broker_context(...)` that logs `broker_fractional_positions_detected` when non-integer holdings are observed.
+- Added `_state_from_broker_snapshot(...)` and updated `scripts/production/daily_run.py` to persist broker-synced cash/positions after every non-dry-run Trading212 session (not only when order issues occur), reducing model/broker drift.
+- Extended `tests/test_daily_run_trading212_execution.py` with coverage for fractional-position alert logging and broker-snapshot state sync behavior.
+- Updated broker-aware smoothing behavior in `scripts/production/daily_run.py`: `_state_from_broker_context(...)` now derives `prev_weights` from broker positions + latest price snapshot so turnover smoothing remains active while anchored to actual holdings.
+- Added broker-prev-weight diagnostics (`broker_prev_weights_computed`, `broker_prev_weights_missing_prices`, `broker_prev_weights_skipped`) and wired price lookup from the target-date snapshot into broker-state preparation.
+- Extended `tests/test_daily_run_trading212_execution.py` with coverage for broker-derived `prev_weights` computation.
