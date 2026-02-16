@@ -2,6 +2,27 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-16
+- Added a run-calendar module at `src/run_calendar.py` with deterministic date decisions (`allow`/`skip`) using:
+  - optional weekend blocking,
+  - US federal holiday blocking,
+  - explicit per-date overrides (`skip` / `force_run`).
+- Added run-calendar config flags in `src/config.py`:
+  - `RUN_CALENDAR_TIMEZONE` (default `America/New_York`)
+  - `RUN_CALENDAR_SKIP_WEEKENDS` (default `False`, to align with weekday-only Railway cron)
+  - `RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS` (default `True`)
+- Added Postgres persistence for calendar overrides in `src/production_db.py`:
+  - new table `production_run_calendar_overrides`
+  - helpers to upsert/list/get/delete per-date overrides.
+- Wired `scripts/production/daily_run.py` to evaluate run-calendar policy immediately after DB init and exit early on blocked dates (unless `--force` is provided).
+- Added Flutter-friendly API endpoints in `scripts/production/api_server.py`:
+  - `GET /run-calendar/decision?date=YYYY-MM-DD`
+  - `GET /run-calendar/overrides`
+  - `POST /run-calendar/overrides`
+  - `DELETE /run-calendar/overrides/{run_date}`
+  - `GET /run-calendar/us-federal-holidays?year=YYYY`
+- Added unit tests in `tests/test_run_calendar.py` for default holiday blocking, optional weekend behavior, and override precedence.
+
 ## 2026-02-10
 - Added `GET /fx-rate` in `scripts/production/api_server.py` to provide USD/GBP conversion rates for app-side currency normalization.
 - Wired the FX endpoint to a free external provider (`frankfurter.app`) with in-process TTL caching and a DB-derived fallback from historical broker summary ratios when the provider is unavailable.

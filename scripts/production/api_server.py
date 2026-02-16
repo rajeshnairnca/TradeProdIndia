@@ -1,7 +1,7 @@
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(PROJECT_ROOT)
@@ -11,11 +11,14 @@ import requests
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+from src import config
 from src.production_db import (
     append_pending_adjustments as db_append_pending_adjustments,
     clear_pending_adjustments as db_clear_pending_adjustments,
     db_enabled,
+    delete_run_calendar_override as db_delete_run_calendar_override,
     init_db as db_init,
+    list_run_calendar_overrides as db_list_run_calendar_overrides,
     latest_run_date as db_latest_run_date,
     latest_prices as db_latest_prices,
     latest_price_run_date as db_latest_price_run_date,
@@ -30,12 +33,20 @@ from src.production_db import (
     list_trades as db_list_trades,
     list_universe_monitor_candidates as db_list_universe_monitor_candidates,
     load_excluded_tickers as db_load_excluded_tickers,
+    load_run_calendar_override as db_load_run_calendar_override,
     load_universe_map as db_load_universe_map,
     load_pending_adjustments as db_load_pending_adjustments,
     price_tickers_for_date as db_price_tickers_for_date,
     replace_excluded_tickers as db_replace_excluded_tickers,
     load_state as db_load_state,
     reset_production_data as db_reset_production_data,
+    upsert_run_calendar_override as db_upsert_run_calendar_override,
+)
+from src.run_calendar import (
+    RUN_CALENDAR_ACTION_FORCE_RUN,
+    RUN_CALENDAR_ACTION_SKIP,
+    evaluate_run_day,
+    list_us_federal_holidays,
 )
 
 API_KEY = os.getenv("API_KEY", "").strip()
@@ -222,6 +233,26 @@ class ExcludeTickersRequest(BaseModel):
 
 class ResetRequest(BaseModel):
     confirm: str
+
+
+class RunCalendarOverrideRequest(BaseModel):
+    date: str
+    action: Literal["skip", "force_run"] = RUN_CALENDAR_ACTION_SKIP
+    reason: str = ""
+    source: str = "app"
+
+
+def _normalize_iso_date(value: str, field_name: str = "date") -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
+    try:
+        return str(pd.to_datetime(text).date())
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} format. Use YYYY-MM-DD.",
+        )
 
 
 def _require_api_key(
@@ -661,6 +692,88 @@ def exclude_tickers(payload: ExcludeTickersRequest):
     excluded.update(tickers)
     db_replace_excluded_tickers(excluded)
     return {"count": len(excluded), "excluded_tickers": sorted(excluded), "source": source}
+
+
+@app.get("/run-calendar/decision", dependencies=[Depends(_require_api_key)])
+def run_calendar_decision(date: str):
+    run_date = _normalize_iso_date(date, field_name="date")
+    override = db_load_run_calendar_override(run_date) or {}
+    decision = evaluate_run_day(
+        run_date,
+        override_action=str(override.get("action") or "").strip().lower() or None,
+        override_reason=str(override.get("reason") or "").strip() or None,
+        skip_weekends=config.RUN_CALENDAR_SKIP_WEEKENDS,
+        skip_us_federal_holidays=config.RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS,
+    )
+    return {
+        "date": run_date,
+        "should_run": bool(decision.get("should_run")),
+        "reason_code": decision.get("reason_code"),
+        "reason": decision.get("reason"),
+        "source": decision.get("source"),
+        "override": override or None,
+        "settings": {
+            "skip_weekends": bool(config.RUN_CALENDAR_SKIP_WEEKENDS),
+            "skip_us_federal_holidays": bool(config.RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS),
+        },
+    }
+
+
+@app.get("/run-calendar/overrides", dependencies=[Depends(_require_api_key)])
+def run_calendar_overrides(
+    start: str | None = None,
+    end: str | None = None,
+):
+    start_date = _normalize_iso_date(start, field_name="start") if start else None
+    end_date = _normalize_iso_date(end, field_name="end") if end else None
+    rows = db_list_run_calendar_overrides(start=start_date, end=end_date)
+    return {"count": len(rows), "overrides": rows}
+
+
+@app.post("/run-calendar/overrides", dependencies=[Depends(_require_api_key)])
+def upsert_run_calendar_override(payload: RunCalendarOverrideRequest):
+    run_date = _normalize_iso_date(payload.date, field_name="date")
+    action = str(payload.action).strip().lower()
+    if action not in (RUN_CALENDAR_ACTION_SKIP, RUN_CALENDAR_ACTION_FORCE_RUN):
+        raise HTTPException(status_code=400, detail="Invalid action. Use 'skip' or 'force_run'.")
+    reason = str(payload.reason or "").strip()
+    source = str(payload.source or "app").strip() or "app"
+    db_upsert_run_calendar_override(
+        run_date=run_date,
+        action=action,
+        reason=reason or None,
+        source=source,
+    )
+    decision = evaluate_run_day(
+        run_date,
+        override_action=action,
+        override_reason=reason or None,
+        skip_weekends=config.RUN_CALENDAR_SKIP_WEEKENDS,
+        skip_us_federal_holidays=config.RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS,
+    )
+    return {
+        "upserted": True,
+        "date": run_date,
+        "action": action,
+        "reason": reason,
+        "source": source,
+        "decision": decision,
+    }
+
+
+@app.delete("/run-calendar/overrides/{run_date}", dependencies=[Depends(_require_api_key)])
+def delete_run_calendar_override(run_date: str):
+    date_value = _normalize_iso_date(run_date, field_name="run_date")
+    deleted = db_delete_run_calendar_override(date_value)
+    return {"deleted": bool(deleted), "date": date_value}
+
+
+@app.get("/run-calendar/us-federal-holidays", dependencies=[Depends(_require_api_key)])
+def run_calendar_us_federal_holidays(year: int):
+    if year < 1970 or year > 2100:
+        raise HTTPException(status_code=400, detail="year must be between 1970 and 2100.")
+    holidays = list_us_federal_holidays(year)
+    return {"year": year, "count": len(holidays), "holidays": holidays}
 
 
 @app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])

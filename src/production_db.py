@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from datetime import date as dt_date
 from typing import Any, Iterable
 
 import psycopg2
@@ -174,6 +175,17 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS production_run_calendar_overrides (
+                run_date date PRIMARY KEY,
+                action text NOT NULL CHECK (action IN ('skip', 'force_run')),
+                reason text,
+                source text,
+                updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS production_state (
                 id integer PRIMARY KEY,
                 last_date date,
@@ -260,6 +272,9 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_excluded_tickers_ticker_idx ON production_excluded_tickers (ticker);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_run_calendar_overrides_run_date_idx ON production_run_calendar_overrides (run_date);"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_broker_orders_run_date_idx ON production_broker_orders (run_date);"
@@ -703,6 +718,114 @@ def replace_excluded_tickers(tickers: Iterable[str]) -> None:
             """,
             rows,
         )
+
+
+def _normalize_date_value(value: str) -> str:
+    date_value = dt_date.fromisoformat(str(value).strip())
+    return date_value.isoformat()
+
+
+def upsert_run_calendar_override(
+    run_date: str,
+    action: str,
+    reason: str | None = None,
+    source: str | None = "app",
+) -> None:
+    if not db_enabled():
+        return
+    init_db()
+    run_date_value = _normalize_date_value(run_date)
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in {"skip", "force_run"}:
+        raise ValueError(
+            f"Invalid run-calendar action '{action}'. Supported: ['force_run', 'skip']"
+        )
+    reason_value = str(reason).strip() if reason is not None else None
+    source_value = str(source).strip() if source is not None else ""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO production_run_calendar_overrides (
+                run_date,
+                action,
+                reason,
+                source
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (run_date) DO UPDATE SET
+                action = EXCLUDED.action,
+                reason = EXCLUDED.reason,
+                source = EXCLUDED.source,
+                updated_at = now();
+            """,
+            (run_date_value, normalized_action, reason_value, source_value),
+        )
+
+
+def load_run_calendar_override(run_date: str) -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    run_date_value = _normalize_date_value(run_date)
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date::text AS run_date, action, reason, source, updated_at
+            FROM production_run_calendar_overrides
+            WHERE run_date = %s;
+            """,
+            (run_date_value,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+def list_run_calendar_overrides(
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict[str, Any]]:
+    if not db_enabled():
+        return []
+    init_db()
+    where: list[str] = []
+    params: list[Any] = []
+    if start:
+        where.append("run_date >= %s")
+        params.append(_normalize_date_value(start))
+    if end:
+        where.append("run_date <= %s")
+        params.append(_normalize_date_value(end))
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT run_date::text AS run_date, action, reason, source, updated_at
+            FROM production_run_calendar_overrides
+            {where_sql}
+            ORDER BY run_date ASC;
+            """,
+            params,
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def delete_run_calendar_override(run_date: str) -> bool:
+    if not db_enabled():
+        return False
+    init_db()
+    run_date_value = _normalize_date_value(run_date)
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM production_run_calendar_overrides WHERE run_date = %s;",
+            (run_date_value,),
+        )
+        return cur.rowcount > 0
 
 
 def upsert_state(state: ProductionState) -> None:

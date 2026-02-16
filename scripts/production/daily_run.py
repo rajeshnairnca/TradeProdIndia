@@ -26,6 +26,7 @@ from src.production_db import (
     init_db as db_init,
     list_run_summaries as db_list_run_summaries,
     load_excluded_tickers as db_load_excluded_tickers,
+    load_run_calendar_override as db_load_run_calendar_override,
     load_pending_adjustments as db_load_pending_adjustments,
     load_state as db_load_state,
     load_universe_map as db_load_universe_map,
@@ -38,6 +39,7 @@ from src.production_db import (
     upsert_run_summary as db_upsert_run_summary,
     upsert_state as db_upsert_state,
 )
+from src.run_calendar import evaluate_run_day, resolve_schedule_date
 from src.regime import compute_market_regime_table
 from src.strategy import list_strategy_names, load_strategies
 from src.universe import NASDAQ100_TICKERS
@@ -1216,6 +1218,36 @@ def main():
     _log("db_init_start")
     db_init()
     _log("db_init_complete")
+
+    schedule_date = resolve_schedule_date(args.date, timezone_name=config.RUN_CALENDAR_TIMEZONE)
+    schedule_date_str = schedule_date.strftime("%Y-%m-%d")
+    schedule_override = db_load_run_calendar_override(schedule_date_str) or {}
+    run_decision = evaluate_run_day(
+        schedule_date,
+        override_action=str(schedule_override.get("action") or "").strip().lower() or None,
+        override_reason=str(schedule_override.get("reason") or "").strip() or None,
+        skip_weekends=config.RUN_CALENDAR_SKIP_WEEKENDS,
+        skip_us_federal_holidays=config.RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS,
+    )
+    if not run_decision["should_run"]:
+        if args.force:
+            _log(
+                "daily_run_calendar_blocked_but_forced",
+                schedule_date=schedule_date_str,
+                reason_code=run_decision.get("reason_code"),
+                reason=run_decision.get("reason"),
+            )
+        else:
+            _log(
+                "daily_run_skipped_by_calendar",
+                schedule_date=schedule_date_str,
+                reason_code=run_decision.get("reason_code"),
+                reason=run_decision.get("reason"),
+            )
+            print(
+                f"Skipping run for {schedule_date_str}: {run_decision.get('reason')}"
+            )
+            return
 
     strategy_roots = args.strategy_roots or ["alphas"]
     strategy_names = args.strategies or list_strategy_names(strategy_roots)

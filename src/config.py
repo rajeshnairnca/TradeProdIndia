@@ -110,6 +110,10 @@ TRADINGVIEW_EXCHANGE_MAP_FILE = _env_str(
     "TRADINGVIEW_EXCHANGE_MAP_FILE",
     "data/universe_us_exchange_map.json",
 )
+RUN_CALENDAR_TIMEZONE = _env_str("RUN_CALENDAR_TIMEZONE", "America/New_York")
+# Railway cron already skips weekends in this setup; keep weekend blocking opt-in.
+RUN_CALENDAR_SKIP_WEEKENDS = _env_bool("RUN_CALENDAR_SKIP_WEEKENDS", False)
+RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS = _env_bool("RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS", True)
 
 
 def resolve_path(path: str) -> str:
