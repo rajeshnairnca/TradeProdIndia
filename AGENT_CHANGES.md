@@ -2,6 +2,25 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-17
+- Updated `src/production_market_data.py` `add_universe_tickers(...)` with a new `fail_on_no_valid_tickers` flag (default `True`) so callers can choose non-fatal behavior when all requested new tickers fail history sufficiency checks.
+- Wired `scripts/production/daily_run.py` to call `add_universe_tickers(..., fail_on_no_valid_tickers=False)`, preventing production runs from aborting when queued tickers have insufficient post-indicator history (e.g., newly listed symbols).
+- Added `tests/test_production_market_data_add_tickers.py` to cover both modes:
+  - default strict mode still raises when no valid new ticker data is available,
+  - non-fatal mode returns existing data and allows the run to continue.
+- Extended `src/production_market_data.py` `add_universe_tickers(...)` with `return_failed_tickers`; `scripts/production/daily_run.py` now requeues only failed pending ticker adjustments (instead of dropping them), so newly listed symbols are retried automatically in subsequent production runs until they pass history checks.
+- Added pending retry helper logic in `scripts/production/daily_run.py` to preserve only failed ticker entries (with filtered exchange mappings) when clearing/applying the pending queue.
+- Hardened Trading212 history-fill parsing in `scripts/production/daily_run.py`:
+  - normalize negative sell fill quantities/values to positive magnitudes,
+  - capture explicit `fillPrice`,
+  - prefer `fillPrice` (when present) over derived `filledValue/quantity` for `exec_price`,
+  - propagate fill/value currency metadata for downstream notional conversion.
+- Updated broker notional currency selection in `scripts/production/daily_run.py` to prefer filled-value currency metadata when converting order notional into broker currency.
+- Expanded `tests/test_daily_run_trading212_execution.py` with regressions for:
+  - sell-order fill normalization and `exec_price` population,
+  - `exec_price` preference for explicit fill price,
+  - pending ticker retry-entry filtering.
+
 ## 2026-02-16
 - Added a run-calendar module at `src/run_calendar.py` with deterministic date decisions (`allow`/`skip`) using:
   - optional weekend blocking,

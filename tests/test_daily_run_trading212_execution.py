@@ -29,6 +29,7 @@ if "psycopg2" not in sys.modules:
     sys.modules["psycopg2.extras"] = fake_extras
 
 from scripts.production.daily_run import (
+    _build_retry_pending_ticker_entries,
     _broker_notionals,
     _execute_trading212_orders,
     _state_from_broker_context,
@@ -217,6 +218,93 @@ def test_execute_orders_reconciles_unresolved_status_with_positions_endpoint() -
     )
     assert client.position_calls >= 1
     assert client.history_calls >= 1
+
+
+def test_execute_orders_normalizes_negative_sell_fill_snapshot() -> None:
+    client = _FakeClient(
+        history_pages=[
+            {
+                "items": [
+                    {
+                        "order": {"id": "order-1", "status": "FILLED"},
+                        "fill": {
+                            "quantity": -4.0,
+                            "price": 200.0,
+                            "value": -800.0,
+                            "currencyCode": "USD",
+                        },
+                    }
+                ]
+            }
+        ],
+    )
+    context = _context_with_two_tickers(client)
+    trades = [{"ticker": "MSFT", "action": "SELL", "shares": -4}]
+    orders, missing, issues = _execute_trading212_orders(trades, context, dry_run=False)
+    assert missing == []
+    assert issues == []
+    assert len(orders) == 1
+    assert orders[0]["status"] == "FILLED"
+    assert orders[0]["filled_quantity"] == 4.0
+    assert orders[0]["exec_price"] == 200.0
+    assert orders[0]["currency"] == "USD"
+    assert orders[0]["payload"]["filledValue"] == 800.0
+
+
+def test_execute_orders_prefers_fill_price_for_exec_price() -> None:
+    client = _FakeClient(
+        history_pages=[
+            {
+                "items": [
+                    {
+                        "order": {"id": "order-1", "status": "FILLED"},
+                        "fill": {"quantity": 2.0, "price": 120.0, "value": 180.0, "currencyCode": "USD"},
+                    }
+                ]
+            }
+        ],
+    )
+    context = _context_with_two_tickers(client)
+    trades = [{"ticker": "AAPL", "action": "BUY", "shares": 2}]
+    orders, missing, issues = _execute_trading212_orders(trades, context, dry_run=False)
+    assert missing == []
+    assert issues == []
+    assert len(orders) == 1
+    assert orders[0]["status"] == "FILLED"
+    assert orders[0]["filled_quantity"] == 2.0
+    # Prefer explicit fill price over implied value/quantity division.
+    assert orders[0]["exec_price"] == 120.0
+
+
+def test_build_retry_pending_ticker_entries_filters_to_failed_tickers() -> None:
+    pending_entries = [
+        {
+            "type": "cash",
+            "amount": 100.0,
+            "source": "app",
+        },
+        {
+            "type": "tickers",
+            "tickers": ["SNDK", "AAPL"],
+            "exchanges": {"SNDK": "NASDAQ", "AAPL": "NASDAQ"},
+            "source": "app",
+        },
+        {
+            "type": "tickers",
+            "tickers": ["XYZ", "MSFT"],
+            "ticker_exchanges": [
+                {"ticker": "XYZ", "exchange": "NYSE"},
+                {"ticker": "MSFT", "exchange": "NASDAQ"},
+            ],
+            "source": "app",
+        },
+    ]
+    retry = _build_retry_pending_ticker_entries(pending_entries, {"SNDK", "XYZ"})
+    assert len(retry) == 2
+    assert retry[0]["tickers"] == ["SNDK"]
+    assert retry[0]["exchanges"] == {"SNDK": "NASDAQ"}
+    assert retry[1]["tickers"] == ["XYZ"]
+    assert retry[1]["exchanges"] == {"XYZ": "NYSE"}
 
 
 def test_broker_notionals_converts_order_currency_to_broker_currency() -> None:

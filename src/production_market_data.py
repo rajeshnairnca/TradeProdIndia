@@ -326,7 +326,9 @@ def add_universe_tickers(
     rolling_window: int | None = None,
     vix_ticker: str = "^VIX",
     recompute_cross_sectional: bool = True,
-) -> pd.DataFrame:
+    fail_on_no_valid_tickers: bool = True,
+    return_failed_tickers: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, list[str]]:
     """Add new tickers with yfinance history, then write back to parquet."""
     import yfinance as yf
     import pandas_ta_classic as ta  # noqa: F401
@@ -346,12 +348,15 @@ def add_universe_tickers(
     requested = [str(t).strip().upper() for t in tickers if str(t).strip()]
     new_tickers = [t for t in requested if t not in existing_tickers]
     if not new_tickers:
+        if return_failed_tickers:
+            return existing, []
         return existing
 
     rolling_window = rolling_window or config.ADV_LOOKBACK
 
     all_stock_data: dict[str, pd.DataFrame] = {}
     sector_by_ticker: dict[str, str] = {}
+    failed_tickers: set[str] = set()
     fetch_errors: list[str] = []
     for ticker in tqdm(new_tickers, desc="Fetching yfinance history", unit="ticker"):
         try:
@@ -360,10 +365,12 @@ def add_universe_tickers(
         except Exception as exc:  # noqa: BLE001
             msg = f"{ticker}: {type(exc).__name__}({exc})"
             fetch_errors.append(msg)
+            failed_tickers.add(ticker)
             logger.warning("Failed to fetch yfinance history for %s: %s", ticker, exc)
             continue
         if df.empty:
             fetch_errors.append(f"{ticker}: empty_history")
+            failed_tickers.add(ticker)
             logger.warning("Skipping %s: no yfinance history returned.", ticker)
             continue
         df = df.copy()
@@ -378,16 +385,26 @@ def add_universe_tickers(
         cleaned = df.dropna(subset=REQUIRED_INDICATOR_COLS)
         if len(cleaned) < min_trading_days:
             fetch_errors.append(f"{ticker}: insufficient_history({len(cleaned)})")
+            failed_tickers.add(ticker)
             continue
         all_stock_data[ticker] = cleaned
         sector_by_ticker[ticker] = _fetch_sector_yfinance(stock, ticker=ticker)
 
     if not all_stock_data:
         preview = ", ".join(fetch_errors[:10]) if fetch_errors else "no valid ticker data"
-        raise ValueError(
-            "No new tickers had sufficient data to add. "
-            f"Sample failures: {preview}"
+        if fail_on_no_valid_tickers:
+            raise ValueError(
+                "No new tickers had sufficient data to add. "
+                f"Sample failures: {preview}"
+            )
+        logger.warning(
+            "Skipping universe ticker add because no requested tickers had sufficient data. "
+            "Sample failures: %s",
+            preview,
         )
+        if return_failed_tickers:
+            return existing, sorted(failed_tickers)
+        return existing
 
     all_data_list: list[pd.DataFrame] = []
     for ticker, df in all_stock_data.items():
@@ -473,6 +490,8 @@ def add_universe_tickers(
         source=data_path,
         required_columns=_BASE_REQUIRED_COLUMNS,
     )
+    if return_failed_tickers:
+        return combined, sorted(failed_tickers)
     return combined
 
 

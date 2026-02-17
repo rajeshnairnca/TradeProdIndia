@@ -21,6 +21,7 @@ from src.production import (
     ProductionState,
 )
 from src.production_db import (
+    append_pending_adjustments as db_append_pending_adjustments,
     clear_pending_adjustments as db_clear_pending_adjustments,
     db_enabled,
     init_db as db_init,
@@ -181,6 +182,57 @@ def _normalize_exchange_map(mapping: dict[str, str]) -> dict[str, str]:
     return normalized
 
 
+def _build_retry_pending_ticker_entries(
+    pending_entries: list[dict],
+    retry_tickers: set[str],
+) -> list[dict]:
+    if not retry_tickers:
+        return []
+    retry_entries: list[dict] = []
+    for entry in pending_entries:
+        if str(entry.get("type", "")).strip().lower() != "tickers":
+            continue
+        tickers = entry.get("tickers", [])
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        selected_tickers = sorted(
+            {
+                str(ticker).strip().upper()
+                for ticker in (tickers or [])
+                if str(ticker).strip().upper() in retry_tickers
+            }
+        )
+        if not selected_tickers:
+            continue
+        retry_entry = dict(entry)
+        retry_entry["tickers"] = selected_tickers
+        exchanges_raw = entry.get("exchanges") or entry.get("ticker_exchanges") or {}
+        filtered_exchanges: dict[str, str] = {}
+        if isinstance(exchanges_raw, dict):
+            for ticker, exchange in exchanges_raw.items():
+                ticker_key = str(ticker).strip().upper()
+                if ticker_key not in selected_tickers:
+                    continue
+                exchange_key = str(exchange).strip().upper()
+                filtered_exchanges[ticker_key] = exchange_key or "UNKNOWN"
+        elif isinstance(exchanges_raw, list):
+            for item in exchanges_raw:
+                if not isinstance(item, dict):
+                    continue
+                ticker_key = str(item.get("ticker", "")).strip().upper()
+                if ticker_key not in selected_tickers:
+                    continue
+                exchange_key = str(item.get("exchange", "")).strip().upper()
+                filtered_exchanges[ticker_key] = exchange_key or "UNKNOWN"
+        retry_entry.pop("ticker_exchanges", None)
+        if filtered_exchanges:
+            retry_entry["exchanges"] = filtered_exchanges
+        else:
+            retry_entry.pop("exchanges", None)
+        retry_entries.append(retry_entry)
+    return retry_entries
+
+
 def _apply_universe_filter_with_exclusions(
     df: pd.DataFrame,
     excluded: set[str],
@@ -313,13 +365,26 @@ def _history_fill_snapshot(item: dict) -> dict:
     fill = fill if isinstance(fill, dict) else {}
     order = item.get("order")
     order = order if isinstance(order, dict) else {}
-    filled_qty = _safe_float(fill.get("quantity"))
+    filled_qty = abs(_safe_float(fill.get("quantity")))
     if filled_qty <= 0:
-        filled_qty = _safe_float(item.get("filledQuantity"))
-    fill_price = _safe_float(fill.get("price"))
+        filled_qty = abs(_safe_float(item.get("filledQuantity")))
+    if filled_qty <= 0:
+        filled_qty = abs(_safe_float(order.get("filledQuantity")))
+
+    fill_price = abs(_safe_float(fill.get("price")))
+    if fill_price <= 0:
+        fill_price = abs(_safe_float(item.get("fillPrice")))
+    if fill_price <= 0:
+        fill_price = abs(_safe_float(item.get("executedPrice")))
+    if fill_price <= 0:
+        fill_price = abs(_safe_float(order.get("price")))
+
     fill_value = _safe_float(fill.get("value"))
     if fill_value <= 0:
         fill_value = _safe_float(item.get("filledValue"))
+    if fill_value <= 0:
+        fill_value = _safe_float(order.get("filledValue"))
+    fill_value = abs(fill_value)
     if fill_value <= 0 and filled_qty > 0 and fill_price > 0:
         fill_value = filled_qty * fill_price
     payload: dict = {
@@ -331,6 +396,7 @@ def _history_fill_snapshot(item: dict) -> dict:
     if fill_value > 0:
         payload["filledValue"] = fill_value
     if fill_price > 0:
+        payload["fillPrice"] = fill_price
         payload["resolutionPriceSource"] = "history.orders.fill.price"
     currency = (
         fill.get("currencyCode")
@@ -341,7 +407,11 @@ def _history_fill_snapshot(item: dict) -> dict:
         or order.get("currency")
     )
     if currency:
-        payload["currency"] = str(currency)
+        currency_code = str(currency).strip().upper()
+        if currency_code:
+            payload["currency"] = currency_code
+            payload["filledValueCurrency"] = currency_code
+            payload["fillPriceCurrency"] = currency_code
     return payload
 
 
@@ -560,20 +630,30 @@ def _monitor_orders_with_positions_and_history(
         )
         for order_id, patch in updates.items():
             current = dict(snapshots.get(order_id) or {"id": order_id})
-            if _safe_float(current.get("filledValue")) > 0:
+            current_filled_value = abs(_safe_float(current.get("filledValue")))
+            current_fill_price = abs(_safe_float(current.get("fillPrice")))
+            patch_filled_value = abs(_safe_float(patch.get("filledValue")))
+            patch_fill_price = abs(_safe_float(patch.get("fillPrice")))
+            if current_filled_value > 0 and current_fill_price > 0:
                 continue
-            if _safe_float(patch.get("filledValue")) > 0:
+            if patch_filled_value <= 0 and patch_fill_price <= 0:
+                continue
+            if patch_filled_value > 0 and current_filled_value <= 0:
                 current["filledValue"] = patch["filledValue"]
-                if patch.get("resolutionPriceSource"):
-                    current["resolutionPriceSource"] = patch["resolutionPriceSource"]
-                snapshots[order_id] = current
-                _log(
-                    "broker_history_fill_price_applied",
-                    phase=phase,
-                    order_id=order_id,
-                    filled_qty=_safe_float(current.get("filledQuantity")),
-                    filled_value=_safe_float(current.get("filledValue")),
-                )
+            if patch_fill_price > 0 and current_fill_price <= 0:
+                current["fillPrice"] = patch["fillPrice"]
+            for key in ("resolutionPriceSource", "currency", "filledValueCurrency", "fillPriceCurrency"):
+                if patch.get(key):
+                    current[key] = patch[key]
+            snapshots[order_id] = current
+            _log(
+                "broker_history_fill_price_applied",
+                phase=phase,
+                order_id=order_id,
+                filled_qty=_safe_float(current.get("filledQuantity")),
+                filled_value=_safe_float(current.get("filledValue")),
+                fill_price=_safe_float(current.get("fillPrice")),
+            )
 
     return snapshots
 
@@ -1006,11 +1086,24 @@ def _execute_trading212_orders(
             order_id = item["order_id"]
             filled = bulk_status.get(order_id) or {"id": order_id, "status": "PENDING"}
             status = str(filled.get("status", "")).upper()
-            filled_qty = _safe_float(filled.get("filledQuantity"))
-            filled_value = _safe_float(filled.get("filledValue"))
+            filled_qty = abs(_safe_float(filled.get("filledQuantity")))
+            filled_value = abs(_safe_float(filled.get("filledValue")))
+            fill_price = abs(_safe_float(filled.get("fillPrice")))
             exec_price = None
-            if filled_qty > 0 and filled_value > 0:
+            if fill_price > 0:
+                exec_price = fill_price
+            elif filled_qty > 0 and filled_value > 0:
                 exec_price = filled_value / filled_qty
+            currency_code = (
+                str(
+                    filled.get("fillPriceCurrency")
+                    or filled.get("currency")
+                    or context.get("account_currency")
+                    or ""
+                )
+                .strip()
+                .upper()
+            )
             orders.append(
                 {
                     "ticker": item["ticker"],
@@ -1018,7 +1111,7 @@ def _execute_trading212_orders(
                     "quantity": item["shares"],
                     "filled_quantity": filled_qty,
                     "exec_price": exec_price,
-                    "currency": filled.get("currency") or context.get("account_currency"),
+                    "currency": currency_code or None,
                     "status": status,
                     "order_id": order_id,
                     "payload": filled,
@@ -1154,7 +1247,17 @@ def _broker_notionals(
         if notional <= 0:
             continue
 
-        order_currency = str(order.get("currency") or payload.get("currency") or "").strip().upper()
+        filled_value_currency = str(
+            payload.get("filledValueCurrency")
+            or payload.get("currency")
+            or ""
+        ).strip().upper()
+        price_currency = str(
+            payload.get("fillPriceCurrency")
+            or order.get("currency")
+            or ""
+        ).strip().upper()
+        order_currency = filled_value_currency or price_currency
         converted_notional = _convert_between_usd_gbp(
             amount=abs(notional),
             source_currency=order_currency,
@@ -1292,6 +1395,8 @@ def main():
     pending_cash_entries: list[dict] = []
     pending_tickers: list[str] = []
     pending_exchange_map: dict[str, str] = {}
+    failed_new_tickers: set[str] = set()
+    pending_ticker_candidates: set[str] = set()
     if not args.skip_pending:
         _log("pending_adjustments_load_start")
         pending_entries = db_load_pending_adjustments()
@@ -1361,6 +1466,15 @@ def main():
         new_tickers.extend(list(pending_exchange_map.keys()))
     if new_tickers:
         new_tickers = sorted(set(new_tickers))
+    pending_ticker_candidates = {
+        str(ticker).strip().upper()
+        for ticker in pending_tickers
+        if str(ticker).strip()
+    } | {
+        str(ticker).strip().upper()
+        for ticker in pending_exchange_map.keys()
+        if str(ticker).strip()
+    }
     if new_tickers:
         _log("universe_add_tickers_start", requested=len(new_tickers))
         if df is None:
@@ -1371,7 +1485,7 @@ def main():
                 required_columns=["Close", "Open", "High", "Low", "Volume"],
             )
         existing_tickers = set(df.index.get_level_values("ticker").unique())
-        df = add_universe_tickers(
+        df, failed_ticker_list = add_universe_tickers(
             data_path,
             new_tickers,
             period=args.history_period,
@@ -1379,9 +1493,21 @@ def main():
             min_trading_days=args.min_trading_days,
             rolling_window=args.rolling_window,
             vix_ticker=args.history_vix_ticker,
+            fail_on_no_valid_tickers=False,
+            return_failed_tickers=True,
         )
+        failed_new_tickers = {
+            str(ticker).strip().upper()
+            for ticker in failed_ticker_list
+            if str(ticker).strip()
+        }
         added = sorted(set(df.index.get_level_values("ticker").unique()) - existing_tickers)
-        _log("universe_add_tickers_complete", added=len(added))
+        _log(
+            "universe_add_tickers_complete",
+            added=len(added),
+            failed=len(failed_new_tickers),
+            failed_preview=sorted(failed_new_tickers)[:10],
+        )
         if added:
             for ticker in added:
                 universe_map.setdefault(str(ticker).strip().upper(), "UNKNOWN")
@@ -1760,7 +1886,20 @@ def main():
             db_replace_broker_orders(summary["date"], "trading212", broker_orders)
         db_upsert_state(state_to_persist)
         if pending_entries:
+            retry_pending_tickers = failed_new_tickers & pending_ticker_candidates
+            retry_entries = _build_retry_pending_ticker_entries(
+                pending_entries,
+                retry_tickers=retry_pending_tickers,
+            )
             db_clear_pending_adjustments()
+            if retry_entries:
+                db_append_pending_adjustments(retry_entries)
+                _log(
+                    "pending_adjustments_requeued",
+                    entries=len(retry_entries),
+                    retry_tickers=len(retry_pending_tickers),
+                    retry_preview=sorted(retry_pending_tickers)[:10],
+                )
         _log("db_persist_complete")
 
     print(f"Run date: {summary['date']}")
