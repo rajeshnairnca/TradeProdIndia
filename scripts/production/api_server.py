@@ -233,6 +233,7 @@ class ExcludeTickersRequest(BaseModel):
 
 class ResetRequest(BaseModel):
     confirm: str
+    preserve_universe_monitor: bool = True
 
 
 class RunCalendarOverrideRequest(BaseModel):
@@ -874,7 +875,21 @@ def delete_pending_adjustments():
 
 @app.post("/reset-production", dependencies=[Depends(_require_api_key)])
 def reset_production(payload: ResetRequest):
-    if payload.confirm != "RESET_PRODUCTION_DATA":
-        raise HTTPException(status_code=400, detail="Confirmation token missing or invalid.")
-    db_reset_production_data()
-    return {"reset": True}
+    preserve_monitor = bool(payload.preserve_universe_monitor)
+    if preserve_monitor:
+        if payload.confirm != "RESET_PRODUCTION_DATA":
+            raise HTTPException(status_code=400, detail="Confirmation token missing or invalid.")
+    else:
+        if payload.confirm != "RESET_PRODUCTION_AND_MONITOR_DATA":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid confirmation token for full reset. "
+                    "Use RESET_PRODUCTION_AND_MONITOR_DATA."
+                ),
+            )
+    db_reset_production_data(preserve_universe_monitor=preserve_monitor)
+    return {
+        "reset": True,
+        "preserve_universe_monitor": preserve_monitor,
+    }

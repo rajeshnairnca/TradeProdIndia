@@ -20,6 +20,9 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - sell-order fill normalization and `exec_price` population,
   - `exec_price` preference for explicit fill price,
   - pending ticker retry-entry filtering.
+- Hardened production reset behavior to preserve universe-monitor pass-streak data by default:
+  - `src/production_db.py` `reset_production_data(...)` now takes `preserve_universe_monitor` (default `True`) and only truncates universe-monitor tables when explicitly disabled.
+  - `scripts/production/api_server.py` `POST /reset-production` now accepts `preserve_universe_monitor` (default `true`), returns the applied mode, and requires stronger confirmation token (`RESET_PRODUCTION_AND_MONITOR_DATA`) for full monitor-data wipes.
 
 ## 2026-02-16
 - Added a run-calendar module at `src/run_calendar.py` with deterministic date decisions (`allow`/`skip`) using:

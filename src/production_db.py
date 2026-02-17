@@ -1683,22 +1683,27 @@ def clear_pending_adjustments() -> None:
         cur.execute("DELETE FROM production_pending_adjustments;")
 
 
-def reset_production_data() -> None:
+def reset_production_data(preserve_universe_monitor: bool = True) -> None:
     if not db_enabled():
         raise RuntimeError("DATABASE_URL/POSTGRES_URL not configured.")
     init_db()
     with _connect() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
-            TRUNCATE
-                production_runs,
-                production_trades,
-                production_prices,
-                production_state,
-                production_pending_adjustments,
-                production_broker_account,
-                production_broker_positions,
-                production_broker_orders;
-            """
-        )
+        tables = [
+            "production_runs",
+            "production_trades",
+            "production_prices",
+            "production_state",
+            "production_pending_adjustments",
+            "production_broker_account",
+            "production_broker_positions",
+            "production_broker_orders",
+        ]
+        if not preserve_universe_monitor:
+            tables.extend(
+                [
+                    "production_universe_monitor_state",
+                    "production_universe_monitor_candidates",
+                ]
+            )
+        cur.execute(f"TRUNCATE {', '.join(tables)};")
