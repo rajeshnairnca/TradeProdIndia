@@ -2,6 +2,28 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-20
+- Added a shared pagination guard in `scripts/production/api_server.py` (`_normalize_pagination`) with configurable defaults (`API_DEFAULT_PAGE_LIMIT`, `API_MAX_PAGE_LIMIT`) and strict validation (`limit > 0`, `offset >= 0`, capped max limit) to prevent accidental unbounded reads.
+- Converted list-style API endpoints to a consistent paginated response contract (`total`, `count`, `limit`, `offset`, data array) and removed unbounded defaults:
+  - `/summaries`, `/latest-trades`, `/trades`
+  - `/universe`
+  - `/universe-monitor/candidates`, `/universe-monitor/potential`
+  - `/broker-positions`, `/broker-orders`, `/latest-broker-orders`
+  - `/excluded-tickers`
+  - `/run-calendar/overrides`
+  - `/stale-tickers`
+  - `/pending-adjustments`
+- Added SQL-level paginated helpers in `src/production_db.py` so pagination happens in Postgres (instead of loading full tables in memory first):
+  - `list_universe_map(...)`
+  - `list_excluded_tickers(...)`
+  - `list_run_calendar_overrides_paginated(...)`
+  - `list_run_summaries_paginated(...)`
+  - `list_latest_trades(...)`
+  - `list_latest_broker_positions(...)`
+  - `list_latest_broker_orders(...)`
+  - `list_pending_adjustments(...)`
+- Kept existing full-load helper functions for non-API internal workflows (e.g., CAGR/existing production scripts) while routing API reads through the new paginated helpers.
+
 ## 2026-02-17
 - Updated `src/production_market_data.py` `add_universe_tickers(...)` with a new `fail_on_no_valid_tickers` flag (default `True`) so callers can choose non-fatal behavior when all requested new tickers fail history sufficiency checks.
 - Wired `scripts/production/daily_run.py` to call `add_universe_tickers(..., fail_on_no_valid_tickers=False)`, preventing production runs from aborting when queued tickers have insufficient post-indicator history (e.g., newly listed symbols).

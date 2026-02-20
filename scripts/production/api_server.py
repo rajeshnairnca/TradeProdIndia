@@ -18,15 +18,19 @@ from src.production_db import (
     db_enabled,
     delete_run_calendar_override as db_delete_run_calendar_override,
     init_db as db_init,
-    list_run_calendar_overrides as db_list_run_calendar_overrides,
+    list_excluded_tickers as db_list_excluded_tickers,
+    list_latest_broker_orders as db_list_latest_broker_orders,
+    list_latest_broker_positions as db_list_latest_broker_positions,
+    list_latest_trades as db_list_latest_trades,
+    list_pending_adjustments as db_list_pending_adjustments,
+    list_run_calendar_overrides_paginated as db_list_run_calendar_overrides_paginated,
+    list_run_summaries_paginated as db_list_run_summaries_paginated,
+    list_universe_map as db_list_universe_map,
     latest_run_date as db_latest_run_date,
     latest_prices as db_latest_prices,
     latest_price_run_date as db_latest_price_run_date,
     latest_summary as db_latest_summary,
-    latest_trades as db_latest_trades,
     latest_broker_account as db_latest_broker_account,
-    latest_broker_orders as db_latest_broker_orders,
-    latest_broker_positions as db_latest_broker_positions,
     latest_universe_monitor_summary as db_latest_universe_monitor_summary,
     list_run_summaries as db_list_run_summaries,
     list_broker_orders as db_list_broker_orders,
@@ -35,7 +39,6 @@ from src.production_db import (
     load_excluded_tickers as db_load_excluded_tickers,
     load_run_calendar_override as db_load_run_calendar_override,
     load_universe_map as db_load_universe_map,
-    load_pending_adjustments as db_load_pending_adjustments,
     price_tickers_for_date as db_price_tickers_for_date,
     replace_excluded_tickers as db_replace_excluded_tickers,
     load_state as db_load_state,
@@ -55,6 +58,8 @@ FX_TIMEOUT_SECONDS = float(os.getenv("FX_TIMEOUT_SECONDS", "4.0"))
 FX_CACHE_TTL_SECONDS = int(os.getenv("FX_CACHE_TTL_SECONDS", "3600"))
 SUPPORTED_FX_CURRENCIES = {"USD", "GBP"}
 _fx_cache: dict[tuple[str, str], dict[str, object]] = {}
+DEFAULT_PAGE_LIMIT = int(os.getenv("API_DEFAULT_PAGE_LIMIT", "200"))
+MAX_PAGE_LIMIT = int(os.getenv("API_MAX_PAGE_LIMIT", "1000"))
 
 if not db_enabled():
     raise RuntimeError(
@@ -256,6 +261,24 @@ def _normalize_iso_date(value: str, field_name: str = "date") -> str:
         )
 
 
+def _normalize_pagination(
+    limit: int,
+    offset: int,
+    *,
+    default_limit: int = DEFAULT_PAGE_LIMIT,
+    max_limit: int = MAX_PAGE_LIMIT,
+) -> tuple[int, int]:
+    normalized_limit = default_limit if limit is None else int(limit)
+    normalized_offset = 0 if offset is None else int(offset)
+    if normalized_limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be > 0")
+    if normalized_offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    if normalized_limit > max_limit:
+        raise HTTPException(status_code=400, detail=f"limit must be <= {max_limit}")
+    return normalized_limit, normalized_offset
+
+
 def _require_api_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None, alias="Authorization"),
@@ -336,40 +359,19 @@ def latest_summary():
 def summaries(
     start: str | None = None,
     end: str | None = None,
-    limit: int = 0,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
     fields: str | None = None,
 ):
-    if limit < 0:
-        raise HTTPException(status_code=400, detail="limit must be >= 0")
-
-    start_dt = pd.to_datetime(start) if start else None
-    end_dt = pd.to_datetime(end) if end else None
-
-    rows: list[dict] = db_list_run_summaries()
-
-    if not rows:
-        return {"count": 0, "summaries": []}
-
-    def _parse_date(value: str | None):
-        try:
-            return pd.to_datetime(value) if value else None
-        except (TypeError, ValueError):
-            return None
-
-    filtered: list[dict] = []
-    for row in rows:
-        row_date = _parse_date(row.get("date"))
-        if row_date is None:
-            continue
-        if start_dt and row_date < start_dt:
-            continue
-        if end_dt and row_date > end_dt:
-            continue
-        filtered.append(row)
-
-    filtered = sorted(filtered, key=lambda r: str(r.get("date")))
-    if limit:
-        filtered = filtered[-limit:]
+    limit, offset = _normalize_pagination(limit, offset)
+    start_date = _normalize_iso_date(start, field_name="start") if start else None
+    end_date = _normalize_iso_date(end, field_name="end") if end else None
+    total, filtered = db_list_run_summaries_paginated(
+        start=start_date,
+        end=end_date,
+        limit=limit,
+        offset=offset,
+    )
 
     field_list: list[str] | None = None
     if fields:
@@ -381,26 +383,44 @@ def summaries(
             trimmed.append({key: row.get(key) for key in field_list})
         filtered = trimmed
 
-    return {"count": len(filtered), "summaries": filtered}
+    return {
+        "total": total,
+        "count": len(filtered),
+        "limit": limit,
+        "offset": offset,
+        "summaries": filtered,
+    }
 
 
 @app.get("/latest-trades", dependencies=[Depends(_require_api_key)])
-def latest_trades(limit: int = 0):
-    rows = db_latest_trades(limit=limit)
-    if not rows:
+def latest_trades(limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0):
+    limit, offset = _normalize_pagination(limit, offset)
+    total, rows = db_list_latest_trades(limit=limit, offset=offset)
+    if total <= 0:
         raise HTTPException(status_code=404, detail="Latest trades not found.")
-    return {"trades": rows}
+    if not rows:
+        return {"total": total, "count": 0, "limit": limit, "offset": offset, "trades": []}
+    return {
+        "total": total,
+        "count": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "trades": rows,
+    }
 
 
 @app.get("/trades", dependencies=[Depends(_require_api_key)])
 def trades(limit: int = 200, offset: int = 0):
-    if limit < 0:
-        raise HTTPException(status_code=400, detail="limit must be >= 0")
-    if offset < 0:
-        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    limit, offset = _normalize_pagination(limit, offset)
 
     total, records = db_list_trades(limit, offset)
-    return {"total": total, "limit": limit, "offset": offset, "trades": records}
+    return {
+        "total": total,
+        "count": len(records),
+        "limit": limit,
+        "offset": offset,
+        "trades": records,
+    }
 
 
 @app.get("/cagr", dependencies=[Depends(_require_api_key)])
@@ -585,12 +605,18 @@ def portfolio_snapshot():
 
 
 @app.get("/universe", dependencies=[Depends(_require_api_key)])
-def universe_listing():
-    mapping = db_load_universe_map()
-    if not mapping:
+def universe_listing(limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0):
+    limit, offset = _normalize_pagination(limit, offset)
+    total, universe = db_list_universe_map(limit=limit, offset=offset)
+    if total <= 0:
         raise HTTPException(status_code=404, detail="Universe mapping not found.")
-    universe = [{"ticker": k, "exchange": v} for k, v in sorted(mapping.items())]
-    return {"count": len(universe), "universe": universe}
+    return {
+        "total": total,
+        "count": len(universe),
+        "limit": limit,
+        "offset": offset,
+        "universe": universe,
+    }
 
 
 @app.get("/universe-monitor/summary", dependencies=[Depends(_require_api_key)])
@@ -611,10 +637,7 @@ def universe_monitor_candidates(
     watchlist: bool = False,
     potential: bool = False,
 ):
-    if limit < 0:
-        raise HTTPException(status_code=400, detail="limit must be >= 0")
-    if offset < 0:
-        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    limit, offset = _normalize_pagination(limit, offset)
 
     total, records = db_list_universe_monitor_candidates(
         limit=limit,
@@ -624,6 +647,7 @@ def universe_monitor_candidates(
     )
     return {
         "total": total,
+        "count": len(records),
         "limit": limit,
         "offset": offset,
         "watchlist": watchlist,
@@ -651,37 +675,78 @@ def broker_summary(broker: str = "trading212"):
 
 
 @app.get("/broker-positions", dependencies=[Depends(_require_api_key)])
-def broker_positions(broker: str = "trading212"):
-    positions = db_latest_broker_positions(broker)
-    if positions:
-        return {"count": len(positions), "positions": positions}
+def broker_positions(
+    broker: str = "trading212",
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
+):
+    limit, offset = _normalize_pagination(limit, offset)
+    total, positions = db_list_latest_broker_positions(
+        broker=broker,
+        limit=limit,
+        offset=offset,
+    )
+    if total > 0:
+        return {
+            "total": total,
+            "count": len(positions),
+            "limit": limit,
+            "offset": offset,
+            "positions": positions,
+        }
     raise HTTPException(status_code=404, detail="Broker positions not found.")
 
 
 @app.get("/broker-orders", dependencies=[Depends(_require_api_key)])
 def broker_orders(broker: str = "trading212", limit: int = 200, offset: int = 0):
-    if limit < 0:
-        raise HTTPException(status_code=400, detail="limit must be >= 0")
-    if offset < 0:
-        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    limit, offset = _normalize_pagination(limit, offset)
     total, records = db_list_broker_orders(broker, limit, offset)
     if total > 0:
-        return {"total": total, "limit": limit, "offset": offset, "orders": records}
-    return {"total": 0, "limit": limit, "offset": offset, "orders": []}
+        return {
+            "total": total,
+            "count": len(records),
+            "limit": limit,
+            "offset": offset,
+            "orders": records,
+        }
+    return {"total": 0, "count": 0, "limit": limit, "offset": offset, "orders": []}
 
 
 @app.get("/latest-broker-orders", dependencies=[Depends(_require_api_key)])
-def latest_broker_orders(broker: str = "trading212", limit: int = 0):
-    records = db_latest_broker_orders(broker, limit=limit)
-    if records:
-        return {"orders": records}
+def latest_broker_orders(
+    broker: str = "trading212",
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
+):
+    limit, offset = _normalize_pagination(limit, offset)
+    total, records = db_list_latest_broker_orders(
+        broker=broker,
+        limit=limit,
+        offset=offset,
+    )
+    if total > 0:
+        return {
+            "total": total,
+            "count": len(records),
+            "limit": limit,
+            "offset": offset,
+            "orders": records,
+        }
     raise HTTPException(status_code=404, detail="Broker orders not found.")
 
 
 @app.get("/excluded-tickers", dependencies=[Depends(_require_api_key)])
-def list_excluded_tickers():
-    excluded, source = _load_effective_excluded_tickers()
-    return {"count": len(excluded), "excluded_tickers": sorted(excluded), "source": source}
+def list_excluded_tickers(limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0):
+    limit, offset = _normalize_pagination(limit, offset)
+    total, excluded = db_list_excluded_tickers(limit=limit, offset=offset)
+    return {
+        "total": total,
+        "count": len(excluded),
+        "limit": limit,
+        "offset": offset,
+        "excluded_tickers": excluded,
+        "source": "db",
+    }
 
 
 @app.post("/exclude-tickers", dependencies=[Depends(_require_api_key)])
@@ -724,11 +789,25 @@ def run_calendar_decision(date: str):
 def run_calendar_overrides(
     start: str | None = None,
     end: str | None = None,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
 ):
+    limit, offset = _normalize_pagination(limit, offset)
     start_date = _normalize_iso_date(start, field_name="start") if start else None
     end_date = _normalize_iso_date(end, field_name="end") if end else None
-    rows = db_list_run_calendar_overrides(start=start_date, end=end_date)
-    return {"count": len(rows), "overrides": rows}
+    total, rows = db_list_run_calendar_overrides_paginated(
+        start=start_date,
+        end=end_date,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "total": total,
+        "count": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "overrides": rows,
+    }
 
 
 @app.post("/run-calendar/overrides", dependencies=[Depends(_require_api_key)])
@@ -778,7 +857,12 @@ def run_calendar_us_federal_holidays(year: int):
 
 
 @app.get("/stale-tickers", dependencies=[Depends(_require_api_key)])
-def stale_tickers(date: Optional[str] = None):
+def stale_tickers(
+    date: Optional[str] = None,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
+):
+    limit, offset = _normalize_pagination(limit, offset)
     mapping = db_load_universe_map()
     if not mapping:
         raise HTTPException(status_code=404, detail="Universe mapping not found.")
@@ -802,11 +886,16 @@ def stale_tickers(date: Optional[str] = None):
     observed = db_price_tickers_for_date(target_run_date)
     if observed:
         tickers -= observed
+    stale_sorted = sorted(tickers)
+    paged = stale_sorted[offset : offset + limit]
 
     return {
         "as_of": target_run_date,
-        "count": len(tickers),
-        "stale_tickers": sorted(tickers),
+        "total": len(stale_sorted),
+        "count": len(paged),
+        "limit": limit,
+        "offset": offset,
+        "stale_tickers": paged,
         "source": "db",
     }
 
@@ -856,9 +945,16 @@ def queue_adjustments(payload: AdjustmentRequest):
 
 
 @app.get("/pending-adjustments", dependencies=[Depends(_require_api_key)])
-def list_pending_adjustments():
-    entries: list[dict] = db_load_pending_adjustments()
-    return {"pending": entries}
+def list_pending_adjustments(limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0):
+    limit, offset = _normalize_pagination(limit, offset)
+    total, entries = db_list_pending_adjustments(limit=limit, offset=offset)
+    return {
+        "total": total,
+        "count": len(entries),
+        "limit": limit,
+        "offset": offset,
+        "pending": entries,
+    }
 
 
 @app.post("/clear-pending", dependencies=[Depends(_require_api_key)])

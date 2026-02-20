@@ -674,6 +674,36 @@ def load_universe_map() -> dict[str, str]:
         return out
 
 
+def list_universe_map(limit: int, offset: int) -> tuple[int, list[dict[str, str]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM production_universe_map;")
+        total = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            """
+            SELECT ticker, exchange
+            FROM production_universe_map
+            ORDER BY ticker ASC
+            OFFSET %s LIMIT %s;
+            """,
+            (offset, limit),
+        )
+        rows = []
+        for ticker, exchange in cur.fetchall():
+            if not ticker:
+                continue
+            rows.append(
+                {
+                    "ticker": str(ticker).strip().upper(),
+                    "exchange": str(exchange or "UNKNOWN").strip().upper(),
+                }
+            )
+        return total, rows
+
+
 def load_excluded_tickers() -> set[str]:
     if not db_enabled():
         return set()
@@ -691,6 +721,33 @@ def load_excluded_tickers() -> set[str]:
             for row in cur.fetchall()
             if row and row[0] and str(row[0]).strip()
         }
+
+
+def list_excluded_tickers(limit: int, offset: int) -> tuple[int, list[str]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM production_excluded_tickers;")
+        total = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            """
+            SELECT ticker
+            FROM production_excluded_tickers
+            ORDER BY ticker ASC
+            OFFSET %s LIMIT %s;
+            """,
+            (offset, limit),
+        )
+        rows = []
+        for row in cur.fetchall():
+            if not row or not row[0]:
+                continue
+            ticker = str(row[0]).strip().upper()
+            if ticker:
+                rows.append(ticker)
+        return total, rows
 
 
 def replace_excluded_tickers(tickers: Iterable[str]) -> None:
@@ -812,6 +869,46 @@ def list_run_calendar_overrides(
             params,
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+def list_run_calendar_overrides_paginated(
+    start: str | None,
+    end: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    where: list[str] = []
+    params: list[Any] = []
+    if start:
+        where.append("run_date >= %s")
+        params.append(_normalize_date_value(start))
+    if end:
+        where.append("run_date <= %s")
+        params.append(_normalize_date_value(end))
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM production_run_calendar_overrides{where_sql};",
+            params,
+        )
+        total = int(cur.fetchone()[0] or 0)
+        page_params = [*params, offset, limit]
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT run_date::text AS run_date, action, reason, source, updated_at
+            FROM production_run_calendar_overrides
+            {where_sql}
+            ORDER BY run_date ASC
+            OFFSET %s LIMIT %s;
+            """,
+            page_params,
+        )
+        return total, [dict(row) for row in cur.fetchall()]
 
 
 def delete_run_calendar_override(run_date: str) -> bool:
@@ -989,6 +1086,77 @@ def list_run_summaries() -> list[dict[str, Any]]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def list_run_summaries_paginated(
+    start: str | None,
+    end: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    where: list[str] = []
+    params: list[Any] = []
+    if start:
+        where.append("run_date >= %s")
+        params.append(_normalize_date_value(start))
+    if end:
+        where.append("run_date <= %s")
+        params.append(_normalize_date_value(end))
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT COUNT(*) FROM production_runs{where_sql};",
+            params,
+        )
+        total = int(cur.fetchone()[0] or 0)
+
+        page_params = [*params, offset, limit]
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            f"""
+            SELECT run_date AS date,
+                   num_trades,
+                   net_worth_usd,
+                   cash_usd,
+                   portfolio_value_usd,
+                   cash_weight,
+                   regime,
+                   strategies,
+                   daily_costs_usd,
+                   total_costs_usd,
+                   sector,
+                   regime_scope,
+                   cash_adjustment,
+                   broker_name,
+                   broker_currency,
+                   broker_cash,
+                   broker_cash_before,
+                   broker_cash_after,
+                   broker_portfolio_value,
+                   broker_net_worth,
+                   broker_cash_weight,
+                   broker_discrepancies,
+                   broker_buy_notional,
+                   broker_sell_notional,
+                   broker_external_flow,
+                   broker_external_flow_usd,
+                   broker_execution_cost,
+                   broker_execution_cost_usd,
+                   broker_total_execution_cost,
+                   broker_total_execution_cost_usd
+            FROM production_runs
+            {where_sql}
+            ORDER BY run_date DESC
+            OFFSET %s LIMIT %s;
+            """,
+            page_params,
+        )
+        return total, [dict(row) for row in cur.fetchall()]
+
+
 def latest_run_date() -> str | None:
     if not db_enabled():
         return None
@@ -1105,6 +1273,70 @@ def latest_trades(limit: int = 0) -> list[dict[str, Any]]:
         if limit and limit > 0:
             return rows[:limit]
         return rows
+
+
+def list_latest_trades(limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT run_date FROM production_runs ORDER BY run_date DESC LIMIT 1;")
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return 0, []
+        run_date = row[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM production_trades WHERE run_date = %s;",
+            (run_date,),
+        )
+        total = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            """
+            SELECT run_date, ticker, action, shares, price_usd, value_usd,
+                   net_worth_usd, cash_usd, portfolio_value_usd, cash_weight,
+                   regime, strategies
+            FROM production_trades
+            WHERE run_date = %s
+            ORDER BY ticker ASC, id DESC
+            OFFSET %s LIMIT %s;
+            """,
+            (run_date, offset, limit),
+        )
+        rows = []
+        for row in cur.fetchall():
+            (
+                run_date,
+                ticker,
+                action,
+                shares,
+                price_usd,
+                value_usd,
+                net_worth_usd,
+                cash_usd,
+                portfolio_value_usd,
+                cash_weight,
+                regime,
+                strategies,
+            ) = row
+            rows.append(
+                {
+                    "run_date": str(run_date) if run_date else None,
+                    "date": str(run_date) if run_date else None,
+                    "ticker": ticker,
+                    "action": action,
+                    "shares": shares,
+                    "price_usd": price_usd,
+                    "value_usd": value_usd,
+                    "net_worth_usd": net_worth_usd,
+                    "cash_usd": cash_usd,
+                    "portfolio_value_usd": portfolio_value_usd,
+                    "cash_weight": cash_weight,
+                    "regime": regime,
+                    "strategies": strategies,
+                }
+            )
+        return total, rows
 
 
 def upsert_broker_account(run_date: str, broker: str, summary: dict[str, Any]) -> None:
@@ -1312,6 +1544,56 @@ def latest_broker_positions(broker: str) -> list[dict[str, Any]]:
         return [dict(row) for row in cur.fetchall()]
 
 
+def list_latest_broker_positions(
+    broker: str,
+    limit: int,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT MAX(run_date) FROM production_broker_positions WHERE broker = %s;",
+            (broker,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return 0, []
+        run_date = row[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM production_broker_positions
+            WHERE broker = %s AND run_date = %s;
+            """,
+            (broker, run_date),
+        )
+        total = int(cur.fetchone()[0] or 0)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date,
+                   broker,
+                   ticker,
+                   quantity,
+                   average_price,
+                   current_price,
+                   instrument_currency,
+                   account_currency,
+                   wallet_current_value,
+                   payload
+            FROM production_broker_positions
+            WHERE broker = %s AND run_date = %s
+            ORDER BY ticker ASC
+            OFFSET %s LIMIT %s;
+            """,
+            (broker, run_date, offset, limit),
+        )
+        return total, [dict(item) for item in cur.fetchall()]
+
+
 def list_broker_orders(broker: str, limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
     if not db_enabled():
         return 0, []
@@ -1386,6 +1668,58 @@ def latest_broker_orders(broker: str, limit: int = 0) -> list[dict[str, Any]]:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(query, params)
         return [dict(row) for row in cur.fetchall()]
+
+
+def list_latest_broker_orders(
+    broker: str,
+    limit: int,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT run_date FROM production_broker_orders WHERE broker = %s ORDER BY run_date DESC LIMIT 1;",
+            (broker,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return 0, []
+        run_date = row[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM production_broker_orders
+            WHERE broker = %s AND run_date = %s;
+            """,
+            (broker, run_date),
+        )
+        total = int(cur.fetchone()[0] or 0)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT run_date,
+                   broker,
+                   ticker,
+                   action,
+                   quantity,
+                   filled_quantity,
+                   exec_price,
+                   currency,
+                   status,
+                   order_id,
+                   payload,
+                   created_at
+            FROM production_broker_orders
+            WHERE broker = %s AND run_date = %s
+            ORDER BY id DESC
+            OFFSET %s LIMIT %s;
+            """,
+            (broker, run_date, offset, limit),
+        )
+        return total, [dict(item) for item in cur.fetchall()]
 
 
 def replace_universe_monitor_snapshot(
@@ -1672,6 +2006,30 @@ def load_pending_adjustments() -> list[dict[str, Any]]:
             "SELECT payload FROM production_pending_adjustments ORDER BY id ASC;"
         )
         return [row[0] for row in cur.fetchall() if row and row[0]]
+
+
+def list_pending_adjustments(limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM production_pending_adjustments;")
+        total = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            """
+            SELECT payload
+            FROM production_pending_adjustments
+            ORDER BY id ASC
+            OFFSET %s LIMIT %s;
+            """,
+            (offset, limit),
+        )
+        entries = []
+        for row in cur.fetchall():
+            if row and row[0]:
+                entries.append(row[0])
+        return total, entries
 
 
 def clear_pending_adjustments() -> None:
