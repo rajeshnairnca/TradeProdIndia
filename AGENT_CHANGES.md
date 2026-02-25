@@ -2,6 +2,9 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-25
+- Updated `scripts/production/api_server.py` `/cagr` annualization to match backtester behavior by using a 252-trading-day basis from summary-row counts (including broker `cagr`/`cagr_adjusted`) instead of calendar-day `365.25` elapsed-time annualization.
+
 ## 2026-02-20
 - Added a shared pagination guard in `scripts/production/api_server.py` (`_normalize_pagination`) with configurable defaults (`API_DEFAULT_PAGE_LIMIT`, `API_MAX_PAGE_LIMIT`) and strict validation (`limit > 0`, `offset >= 0`, capped max limit) to prevent accidental unbounded reads.
 - Converted list-style API endpoints to a consistent paginated response contract (`total`, `count`, `limit`, `offset`, data array) and removed unbounded defaults:

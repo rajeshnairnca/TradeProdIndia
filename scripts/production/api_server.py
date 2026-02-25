@@ -439,7 +439,8 @@ def cagr_summary():
     end = summaries[-1]
     start_date = pd.to_datetime(start["date"])
     end_date = pd.to_datetime(end["date"])
-    years = (end_date - start_date).days / 365.25 if end_date > start_date else 0.0
+    # Match backtester CAGR annualization: treat each summary row as one trading day.
+    years = len(summaries) / 252.0
     start_value = float(start.get("net_worth_usd", 0.0))
     end_value = float(end.get("net_worth_usd", 0.0))
     if years <= 0 or start_value <= 0:
@@ -486,7 +487,8 @@ def cagr_summary():
         b_end = broker_summaries[-1]
         b_start_date = pd.to_datetime(b_start["date"])
         b_end_date = pd.to_datetime(b_end["date"])
-        b_years = (b_end_date - b_start_date).days / 365.25 if b_end_date > b_start_date else 0.0
+        # Use the same 252-trading-day basis for broker-side CAGR values.
+        b_years = len(broker_summaries) / 252.0
         b_start_val = float(b_start.get("broker_net_worth", 0.0))
         b_end_val = float(b_end.get("broker_net_worth", 0.0))
         if b_years > 0 and b_start_val > 0:
@@ -539,7 +541,7 @@ def cagr_summary():
         "irr": irr,
         "cash_adjustments_total_usd": cash_adjustments,
         "broker": broker_payload,
-        "note": "cagr_adjusted uses time-weighted returns with cash flows applied at period start; irr is money-weighted using net worth and cash adjustments.",
+        "note": "CAGR and cagr_adjusted are annualized on a 252-trading-day basis from summary rows; cagr_adjusted uses time-weighted returns with cash flows applied at period start; irr is money-weighted using net worth and cash adjustments.",
     }
 
 
