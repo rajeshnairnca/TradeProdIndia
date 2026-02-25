@@ -1808,12 +1808,15 @@ def main():
             summary["broker_external_flow"] = external_flow_broker
             summary["broker_external_flow_usd"] = float(total_cash)
 
+            # Reconcile broker cash movement to isolate execution costs:
+            # cash_after ~= cash_before + sells - buys - costs + external_flow
+            # => costs ~= cash_before + sells - buys + external_flow - cash_after
             broker_execution_cost = (
                 broker_cash_before
                 + sell_notional
                 - buy_notional
                 - broker_cash_after
-                - external_flow_broker
+                + external_flow_broker
             )
             if abs(broker_execution_cost) <= 1e-9:
                 broker_execution_cost = 0.0
