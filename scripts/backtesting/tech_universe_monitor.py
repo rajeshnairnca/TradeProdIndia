@@ -18,6 +18,8 @@ from src import config
 from src.production_db import (
     db_enabled,
     init_db as db_init,
+    latest_universe_monitor_summary as db_latest_universe_monitor_summary,
+    list_universe_monitor_candidates as db_list_universe_monitor_candidates,
     replace_universe_monitor_snapshot as db_replace_universe_monitor_snapshot,
 )
 from src.production_market_data import _fetch_tv_analyses_batch, _resolve_tv_interval
@@ -104,14 +106,8 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Consecutive passing runs required before flagging potential additions.",
     )
-    parser.add_argument(
-        "--state-file",
-        default="runs/universe_monitor/tech_monitor_state.json",
-        help="Persistent state file for pass streak tracking.",
-    )
     parser.add_argument("--output-root", default="runs/universe_monitor", help="Output root directory.")
     parser.add_argument("--skip-file-output", action="store_true", help="Do not write CSV/JSON run artifacts.")
-    parser.add_argument("--skip-db", action="store_true", help="Do not write monitor outputs to Postgres.")
     return parser.parse_args()
 
 
@@ -140,36 +136,43 @@ def _load_universe_tickers(path: Path) -> set[str]:
     return {line.strip().upper() for line in path.read_text().splitlines() if line.strip()}
 
 
-def _load_state(path: Path) -> dict:
-    if not path.exists():
-        return {"last_run_date": None, "records": {}, "sector_cache": {}, "market_cap_cache": {}}
-    try:
-        payload = json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return {"last_run_date": None, "records": {}, "sector_cache": {}, "market_cap_cache": {}}
-    if not isinstance(payload, dict):
-        return {"last_run_date": None, "records": {}, "sector_cache": {}, "market_cap_cache": {}}
-    records = payload.get("records", {})
-    sector_cache = payload.get("sector_cache", {})
-    market_cap_cache = payload.get("market_cap_cache", {})
-    normalized_market_cap_cache: dict[str, float | None] = {}
-    if isinstance(market_cap_cache, dict):
-        for ticker, value in market_cap_cache.items():
-            key = str(ticker).strip().upper()
-            if not key:
+def _load_monitor_state_from_db() -> tuple[str | None, dict[str, dict], dict[str, str], dict[str, float | None]]:
+    summary = db_latest_universe_monitor_summary() or {}
+    prev_run_date_raw = summary.get("run_date")
+    prev_run_date = str(prev_run_date_raw) if prev_run_date_raw else None
+
+    records: dict[str, dict] = {}
+    sector_cache: dict[str, str] = {}
+    market_cap_cache: dict[str, float | None] = {}
+
+    limit = 1000
+    offset = 0
+    while True:
+        total, rows = db_list_universe_monitor_candidates(
+            limit=limit,
+            offset=offset,
+            watchlist=False,
+            potential=False,
+        )
+        if not rows:
+            break
+        for row in rows:
+            ticker = str(row.get("ticker") or "").strip().upper()
+            if not ticker:
                 continue
-            normalized_market_cap_cache[key] = _safe_float(value)
-    return {
-        "last_run_date": payload.get("last_run_date"),
-        "records": records if isinstance(records, dict) else {},
-        "sector_cache": sector_cache if isinstance(sector_cache, dict) else {},
-        "market_cap_cache": normalized_market_cap_cache,
-    }
-
-
-def _save_state(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            sector_val = str(row.get("sector") or "unknown").strip() or "unknown"
+            sector_cache[ticker] = sector_val
+            market_cap_cache[ticker] = _safe_float(row.get("yfinance_market_cap"))
+            records[ticker] = {
+                "pass_streak": int(row.get("pass_streak", 0) or 0),
+                "total_pass_days": int(row.get("total_pass_days", 0) or 0),
+                "last_status": "pass" if bool(row.get("monitor_pass", False)) else "fail",
+                "last_seen": prev_run_date,
+            }
+        offset += len(rows)
+        if offset >= total:
+            break
+    return prev_run_date, records, sector_cache, market_cap_cache
 
 
 def _extract_tv_metrics(analysis) -> dict:
@@ -314,19 +317,21 @@ def _quality_metrics(history: pd.DataFrame) -> dict:
 
 def main() -> None:
     args = parse_args()
+    if not db_enabled():
+        raise ValueError(
+            "Database is required for tech universe monitor streak/state tracking. "
+            "Set DATABASE_URL or POSTGRES_URL."
+        )
+    db_init()
     allowed_exchanges = [item.strip().upper() for item in args.allowed_exchanges.split(",") if item.strip()]
     exchange_priority = [item.strip().upper() for item in args.exchange_priority.split(",") if item.strip()]
     sector_keywords = _parse_keywords(args.sector_keywords)
     run_date = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
 
-    state_path = _resolve_path(args.state_file)
     output_root = _resolve_path(args.output_root)
     universe_path = _resolve_path(args.universe_file)
     catalog_path = _resolve_path(args.catalog_file)
-    state = _load_state(state_path)
-    records = state.get("records", {})
-    sector_cache = {str(k).upper(): str(v) for k, v in state.get("sector_cache", {}).items()}
-    market_cap_cache = {str(k).upper(): _safe_float(v) for k, v in state.get("market_cap_cache", {}).items()}
+    _, records, sector_cache, market_cap_cache = _load_monitor_state_from_db()
     universe_tickers = _load_universe_tickers(universe_path)
 
     catalog = parse_tradingview_catalog(
@@ -577,25 +582,8 @@ def main() -> None:
         summary["outputs"] = file_paths
         summary_path.write_text(json.dumps(summary, indent=2))
 
-    db_written = False
-    if not args.skip_db and db_enabled():
-        db_init()
-        db_replace_universe_monitor_snapshot(summary, all_df.to_dict(orient="records"))
-        db_written = True
-
-    if args.skip_file_output and not db_written:
-        raise ValueError("No output target enabled. Configure DB or disable --skip-file-output.")
-
-    _save_state(
-        state_path,
-        {
-            "last_run_date": run_date,
-            "records": updated_records,
-            "sector_cache": sector_cache,
-            "market_cap_cache": market_cap_cache,
-            "last_summary": summary,
-        },
-    )
+    db_replace_universe_monitor_snapshot(summary, all_df.to_dict(orient="records"))
+    db_written = True
 
     if file_paths:
         print(f"All candidates: {file_paths['all_candidates_csv']}")

@@ -6,6 +6,7 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Updated `scripts/production/api_server.py` `/cagr` annualization to match backtester behavior by using a 252-trading-day basis from summary-row counts (including broker `cagr`/`cagr_adjusted`) instead of calendar-day `365.25` elapsed-time annualization.
 - Fixed broker execution-cost reconciliation sign in `scripts/production/daily_run.py` so external cash adjustments (deposits/withdrawals) are added with the correct direction when computing `broker_execution_cost` and cumulative broker execution-cost totals.
 - Added `/universe/selection-diagnostics` in `scripts/production/api_server.py` to expose per-ticker signal-selection stages/reasons (universe filter, excluded list, quality filter, invalid close, and top-k snapshot status) with summary counts and pagination.
+- Converted `scripts/backtesting/tech_universe_monitor.py` streak/cache continuity to DB-backed loading (from latest universe-monitor snapshot rows + summary run date) and made DB required for monitor runs, removing file-state dependency that could reset `pass_streak` on non-persistent filesystems.
 
 ## 2026-02-20
 - Added a shared pagination guard in `scripts/production/api_server.py` (`_normalize_pagination`) with configurable defaults (`API_DEFAULT_PAGE_LIMIT`, `API_MAX_PAGE_LIMIT`) and strict validation (`limit > 0`, `offset >= 0`, capped max limit) to prevent accidental unbounded reads.
