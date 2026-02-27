@@ -14,6 +14,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.append(PROJECT_ROOT)
 
 from src import config
+from src.cagr_metrics import compute_cagr_summary
 from src.market_data_validation import validate_market_data_frame
 from src.production_market_data import add_universe_tickers, update_market_data
 from src.production import (
@@ -94,6 +95,21 @@ def _log(message: str, **fields) -> None:
     if fields:
         payload = f"{payload} | {json.dumps(fields, default=str, sort_keys=True)}"
     print(payload, flush=True)
+
+
+def _attach_cagr_payload(summary: dict) -> None:
+    run_date = str(summary.get("date") or "").strip()
+    if not run_date:
+        return
+    history = db_list_run_summaries()
+    by_date: dict[str, dict] = {}
+    for item in history:
+        date_key = str(item.get("date") or "").strip()
+        if not date_key:
+            continue
+        by_date[date_key] = item
+    by_date[run_date] = summary
+    summary["cagr_payload"] = compute_cagr_summary(by_date.values())
 
 
 def parse_args():
@@ -1850,6 +1866,8 @@ def main():
 
         if fx_rate > 0:
             summary["broker_net_worth_usd"] = broker_net_worth_gbp / fx_rate
+
+    _attach_cagr_payload(summary)
 
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
     state_to_persist = new_state
