@@ -18,6 +18,11 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - `/cagr` now returns the latest persisted `cagr_payload` when available and falls back to on-demand recomputation for older rows.
 - Extended `production_runs` persistence in `src/production_db.py` with `cagr_payload jsonb` (schema migration + upsert/select wiring).
 - Updated `scripts/production/daily_run.py` to compute and persist `cagr_payload` as part of each run so app reads no longer need full-history recomputation.
+- Moved universe selection diagnostics to DB-backed snapshots:
+  - Added `src/selection_diagnostics.py` to build per-ticker selection-stage diagnostics from production data.
+  - Updated `scripts/production/daily_run.py` to compute and persist a diagnostics snapshot each non-dry run.
+  - Added `production_universe_selection_diagnostics_state` and `production_universe_selection_diagnostics_records` tables plus DB helpers in `src/production_db.py`.
+  - Updated `GET /universe/selection-diagnostics` in `scripts/production/api_server.py` to read persisted diagnostics from DB (no parquet/file dependency).
 - Optimized `/summaries` field projection path:
   - Added summary field allowlist constant `RUN_SUMMARY_FIELDS` in `src/production_db.py` and reused it in API (`SUMMARY_FIELDS = DB_RUN_SUMMARY_FIELDS`) so API validation and DB projection stay synchronized.
   - Updated `scripts/production/api_server.py` to validate `fields` on `/summaries` and pass normalized field names to DB.

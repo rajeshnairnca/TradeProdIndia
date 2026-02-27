@@ -17,6 +17,7 @@ from src import config
 from src.cagr_metrics import compute_cagr_summary
 from src.market_data_validation import validate_market_data_frame
 from src.production_market_data import add_universe_tickers, update_market_data
+from src.selection_diagnostics import build_selection_diagnostics
 from src.production import (
     generate_trades_for_date,
     ProductionState,
@@ -37,6 +38,7 @@ from src.production_db import (
     replace_broker_positions as db_replace_broker_positions,
     replace_trades as db_replace_trades,
     replace_prices as db_replace_prices,
+    replace_universe_selection_diagnostics_snapshot as db_replace_universe_selection_diagnostics_snapshot,
     upsert_broker_account as db_upsert_broker_account,
     upsert_run_summary as db_upsert_run_summary,
     upsert_state as db_upsert_state,
@@ -110,6 +112,54 @@ def _attach_cagr_payload(summary: dict) -> None:
         by_date[date_key] = item
     by_date[run_date] = summary
     summary["cagr_payload"] = compute_cagr_summary(by_date.values())
+
+
+def _persist_selection_diagnostics_snapshot(
+    *,
+    full_df: pd.DataFrame,
+    summary: dict,
+    sector: str,
+    target_date: pd.Timestamp,
+    regime_scope: str,
+    strategy_roots: list[str],
+    excluded_tickers: set[str],
+) -> None:
+    try:
+        snapshot = build_selection_diagnostics(
+            full_df=full_df,
+            sector=sector,
+            target_date=target_date,
+            regime_scope=regime_scope,
+            excluded_tickers=excluded_tickers,
+            strategies=summary.get("strategies"),
+            strategy_roots=strategy_roots,
+        )
+        records = snapshot.get("records") if isinstance(snapshot.get("records"), list) else []
+        payload = dict(snapshot)
+        payload.pop("records", None)
+        db_replace_universe_selection_diagnostics_snapshot(
+            run_date=str(summary["date"]),
+            sector=sector,
+            regime_scope=regime_scope,
+            payload=payload,
+            records=records,
+        )
+        _log(
+            "selection_diagnostics_snapshot_persisted",
+            run_date=summary["date"],
+            sector=sector,
+            regime_scope=regime_scope,
+            records=len(records),
+        )
+    except Exception as exc:
+        _log(
+            "selection_diagnostics_snapshot_failed",
+            run_date=summary.get("date"),
+            sector=sector,
+            regime_scope=regime_scope,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
 
 
 def parse_args():
@@ -1898,6 +1948,15 @@ def main():
     if not args.dry_run:
         _log("db_persist_start")
         db_upsert_run_summary(summary)
+        _persist_selection_diagnostics_snapshot(
+            full_df=df,
+            summary=summary,
+            sector=sector,
+            target_date=target_date,
+            regime_scope=args.regime_scope,
+            strategy_roots=strategy_roots,
+            excluded_tickers=excluded_tickers,
+        )
         db_replace_trades(summary["date"], trades)
         if price_snapshot:
             db_replace_prices(summary["date"], price_snapshot)

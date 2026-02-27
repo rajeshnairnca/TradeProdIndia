@@ -483,6 +483,39 @@ def init_db() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_universe_monitor_candidates_monitor_pass_idx ON production_universe_monitor_candidates (monitor_pass, pass_streak);"
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_universe_selection_diagnostics_state (
+                run_date date NOT NULL,
+                sector text NOT NULL,
+                regime_scope text NOT NULL,
+                generated_at timestamptz DEFAULT now(),
+                payload jsonb NOT NULL,
+                PRIMARY KEY (run_date, sector, regime_scope)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_universe_selection_diagnostics_records (
+                id bigserial PRIMARY KEY,
+                run_date date NOT NULL,
+                sector text NOT NULL,
+                regime_scope text NOT NULL,
+                ticker text NOT NULL,
+                stage text,
+                reason text,
+                combined_score double precision,
+                score_rank integer
+            );
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_selection_records_scope_idx ON production_universe_selection_diagnostics_records (run_date, sector, regime_scope);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_selection_records_ticker_idx ON production_universe_selection_diagnostics_records (ticker);"
+        )
 
 
 def upsert_run_summary(summary: dict[str, Any]) -> None:
@@ -2031,6 +2064,189 @@ def replace_universe_monitor_snapshot(
         )
 
 
+def replace_universe_selection_diagnostics_snapshot(
+    run_date: str,
+    sector: str,
+    regime_scope: str,
+    payload: dict[str, Any],
+    records: Iterable[dict[str, Any]],
+) -> None:
+    if not db_enabled():
+        return
+    init_db()
+
+    run_date_value = _normalize_date_value(run_date)
+    sector_value = str(sector or "").strip()
+    regime_scope_value = str(regime_scope or "").strip()
+    if not sector_value or not regime_scope_value:
+        return
+
+    rows: list[tuple[Any, ...]] = []
+    for item in records:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        score_rank = item.get("score_rank")
+        try:
+            score_rank_value = int(score_rank) if score_rank is not None else None
+        except (TypeError, ValueError):
+            score_rank_value = None
+        rows.append(
+            (
+                run_date_value,
+                sector_value,
+                regime_scope_value,
+                ticker,
+                item.get("stage"),
+                item.get("reason"),
+                item.get("combined_score"),
+                score_rank_value,
+            )
+        )
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM production_universe_selection_diagnostics_records
+            WHERE run_date = %s AND sector = %s AND regime_scope = %s;
+            """,
+            (run_date_value, sector_value, regime_scope_value),
+        )
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO production_universe_selection_diagnostics_records (
+                    run_date,
+                    sector,
+                    regime_scope,
+                    ticker,
+                    stage,
+                    reason,
+                    combined_score,
+                    score_rank
+                )
+                VALUES %s;
+                """,
+                rows,
+            )
+        cur.execute(
+            """
+            INSERT INTO production_universe_selection_diagnostics_state (
+                run_date,
+                sector,
+                regime_scope,
+                payload
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (run_date, sector, regime_scope) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                generated_at = now();
+            """,
+            (
+                run_date_value,
+                sector_value,
+                regime_scope_value,
+                psycopg2.extras.Json(payload),
+            ),
+        )
+
+
+def list_universe_selection_diagnostics_records(
+    *,
+    run_date: str,
+    sector: str,
+    regime_scope: str,
+    limit: int,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not db_enabled():
+        return 0, []
+    init_db()
+    run_date_value = _normalize_date_value(run_date)
+    sector_value = str(sector or "").strip()
+    regime_scope_value = str(regime_scope or "").strip()
+    if not sector_value or not regime_scope_value:
+        return 0, []
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM production_universe_selection_diagnostics_records
+            WHERE run_date = %s AND sector = %s AND regime_scope = %s;
+            """,
+            (run_date_value, sector_value, regime_scope_value),
+        )
+        total = int(cur.fetchone()[0] or 0)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT ticker,
+                   stage,
+                   reason,
+                   combined_score,
+                   score_rank
+            FROM production_universe_selection_diagnostics_records
+            WHERE run_date = %s AND sector = %s AND regime_scope = %s
+            ORDER BY score_rank ASC NULLS LAST, ticker ASC
+            OFFSET %s LIMIT %s;
+            """,
+            (run_date_value, sector_value, regime_scope_value, offset, limit),
+        )
+        return total, [dict(row) for row in cur.fetchall()]
+
+
+def latest_universe_selection_diagnostics_state(
+    *,
+    sector: str,
+    regime_scope: str,
+    run_date: str | None = None,
+) -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    sector_value = str(sector or "").strip()
+    regime_scope_value = str(regime_scope or "").strip()
+    if not sector_value or not regime_scope_value:
+        return None
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if run_date:
+            run_date_value = _normalize_date_value(run_date)
+            cur.execute(
+                """
+                SELECT run_date,
+                       sector,
+                       regime_scope,
+                       generated_at,
+                       payload
+                FROM production_universe_selection_diagnostics_state
+                WHERE run_date = %s AND sector = %s AND regime_scope = %s
+                LIMIT 1;
+                """,
+                (run_date_value, sector_value, regime_scope_value),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT run_date,
+                       sector,
+                       regime_scope,
+                       generated_at,
+                       payload
+                FROM production_universe_selection_diagnostics_state
+                WHERE sector = %s AND regime_scope = %s
+                ORDER BY run_date DESC
+                LIMIT 1;
+                """,
+                (sector_value, regime_scope_value),
+            )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
 def latest_universe_monitor_summary() -> dict[str, Any] | None:
     if not db_enabled():
         return None
@@ -2218,6 +2434,8 @@ def reset_production_data(preserve_universe_monitor: bool = True) -> None:
             "production_broker_account",
             "production_broker_positions",
             "production_broker_orders",
+            "production_universe_selection_diagnostics_state",
+            "production_universe_selection_diagnostics_records",
         ]
         if not preserve_universe_monitor:
             tables.extend(
