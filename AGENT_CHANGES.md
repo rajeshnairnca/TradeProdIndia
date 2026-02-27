@@ -2,6 +2,28 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-02-27
+- Optimized broker API payload control in `scripts/production/api_server.py`:
+  - Added `include_payload` query param (default `false`) to `/broker-summary`, `/broker-positions`, `/broker-orders`, and `/latest-broker-orders`.
+  - Added `fields` query param support for those endpoints with strict field validation so clients can request minimal column sets.
+  - Added `meta_only=true` support to `/broker-orders` and `/latest-broker-orders` for lightweight metadata/count responses without row payloads.
+  - Added `GET /latest-broker-orders/count` as a count-only endpoint for app polling.
+- Extended broker DB read helpers in `src/production_db.py` to support SQL-level column projection (dynamic `SELECT` list) and payload omission:
+  - `latest_broker_account(...)`
+  - `list_latest_broker_positions(...)`
+  - `list_broker_orders(...)`
+  - `list_latest_broker_orders(...)`
+  - Added `count_broker_orders(...)` and `count_latest_broker_orders(...)` for metadata-only API flows.
+- Added shared CAGR computation utilities in `src/cagr_metrics.py` and moved `/cagr` (`scripts/production/api_server.py`) to DB-read-first behavior:
+  - `/cagr` now returns the latest persisted `cagr_payload` when available and falls back to on-demand recomputation for older rows.
+- Extended `production_runs` persistence in `src/production_db.py` with `cagr_payload jsonb` (schema migration + upsert/select wiring).
+- Updated `scripts/production/daily_run.py` to compute and persist `cagr_payload` as part of each run so app reads no longer need full-history recomputation.
+- Optimized `/summaries` field projection path:
+  - Added summary field allowlist constant `RUN_SUMMARY_FIELDS` in `src/production_db.py` and reused it in API (`SUMMARY_FIELDS = DB_RUN_SUMMARY_FIELDS`) so API validation and DB projection stay synchronized.
+  - Updated `scripts/production/api_server.py` to validate `fields` on `/summaries` and pass normalized field names to DB.
+  - Updated `src/production_db.py::list_run_summaries_paginated(...)` to accept optional `fields` and build a safe dynamic SQL `SELECT` list from allowlisted columns (including `date -> run_date AS date` alias), so only requested columns are fetched.
+  - Removed Python-side post-fetch trimming for `/summaries`; invalid requested fields now return HTTP 400 instead of silently returning null keys.
+
 ## 2026-02-25
 - Updated `scripts/production/api_server.py` `/cagr` annualization to match backtester behavior by using a 252-trading-day basis from summary-row counts (including broker `cagr`/`cagr_adjusted`) instead of calendar-day `365.25` elapsed-time annualization.
 - Fixed broker execution-cost reconciliation sign in `scripts/production/daily_run.py` so external cash adjustments (deposits/withdrawals) are added with the correct direction when computing `broker_execution_cost` and cumulative broker execution-cost totals.

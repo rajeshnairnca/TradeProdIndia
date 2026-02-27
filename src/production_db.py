@@ -7,14 +7,141 @@ from typing import Any, Iterable
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql
 
 from .production import ProductionState
 
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
 
+BROKER_ACCOUNT_FIELDS: tuple[str, ...] = (
+    "run_date",
+    "broker",
+    "currency",
+    "cash",
+    "investments",
+    "net_worth",
+    "payload",
+)
+BROKER_POSITION_FIELDS: tuple[str, ...] = (
+    "run_date",
+    "broker",
+    "ticker",
+    "quantity",
+    "average_price",
+    "current_price",
+    "instrument_currency",
+    "account_currency",
+    "wallet_current_value",
+    "payload",
+)
+BROKER_ORDER_FIELDS: tuple[str, ...] = (
+    "run_date",
+    "broker",
+    "ticker",
+    "action",
+    "quantity",
+    "filled_quantity",
+    "exec_price",
+    "currency",
+    "status",
+    "order_id",
+    "payload",
+    "created_at",
+)
+RUN_SUMMARY_FIELDS: tuple[str, ...] = (
+    "date",
+    "num_trades",
+    "net_worth_usd",
+    "cash_usd",
+    "portfolio_value_usd",
+    "cash_weight",
+    "regime",
+    "strategies",
+    "daily_costs_usd",
+    "total_costs_usd",
+    "sector",
+    "regime_scope",
+    "cash_adjustment",
+    "broker_name",
+    "broker_currency",
+    "broker_cash",
+    "broker_cash_before",
+    "broker_cash_after",
+    "broker_portfolio_value",
+    "broker_net_worth",
+    "broker_cash_weight",
+    "broker_discrepancies",
+    "broker_buy_notional",
+    "broker_sell_notional",
+    "broker_external_flow",
+    "broker_external_flow_usd",
+    "broker_execution_cost",
+    "broker_execution_cost_usd",
+    "broker_total_execution_cost",
+    "broker_total_execution_cost_usd",
+)
+
 
 def db_enabled() -> bool:
     return bool(DATABASE_URL.strip())
+
+
+def _broker_select_fields(
+    allowed: tuple[str, ...],
+    fields: Iterable[str] | None = None,
+    *,
+    include_payload: bool = True,
+) -> list[str]:
+    requested = [str(name).strip() for name in (fields or []) if str(name).strip()]
+    if not requested:
+        requested = list(allowed)
+    allowed_set = set(allowed)
+    result: list[str] = []
+    seen: set[str] = set()
+    for name in requested:
+        if name not in allowed_set:
+            continue
+        if not include_payload and name == "payload":
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    if not result:
+        result = [name for name in allowed if include_payload or name != "payload"]
+    return result
+
+
+def _select_sql(columns: Iterable[str]) -> sql.SQL:
+    return sql.SQL(", ").join(sql.Identifier(column) for column in columns)
+
+
+def _run_summary_select_fields(fields: Iterable[str] | None = None) -> list[str]:
+    requested = [str(name).strip() for name in (fields or []) if str(name).strip()]
+    if not requested:
+        return list(RUN_SUMMARY_FIELDS)
+    allowed = set(RUN_SUMMARY_FIELDS)
+    unknown = sorted({name for name in requested if name not in allowed})
+    if unknown:
+        raise ValueError(f"Unsupported summary fields: {', '.join(unknown)}")
+    result: list[str] = []
+    seen: set[str] = set()
+    for name in requested:
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
+def _run_summary_select_sql(columns: Iterable[str]) -> sql.SQL:
+    parts: list[sql.SQL] = []
+    for name in columns:
+        if name == "date":
+            parts.append(sql.SQL("run_date AS date"))
+        else:
+            parts.append(sql.Identifier(name))
+    return sql.SQL(", ").join(parts)
 
 
 @contextmanager
@@ -70,7 +197,8 @@ def init_db() -> None:
                 broker_execution_cost double precision,
                 broker_execution_cost_usd double precision,
                 broker_total_execution_cost double precision,
-                broker_total_execution_cost_usd double precision
+                broker_total_execution_cost_usd double precision,
+                cagr_payload jsonb
             );
             """
         )
@@ -124,6 +252,9 @@ def init_db() -> None:
         )
         cur.execute(
             "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS broker_total_execution_cost_usd double precision;"
+        )
+        cur.execute(
+            "ALTER TABLE production_runs ADD COLUMN IF NOT EXISTS cagr_payload jsonb;"
         )
         cur.execute(
             """
@@ -401,9 +532,10 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 broker_execution_cost,
                 broker_execution_cost_usd,
                 broker_total_execution_cost,
-                broker_total_execution_cost_usd
+                broker_total_execution_cost_usd,
+                cagr_payload
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (run_date) DO UPDATE SET
                 num_trades = EXCLUDED.num_trades,
                 net_worth_usd = EXCLUDED.net_worth_usd,
@@ -433,7 +565,8 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 broker_execution_cost = EXCLUDED.broker_execution_cost,
                 broker_execution_cost_usd = EXCLUDED.broker_execution_cost_usd,
                 broker_total_execution_cost = EXCLUDED.broker_total_execution_cost,
-                broker_total_execution_cost_usd = EXCLUDED.broker_total_execution_cost_usd;
+                broker_total_execution_cost_usd = EXCLUDED.broker_total_execution_cost_usd,
+                cagr_payload = EXCLUDED.cagr_payload;
             """,
             (
                 run_date,
@@ -468,6 +601,9 @@ def upsert_run_summary(summary: dict[str, Any]) -> None:
                 summary.get("broker_execution_cost_usd"),
                 summary.get("broker_total_execution_cost"),
                 summary.get("broker_total_execution_cost_usd"),
+                psycopg2.extras.Json(summary.get("cagr_payload"))
+                if summary.get("cagr_payload") is not None
+                else None,
             ),
         )
 
@@ -1091,6 +1227,7 @@ def list_run_summaries_paginated(
     end: str | None,
     limit: int,
     offset: int,
+    fields: Iterable[str] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     if not db_enabled():
         return 0, []
@@ -1105,6 +1242,9 @@ def list_run_summaries_paginated(
         params.append(_normalize_date_value(end))
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
 
+    select_fields = _run_summary_select_fields(fields)
+    select_sql = _run_summary_select_sql(select_fields)
+
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1115,45 +1255,19 @@ def list_run_summaries_paginated(
 
         page_params = [*params, offset, limit]
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(
-            f"""
-            SELECT run_date AS date,
-                   num_trades,
-                   net_worth_usd,
-                   cash_usd,
-                   portfolio_value_usd,
-                   cash_weight,
-                   regime,
-                   strategies,
-                   daily_costs_usd,
-                   total_costs_usd,
-                   sector,
-                   regime_scope,
-                   cash_adjustment,
-                   broker_name,
-                   broker_currency,
-                   broker_cash,
-                   broker_cash_before,
-                   broker_cash_after,
-                   broker_portfolio_value,
-                   broker_net_worth,
-                   broker_cash_weight,
-                   broker_discrepancies,
-                   broker_buy_notional,
-                   broker_sell_notional,
-                   broker_external_flow,
-                   broker_external_flow_usd,
-                   broker_execution_cost,
-                   broker_execution_cost_usd,
-                   broker_total_execution_cost,
-                   broker_total_execution_cost_usd
+        query = sql.SQL(
+            """
+            SELECT {select_fields}
             FROM production_runs
             {where_sql}
             ORDER BY run_date DESC
             OFFSET %s LIMIT %s;
-            """,
-            page_params,
+            """
+        ).format(
+            select_fields=select_sql,
+            where_sql=sql.SQL(where_sql),
         )
+        cur.execute(query, page_params)
         return total, [dict(row) for row in cur.fetchall()]
 
 
@@ -1205,7 +1319,8 @@ def latest_summary() -> dict[str, Any] | None:
                    broker_execution_cost,
                    broker_execution_cost_usd,
                    broker_total_execution_cost,
-                   broker_total_execution_cost_usd
+                   broker_total_execution_cost_usd,
+                   cagr_payload
             FROM production_runs
             ORDER BY run_date DESC
             LIMIT 1;
@@ -1488,26 +1603,32 @@ def replace_broker_orders(
         )
 
 
-def latest_broker_account(broker: str) -> dict[str, Any] | None:
+def latest_broker_account(
+    broker: str,
+    *,
+    include_payload: bool = True,
+    fields: Iterable[str] | None = None,
+) -> dict[str, Any] | None:
     if not db_enabled():
         return None
     init_db()
+    select_fields = _broker_select_fields(
+        BROKER_ACCOUNT_FIELDS,
+        fields,
+        include_payload=include_payload,
+    )
     with _connect() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            """
-            SELECT run_date,
-                   broker,
-                   currency,
-                   cash,
-                   investments,
-                   net_worth,
-                   payload
+            sql.SQL(
+                """
+            SELECT {select_fields}
             FROM production_broker_account
             WHERE broker = %s
             ORDER BY run_date DESC
             LIMIT 1;
-            """,
+            """
+            ).format(select_fields=_select_sql(select_fields)),
             (broker,),
         )
         row = cur.fetchone()
@@ -1548,10 +1669,18 @@ def list_latest_broker_positions(
     broker: str,
     limit: int,
     offset: int,
+    *,
+    include_payload: bool = True,
+    fields: Iterable[str] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     if not db_enabled():
         return 0, []
     init_db()
+    select_fields = _broker_select_fields(
+        BROKER_POSITION_FIELDS,
+        fields,
+        include_payload=include_payload,
+    )
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1573,31 +1702,49 @@ def list_latest_broker_positions(
         total = int(cur.fetchone()[0] or 0)
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            """
-            SELECT run_date,
-                   broker,
-                   ticker,
-                   quantity,
-                   average_price,
-                   current_price,
-                   instrument_currency,
-                   account_currency,
-                   wallet_current_value,
-                   payload
+            sql.SQL(
+                """
+            SELECT {select_fields}
             FROM production_broker_positions
             WHERE broker = %s AND run_date = %s
             ORDER BY ticker ASC
             OFFSET %s LIMIT %s;
-            """,
+            """
+            ).format(select_fields=_select_sql(select_fields)),
             (broker, run_date, offset, limit),
         )
         return total, [dict(item) for item in cur.fetchall()]
 
 
-def list_broker_orders(broker: str, limit: int, offset: int) -> tuple[int, list[dict[str, Any]]]:
+def count_broker_orders(broker: str) -> int:
+    if not db_enabled():
+        return 0
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM production_broker_orders WHERE broker = %s;",
+            (broker,),
+        )
+        return int(cur.fetchone()[0] or 0)
+
+
+def list_broker_orders(
+    broker: str,
+    limit: int,
+    offset: int,
+    *,
+    include_payload: bool = True,
+    fields: Iterable[str] | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
     if not db_enabled():
         return 0, []
     init_db()
+    select_fields = _broker_select_fields(
+        BROKER_ORDER_FIELDS,
+        fields,
+        include_payload=include_payload,
+    )
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1607,24 +1754,15 @@ def list_broker_orders(broker: str, limit: int, offset: int) -> tuple[int, list[
         total = int(cur.fetchone()[0] or 0)
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            """
-            SELECT run_date,
-                   broker,
-                   ticker,
-                   action,
-                   quantity,
-                   filled_quantity,
-                   exec_price,
-                   currency,
-                   status,
-                   order_id,
-                   payload,
-                   created_at
+            sql.SQL(
+                """
+            SELECT {select_fields}
             FROM production_broker_orders
             WHERE broker = %s
             ORDER BY run_date DESC, id DESC
             LIMIT %s OFFSET %s;
-            """,
+            """
+            ).format(select_fields=_select_sql(select_fields)),
             (broker, limit, offset),
         )
         return total, [dict(row) for row in cur.fetchall()]
@@ -1674,10 +1812,18 @@ def list_latest_broker_orders(
     broker: str,
     limit: int,
     offset: int,
+    *,
+    include_payload: bool = True,
+    fields: Iterable[str] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     if not db_enabled():
         return 0, []
     init_db()
+    select_fields = _broker_select_fields(
+        BROKER_ORDER_FIELDS,
+        fields,
+        include_payload=include_payload,
+    )
     with _connect() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1699,27 +1845,43 @@ def list_latest_broker_orders(
         total = int(cur.fetchone()[0] or 0)
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            """
-            SELECT run_date,
-                   broker,
-                   ticker,
-                   action,
-                   quantity,
-                   filled_quantity,
-                   exec_price,
-                   currency,
-                   status,
-                   order_id,
-                   payload,
-                   created_at
+            sql.SQL(
+                """
+            SELECT {select_fields}
             FROM production_broker_orders
             WHERE broker = %s AND run_date = %s
             ORDER BY id DESC
             OFFSET %s LIMIT %s;
-            """,
+            """
+            ).format(select_fields=_select_sql(select_fields)),
             (broker, run_date, offset, limit),
         )
         return total, [dict(item) for item in cur.fetchall()]
+
+
+def count_latest_broker_orders(broker: str) -> tuple[Any | None, int]:
+    if not db_enabled():
+        return None, 0
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT run_date FROM production_broker_orders WHERE broker = %s ORDER BY run_date DESC LIMIT 1;",
+            (broker,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return None, 0
+        run_date = row[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM production_broker_orders
+            WHERE broker = %s AND run_date = %s;
+            """,
+            (broker, run_date),
+        )
+        return run_date, int(cur.fetchone()[0] or 0)
 
 
 def replace_universe_monitor_snapshot(
