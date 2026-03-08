@@ -68,28 +68,31 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 # ---- Portfolio Configuration ----
-INITIAL_CAPITAL = 27_000.0
+INITIAL_CAPITAL = _env_float("INITIAL_CAPITAL", 1_000_000.0)
 TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.15
-TOP_K = 4
+TOP_K = _env_int("TOP_K", 4)
 ADV_LOOKBACK = 21
-ROLLING_WINDOW_FOR_VOL = 14
-USE_VOL_PARITY = True
+ROLLING_WINDOW_FOR_VOL = _env_int("ROLLING_WINDOW_FOR_VOL", 14)
+USE_VOL_PARITY = _env_bool("USE_VOL_PARITY", True)
 
 USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", False)
 BACKTEST_USE_FULL_HISTORY = _env_bool("BACKTEST_USE_FULL_HISTORY", True)
+REBALANCE_EVERY = max(1, _env_int("REBALANCE_EVERY", _env_int("REBALANCE_EVERY_N_DAYS", 28)))
+# Backward-compatible alias used by older scripts/tests.
+REBALANCE_EVERY_N_DAYS = REBALANCE_EVERY
 BEAR_CASH_OUT = _env_bool("BEAR_CASH_OUT", False)
 BEAR_GROSS_TARGET = _env_optional_float("BEAR_GROSS_TARGET")
 REGIME_GROSS_TARGETS = _env_json_dict("REGIME_GROSS_TARGETS")
 
 # ---- Market/Cost Configuration ----
-TRADING_REGION = _env_str("TRADING_REGION", "us").lower()
+TRADING_REGION = _env_str("TRADING_REGION", "india").lower()
 US_COMMISSION_RATE = _env_float("US_COMMISSION_RATE", 0.0015)
 US_FINRA_FEE_PER_SHARE = _env_float("US_FINRA_FEE_PER_SHARE", 0.000195)
 US_SEC_FEE_RATE = _env_float("US_SEC_FEE_RATE", 0.0000278)
 UNIVERSE_FILTER = os.getenv("UNIVERSE_FILTER", "all").strip().lower()
 EXCLUDED_TICKERS_FILE = _env_str("EXCLUDED_TICKERS_FILE", "data/universe_excluded.txt")
-ENABLE_UNIVERSE_QUALITY_FILTER = _env_bool("ENABLE_UNIVERSE_QUALITY_FILTER", True)
+ENABLE_UNIVERSE_QUALITY_FILTER = _env_bool("ENABLE_UNIVERSE_QUALITY_FILTER", False)
 UNIVERSE_MIN_HISTORY_ROWS = _env_int("UNIVERSE_MIN_HISTORY_ROWS", 300)
 UNIVERSE_MIN_MEDIAN_ADV_DOLLARS = _env_float("UNIVERSE_MIN_MEDIAN_ADV_DOLLARS", 1_000_000.0)
 UNIVERSE_MIN_P20_ADV_DOLLARS = _env_float("UNIVERSE_MIN_P20_ADV_DOLLARS", 100_000.0)
@@ -110,6 +113,11 @@ TRADINGVIEW_EXCHANGE_MAP_FILE = _env_str(
     "TRADINGVIEW_EXCHANGE_MAP_FILE",
     "data/universe_us_exchange_map.json",
 )
+DEFAULT_STRATEGY_ROOTS = tuple(
+    part.strip()
+    for part in _env_str("DEFAULT_STRATEGY_ROOTS", "alphas_india").split(",")
+    if part.strip()
+) or ("alphas_india",)
 RUN_CALENDAR_TIMEZONE = _env_str("RUN_CALENDAR_TIMEZONE", "America/New_York")
 # Railway cron already skips weekends in this setup; keep weekend blocking opt-in.
 RUN_CALENDAR_SKIP_WEEKENDS = _env_bool("RUN_CALENDAR_SKIP_WEEKENDS", False)
@@ -131,8 +139,32 @@ RISK_PENALTY_COEFF = 0.5021
 SLIPPAGE_COEFF = _env_float("SLIPPAGE_COEFF", 0.008)
 CASH_DRAG_COEFF = 8e-5  # per-step penalty scaled by cash_weight to discourage idle cash
 WEIGHT_CHANGE_PENALTY = 0.0005  # penalize large day-over-day weight changes (swing-friendly)
-WEIGHT_SMOOTHING = 0.85  # blend factor for previous weights vs new weights (higher = smoother)
-CASH_RESERVE = 0.02  # keep this fraction in cash to absorb costs
+WEIGHT_SMOOTHING = _env_float("WEIGHT_SMOOTHING", 0.0)  # blend factor for previous weights vs new weights (higher = smoother)
+CASH_RESERVE = _env_float("CASH_RESERVE", 0.02)  # keep this fraction in cash to absorb costs
+MIN_WEIGHT_CHANGE_TO_TRADE = max(0.0, _env_float("MIN_WEIGHT_CHANGE_TO_TRADE", 0.01))
+MIN_TRADE_DOLLARS = max(0.0, _env_float("MIN_TRADE_DOLLARS", 20_000.0))
+MAX_DAILY_TURNOVER = _env_optional_float("MAX_DAILY_TURNOVER")
+if MAX_DAILY_TURNOVER is None:
+    MAX_DAILY_TURNOVER = 0.35
+elif MAX_DAILY_TURNOVER <= 0:
+    MAX_DAILY_TURNOVER = None
+BACKTEST_ENFORCE_CASH_BALANCE = _env_bool("BACKTEST_ENFORCE_CASH_BALANCE", False)
+
+# ---- Risk Overlays (Optional) ----
+ADAPTIVE_TURNOVER_ENABLED = _env_bool("ADAPTIVE_TURNOVER_ENABLED", False)
+ADAPTIVE_TURNOVER_RISK_CAP = max(0.0, _env_float("ADAPTIVE_TURNOVER_RISK_CAP", 0.10))
+ADAPTIVE_TURNOVER_RISK_REGIMES = tuple(
+    part.strip()
+    for part in _env_str(
+        "ADAPTIVE_TURNOVER_RISK_REGIMES",
+        "bear_high_vol,bear_low_vol,bull_high_vol,sideways_high_vol,sideways_low_vol",
+    ).split(",")
+    if part.strip()
+)
+
+# ---- Regime Switch Confirmation Defaults ----
+CONFIRM_DAYS = max(1, _env_int("CONFIRM_DAYS", 20))
+CONFIRM_DAYS_SIDEWAYS = max(1, _env_int("CONFIRM_DAYS_SIDEWAYS", 30))
 MIN_ADV_SHARES = 250_000.0  # minimum ADV shares required to trade
 MIN_ADV_DOLLARS_FILTER = 20_000_000.0  # minimum ADV$ required to trade
 MIN_ADV_DOLLARS_SLIPPAGE = 1_000_000.0  # minimum ADV$ used for slippage scaling
@@ -174,6 +206,24 @@ TRADING212_PREFERRED_CURRENCY = _env_str("TRADING212_PREFERRED_CURRENCY", "USD")
 TRADING212_INSTRUMENTS_CACHE = _env_str("TRADING212_INSTRUMENTS_CACHE", "data/trading212_instruments.json")
 TRADING212_TICKER_MAP_FILE = _env_str("TRADING212_TICKER_MAP_FILE", "data/trading212_ticker_map.json")
 TRADING212_FX_RATE_USD_GBP = _env_optional_float("TRADING212_FX_RATE_USD_GBP")
+
+USE_KITE = _env_bool("USE_KITE", False)
+KITE_BASE_URL = _env_str("KITE_BASE_URL", "https://api.kite.trade")
+KITE_TIMEOUT = _env_float("KITE_TIMEOUT", 20.0)
+KITE_HTTP_MAX_RETRIES = _env_int("KITE_HTTP_MAX_RETRIES", 4)
+KITE_HTTP_RETRY_BASE_SEC = _env_float("KITE_HTTP_RETRY_BASE_SEC", 1.0)
+KITE_HTTP_RETRY_MAX_SEC = _env_float("KITE_HTTP_RETRY_MAX_SEC", 20.0)
+KITE_ORDER_TIMEOUT = _env_float("KITE_ORDER_TIMEOUT", 300.0)
+KITE_ORDER_POLL_SEC = _env_float("KITE_ORDER_POLL_SEC", 3.0)
+KITE_PRODUCT = _env_str("KITE_PRODUCT", "CNC").upper()
+KITE_ORDER_VARIETY = _env_str("KITE_ORDER_VARIETY", "regular").lower()
+KITE_DEFAULT_EXCHANGE = _env_str("KITE_DEFAULT_EXCHANGE", "NSE").upper()
+KITE_USE_BROKER_STATE_FOR_SIGNALS = _env_bool("KITE_USE_BROKER_STATE_FOR_SIGNALS", True)
+KITE_INSTRUMENTS_CACHE = _env_str("KITE_INSTRUMENTS_CACHE", "data/kite_instruments.json")
+KITE_TICKER_MAP_FILE = _env_str("KITE_TICKER_MAP_FILE", "data/kite_ticker_map.json")
+KITE_INSTRUMENTS_EXCHANGE = _env_str("KITE_INSTRUMENTS_EXCHANGE", "NSE").upper()
+KITE_ACCESS_TOKEN_FILE = _env_str("KITE_ACCESS_TOKEN_FILE", "data/kite_access_token.txt")
+KITE_SESSION_GENERATE_ON_START = _env_bool("KITE_SESSION_GENERATE_ON_START", True)
 HMM_N_COMPONENTS = _env_int("HMM_N_COMPONENTS", 4)
 HMM_WARMUP_PERIOD = _env_int("HMM_WARMUP_PERIOD", 2520)  # ~10 years
 HMM_STEP_SIZE = _env_int("HMM_STEP_SIZE", 5)  # ~1 month

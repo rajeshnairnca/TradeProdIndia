@@ -219,7 +219,7 @@ def build_selection_diagnostics(
             removed_invalid_close.add(ticker)
 
     strategy_names = _parse_strategy_names(strategies)
-    roots = strategy_roots or ["alphas"]
+    roots = strategy_roots or list(config.DEFAULT_STRATEGY_ROOTS)
     scores_by_ticker: dict[str, float] = {}
     selected_tickers: set[str] = set()
     selection_info: dict[str, Any] = {

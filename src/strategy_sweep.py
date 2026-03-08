@@ -48,6 +48,7 @@ def sweep_strategy_combinations(
     metric: str = "cagr",
     start_date: pd.Timestamp | None = None,
     end_date: pd.Timestamp | None = None,
+    rebalance_every_n_days: int | None = None,
 ) -> SweepResult:
     if not strategies_by_name:
         raise ValueError("No strategies provided for sweep.")
@@ -67,7 +68,12 @@ def sweep_strategy_combinations(
 
     for combo in combos:
         strategies = [strategies_by_name[name] for name in combo]
-        backtester = RuleBasedBacktester(df, strategies, regime_table=regime_table)
+        backtester = RuleBasedBacktester(
+            df,
+            strategies,
+            regime_table=regime_table,
+            rebalance_every_n_days=rebalance_every_n_days,
+        )
         result = backtester.run(start_date=start_date, end_date=end_date)
         metrics = result.metrics
 

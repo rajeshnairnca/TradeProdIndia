@@ -461,7 +461,7 @@ def main() -> None:
     if args.regime_mapping_search and args.regime_mapping:
         raise ValueError("Use only one of --regime-mapping or --regime-mapping-search.")
     if not args.strategy_roots:
-        args.strategy_roots = ["alphas"]
+        args.strategy_roots = list(config.DEFAULT_STRATEGY_ROOTS)
     strategy_names = args.strategies or list_strategy_names(args.strategy_roots)
     mapping_fixed = None
     if args.regime_mapping:

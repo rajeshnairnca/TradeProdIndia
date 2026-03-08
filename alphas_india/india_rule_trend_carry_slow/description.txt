@@ -1,0 +1,2 @@
+Long-horizon trend carry with ADX and liquidity support, then EWMA-smoothed per ticker for slower position changes.
+

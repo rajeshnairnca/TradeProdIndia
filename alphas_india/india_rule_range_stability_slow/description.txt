@@ -1,0 +1,2 @@
+Range-stability strategy for sideways phases: controlled mean reversion with explicit noise and volatility penalties.
+

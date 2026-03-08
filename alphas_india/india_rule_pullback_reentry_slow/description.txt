@@ -1,0 +1,2 @@
+Trend-aware pullback entry model using RSI and SMA distance, then ticker-level EWMA smoothing for longer holds.
+

@@ -59,6 +59,8 @@ def test_backtester_cli_smoke(tmp_path: Path):
     env = dict(os.environ)
     env["DATA_FILE"] = str(data_path)
     env["TRADING_REGION"] = "us"
+    env["UNIVERSE_FILTER"] = "all"
+    env["ENABLE_UNIVERSE_QUALITY_FILTER"] = "0"
     env["MPLBACKEND"] = "Agg"
 
     cmd = [
@@ -71,6 +73,8 @@ def test_backtester_cli_smoke(tmp_path: Path):
         "--output-root",
         str(output_root),
         "--use-full-history",
+        "--rebalance-every",
+        "3",
     ]
     subprocess.run(
         cmd,
@@ -86,3 +90,15 @@ def test_backtester_cli_smoke(tmp_path: Path):
     payload = json.loads(results_path.read_text())
     assert payload["num_strategies"] == 1
     assert payload["strategies"] == ["smoke_alpha"]
+    assert payload["rebalance_every_n_days"] == 3
+    assert "backtester.py" in payload["command"]
+
+    run_log_path = repo_root / "runs" / "backtesting" / "backtester_runs.jsonl"
+    assert run_log_path.exists()
+    lines = [line.strip() for line in run_log_path.read_text().splitlines() if line.strip()]
+    assert lines
+    entries = [json.loads(line) for line in lines]
+    matching = [entry for entry in entries if "smoke_alpha" in entry.get("strategies", [])]
+    assert matching
+    latest = matching[-1]
+    assert "scripts/backtesting/backtester.py" in latest["command"]

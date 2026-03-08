@@ -26,6 +26,7 @@ _WORK_STRATEGIES_BY_NAME = None
 _WORK_START_DATE = None
 _WORK_END_DATE = None
 _WORK_METRIC_KEY = None
+_WORK_REBALANCE_EVERY_DAYS = None
 
 
 def _generate_combos(names: list[str], min_size: int, max_size: int):
@@ -41,13 +42,22 @@ def _sample_combos(combos: list[tuple[str, ...]], max_combos: int | None, seed: 
     return combos[:max_combos]
 
 
-def _init_worker(data_path: str, strategy_names: list[str], strategy_roots: list[str], start_date, end_date, metric_key: str):
+def _init_worker(
+    data_path: str,
+    strategy_names: list[str],
+    strategy_roots: list[str],
+    start_date,
+    end_date,
+    metric_key: str,
+    rebalance_every_days: int,
+):
     global _WORK_DF
     global _WORK_REGIME_TABLE
     global _WORK_STRATEGIES_BY_NAME
     global _WORK_START_DATE
     global _WORK_END_DATE
     global _WORK_METRIC_KEY
+    global _WORK_REBALANCE_EVERY_DAYS
 
     df = pd.read_parquet(data_path)
     validate_market_data_frame(df, source=data_path, required_columns=["Close"])
@@ -61,11 +71,17 @@ def _init_worker(data_path: str, strategy_names: list[str], strategy_roots: list
     _WORK_START_DATE = start_date
     _WORK_END_DATE = end_date
     _WORK_METRIC_KEY = metric_key
+    _WORK_REBALANCE_EVERY_DAYS = rebalance_every_days
 
 
 def _evaluate_combo(combo: tuple[str, ...]):
     strategies = [_WORK_STRATEGIES_BY_NAME[name] for name in combo if name in _WORK_STRATEGIES_BY_NAME]
-    backtester = RuleBasedBacktester(_WORK_DF, strategies, regime_table=_WORK_REGIME_TABLE)
+    backtester = RuleBasedBacktester(
+        _WORK_DF,
+        strategies,
+        regime_table=_WORK_REGIME_TABLE,
+        rebalance_every_n_days=_WORK_REBALANCE_EVERY_DAYS,
+    )
     result = backtester.run(start_date=_WORK_START_DATE, end_date=_WORK_END_DATE)
     metrics = result.metrics
     score = float(metrics.get(_WORK_METRIC_KEY, 0.0))
@@ -83,6 +99,12 @@ def parse_args():
     parser.add_argument("--metric", choices=sorted(METRIC_KEYS.keys()), default="cagr", help="Metric to optimize.")
     parser.add_argument("--start-date", type=str, help="Optional YYYY-MM-DD to start backtest.")
     parser.add_argument("--end-date", type=str, help="Optional YYYY-MM-DD to end backtest (exclusive).")
+    parser.add_argument(
+        "--rebalance-every",
+        type=int,
+        default=config.REBALANCE_EVERY_N_DAYS,
+        help="Rebalance cadence in trading days (default from REBALANCE_EVERY_N_DAYS).",
+    )
     parser.add_argument("--output-root", default="alphas", help="Root directory to store sweep results.")
     parser.add_argument("--jobs", type=int, default=1, help="Parallel workers for sweeps (1 = serial).")
     return parser.parse_args()
@@ -90,7 +112,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    strategy_roots = args.strategy_roots or ["alphas"]
+    if args.rebalance_every < 1:
+        raise ValueError("--rebalance-every must be >= 1.")
+    strategy_roots = args.strategy_roots or list(config.DEFAULT_STRATEGY_ROOTS)
     strategy_names = args.strategies or list_strategy_names(strategy_roots)
     if not strategy_names:
         raise ValueError("No strategies found to sweep.")
@@ -118,6 +142,7 @@ def main():
             metric=args.metric,
             start_date=start_date,
             end_date=end_date,
+            rebalance_every_n_days=args.rebalance_every,
         )
     else:
         metric_key = METRIC_KEYS.get(args.metric, "CAGR")
@@ -143,6 +168,7 @@ def main():
                 start_date,
                 end_date,
                 metric_key,
+                args.rebalance_every,
             ),
         ) as executor:
             for combo, score, metrics in executor.map(_evaluate_combo, combos, chunksize=1):
@@ -174,6 +200,7 @@ def main():
         "rows": result.rows,
         "start_date": args.start_date,
         "end_date": args.end_date,
+        "rebalance_every_n_days": int(args.rebalance_every),
     }
     with open(os.path.join(output_dir, "sweep_results.json"), "w") as f:
         json.dump(results_payload, f, indent=2)

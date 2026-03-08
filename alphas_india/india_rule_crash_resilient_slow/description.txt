@@ -1,0 +1,2 @@
+Crash-resilient scoring with strong volatility and expansion penalties plus liquidity support to stabilize holdings.
+

@@ -31,3 +31,9 @@
 
 ## Change Log
 - Log every code change in `AGENT_CHANGES.md` (agent_changes.md) with a brief note on what changed and why.
+
+## Latest Backtest Snapshot (2026-03-08)
+- Baseline run (India mapping set, `WEIGHT_SMOOTHING=0.85`, `rebalance-every=28`, `2013-01-01` to `2026-01-01`):
+  - `CAGR 53.9592%`, `Sharpe 1.5702`, `Max Drawdown -66.5310%`, `Final Net Worth 242,696,010.50`.
+- Improved run (same strategies/mapping/date range, `WEIGHT_SMOOTHING=0.00`, `rebalance-every=14`):
+  - `CAGR 59.5616%`, `Sharpe 1.5978`, `Max Drawdown -60.8747%`, `Final Net Worth 382,533,520.47`.

@@ -6,6 +6,7 @@ import types
 if "psycopg2" not in sys.modules:
     fake_psycopg2 = types.ModuleType("psycopg2")
     fake_extras = types.ModuleType("psycopg2.extras")
+    fake_sql = types.ModuleType("psycopg2.sql")
 
     def _json_passthrough(value):  # type: ignore[no-untyped-def]
         return value
@@ -25,8 +26,12 @@ if "psycopg2" not in sys.modules:
 
     fake_psycopg2.connect = _connect_forbidden  # type: ignore[attr-defined]
     fake_psycopg2.extras = fake_extras  # type: ignore[attr-defined]
+    fake_sql.SQL = lambda value: value  # type: ignore[attr-defined]
+    fake_sql.Identifier = lambda value: value  # type: ignore[attr-defined]
+    fake_psycopg2.sql = fake_sql  # type: ignore[attr-defined]
     sys.modules["psycopg2"] = fake_psycopg2
     sys.modules["psycopg2.extras"] = fake_extras
+    sys.modules["psycopg2.sql"] = fake_sql
 
 from scripts.production.daily_run import (
     _build_retry_pending_ticker_entries,

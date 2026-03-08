@@ -35,7 +35,7 @@ def run_walk_forward(strategy_names: list[str], strategy_roots: list[str] | None
     """
     Performs walk-forward validation for one or more rule-based strategies.
     """
-    roots = strategy_roots or ["alphas"]
+    roots = strategy_roots or list(config.DEFAULT_STRATEGY_ROOTS)
     print(f"--- Starting Walk-Forward Validation for: {strategy_names} ---")
 
     data_path = os.path.join(PROJECT_ROOT, config.DATA_FILE)
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     parser.add_argument("--strategy-roots", action="append", default=[], help="Root folder containing strategies.")
     args = parser.parse_args()
 
-    roots = args.strategy_roots or ["alphas"]
+    roots = args.strategy_roots or list(config.DEFAULT_STRATEGY_ROOTS)
     if args.strategies:
         names = args.strategies
     elif args.alpha_name:

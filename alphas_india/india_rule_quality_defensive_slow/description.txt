@@ -1,0 +1,2 @@
+Defensive quality selection for calmer regimes using volatility/liquidity filters and long-horizon trend, smoothed over time.
+

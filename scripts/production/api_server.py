@@ -66,6 +66,10 @@ SUPPORTED_FX_CURRENCIES = {"USD", "GBP"}
 _fx_cache: dict[tuple[str, str], dict[str, object]] = {}
 DEFAULT_PAGE_LIMIT = int(os.getenv("API_DEFAULT_PAGE_LIMIT", "200"))
 MAX_PAGE_LIMIT = int(os.getenv("API_MAX_PAGE_LIMIT", "1000"))
+DEFAULT_BROKER_QUERY = (
+    os.getenv("DEFAULT_BROKER", "kite" if config.USE_KITE else "trading212").strip().lower()
+    or "trading212"
+)
 
 if not db_enabled():
     raise RuntimeError(
@@ -651,7 +655,7 @@ def universe_monitor_potential(limit: int = 200, offset: int = 0):
 
 @app.get("/broker-summary", dependencies=[Depends(_require_api_key)])
 def broker_summary(
-    broker: str = "trading212",
+    broker: str = DEFAULT_BROKER_QUERY,
     include_payload: bool = False,
     fields: str | None = None,
 ):
@@ -672,7 +676,7 @@ def broker_summary(
 
 @app.get("/broker-positions", dependencies=[Depends(_require_api_key)])
 def broker_positions(
-    broker: str = "trading212",
+    broker: str = DEFAULT_BROKER_QUERY,
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
     include_payload: bool = False,
@@ -704,7 +708,7 @@ def broker_positions(
 
 @app.get("/broker-orders", dependencies=[Depends(_require_api_key)])
 def broker_orders(
-    broker: str = "trading212",
+    broker: str = DEFAULT_BROKER_QUERY,
     limit: int = 200,
     offset: int = 0,
     include_payload: bool = False,
@@ -747,7 +751,7 @@ def broker_orders(
 
 @app.get("/latest-broker-orders", dependencies=[Depends(_require_api_key)])
 def latest_broker_orders(
-    broker: str = "trading212",
+    broker: str = DEFAULT_BROKER_QUERY,
     limit: int = DEFAULT_PAGE_LIMIT,
     offset: int = 0,
     include_payload: bool = False,
@@ -793,7 +797,7 @@ def latest_broker_orders(
 
 
 @app.get("/latest-broker-orders/count", dependencies=[Depends(_require_api_key)])
-def latest_broker_orders_count(broker: str = "trading212"):
+def latest_broker_orders_count(broker: str = DEFAULT_BROKER_QUERY):
     run_date, total = db_count_latest_broker_orders(broker)
     if total <= 0:
         raise HTTPException(status_code=404, detail="Broker orders not found.")

@@ -48,17 +48,29 @@ from src.regime import compute_market_regime_table
 from src.strategy import list_strategy_names, load_strategies
 from src.universe import NASDAQ100_TICKERS
 from src.universe_quality import apply_quality_filter
+from src.kite import (
+    KiteApiError,
+    KiteClient,
+    account_cash_available as kite_account_cash_available,
+    account_net_worth as kite_account_net_worth,
+    build_instrument_index as build_kite_instrument_index,
+    kite_enabled,
+    load_instruments_cache as load_kite_instruments_cache,
+    load_ticker_overrides as load_kite_ticker_overrides,
+    positions_to_internal_positions as kite_positions_to_internal_positions,
+    resolve_kite_instrument,
+)
 from src.trading212 import (
     Trading212ApiError,
     Trading212Client,
-    account_cash_available,
-    account_net_worth,
-    build_instrument_index,
+    account_cash_available as t212_account_cash_available,
+    account_net_worth as t212_account_net_worth,
+    build_instrument_index as build_t212_instrument_index,
     compare_positions,
     extract_fx_rates,
-    load_instruments_cache,
-    load_ticker_overrides,
-    positions_to_internal_positions,
+    load_instruments_cache as load_t212_instruments_cache,
+    load_ticker_overrides as load_t212_ticker_overrides,
+    positions_to_internal_positions as t212_positions_to_internal_positions,
     resolve_t212_ticker,
     trading212_enabled,
 )
@@ -78,7 +90,7 @@ TRADE_COLUMNS = [
     "strategies",
 ]
 
-DEFAULT_REGIME_MAPPING = {
+DEFAULT_REGIME_MAPPING_US = {
     "bear_high_vol": "rule_mean_reversion",
     "bear_low_vol": "rule_low_vol_defensive",
     "bull_high_vol": "rule_quality_min_vol",
@@ -86,6 +98,19 @@ DEFAULT_REGIME_MAPPING = {
     "sideways_high_vol": "rule_range_reversion",
     "sideways_low_vol": "rule_trend_strength",
 }
+
+DEFAULT_REGIME_MAPPING_INDIA = {
+    "bear_high_vol": "india_rule_crash_resilient_slow",
+    "bear_low_vol": "india_rule_quality_defensive_slow",
+    "bull_high_vol": "india_rule_pullback_reentry_slow",
+    "bull_low_vol": "india_rule_trend_carry_slow",
+    "sideways_high_vol": "india_rule_range_stability_slow",
+    "sideways_low_vol": "india_rule_liquidity_momentum_core",
+}
+
+DEFAULT_REGIME_MAPPING = (
+    DEFAULT_REGIME_MAPPING_INDIA if config.TRADING_REGION == "india" else DEFAULT_REGIME_MAPPING_US
+)
 
 
 def _utc_now() -> str:
@@ -745,12 +770,27 @@ def _expected_position_delta(action: str, shares: float) -> float:
     return abs(_safe_float(shares))
 
 
+def _active_broker_name() -> str:
+    kite_on = kite_enabled()
+    t212_on = trading212_enabled()
+    if kite_on and t212_on:
+        raise ValueError(
+            "Both Kite and Trading212 broker integrations are enabled. "
+            "Enable only one broker (USE_KITE or USE_TRADING212)."
+        )
+    if kite_on:
+        return "kite"
+    if t212_on:
+        return "trading212"
+    return ""
+
+
 def _build_trading212_context(state: ProductionState) -> dict:
     _log("broker_context_build_start", broker="trading212")
     client = Trading212Client()
-    instruments = load_instruments_cache(client)
-    overrides = load_ticker_overrides()
-    by_ticker, by_symbol = build_instrument_index(instruments)
+    instruments = load_t212_instruments_cache(client)
+    overrides = load_t212_ticker_overrides()
+    by_ticker, by_symbol = build_t212_instrument_index(instruments)
     _log(
         "broker_instruments_loaded",
         instruments=len(instruments),
@@ -765,9 +805,9 @@ def _build_trading212_context(state: ProductionState) -> dict:
     account_currency = str(
         summary_raw.get("currencyCode") or summary_raw.get("currency") or "GBP"
     ).upper()
-    broker_cash_account = account_cash_available(summary_raw)
-    broker_net_worth_account = account_net_worth(summary_raw)
-    broker_positions = positions_to_internal_positions(positions_raw, overrides)
+    broker_cash_account = t212_account_cash_available(summary_raw)
+    broker_net_worth_account = t212_account_net_worth(summary_raw)
+    broker_positions = t212_positions_to_internal_positions(positions_raw, overrides)
     fx_rates = extract_fx_rates(positions_raw, account_currency=account_currency)
     fx_rate = fx_rates.get("USD") or config.TRADING212_FX_RATE_USD_GBP
     if account_currency == "USD":
@@ -811,6 +851,7 @@ def _build_trading212_context(state: ProductionState) -> dict:
         fx_rate_gbp_per_usd=fx_rate,
     )
     return {
+        "broker": "trading212",
         "client": client,
         "instruments": instruments,
         "overrides": overrides,
@@ -828,6 +869,72 @@ def _build_trading212_context(state: ProductionState) -> dict:
         "broker_positions": broker_positions,
         "fx_rates": fx_rates,
         "fx_rate_gbp_per_usd": fx_rate,
+        "discrepancies": discrepancies,
+    }
+
+
+def _build_kite_context(state: ProductionState) -> dict:
+    _log("broker_context_build_start", broker="kite")
+    client = KiteClient()
+    try:
+        instruments = load_kite_instruments_cache(client)
+    except Exception as exc:
+        instruments = []
+        _log(
+            "broker_instruments_load_failed",
+            broker="kite",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+    overrides = load_kite_ticker_overrides()
+    by_ticker, by_symbol = build_kite_instrument_index(instruments)
+    _log(
+        "broker_instruments_loaded",
+        broker="kite",
+        instruments=len(instruments),
+        overrides=len(overrides),
+        symbols=len(by_symbol),
+    )
+
+    margins_raw = client.get_margins()
+    holdings_raw = client.get_holdings()
+    positions_payload = client.get_positions()
+    _log("broker_snapshot_loaded", broker="kite", positions=len(holdings_raw))
+
+    account_currency = "INR"
+    broker_cash_account = kite_account_cash_available(margins_raw)
+    broker_net_worth_account = kite_account_net_worth(margins_raw, holdings_raw)
+    broker_positions = kite_positions_to_internal_positions(holdings_raw, overrides)
+    discrepancies = compare_positions(
+        state.positions,
+        broker_positions,
+        state.cash,
+        float(broker_cash_account),
+    )
+    _log(
+        "broker_context_build_complete",
+        broker="kite",
+        account_currency=account_currency,
+        broker_positions=len(broker_positions),
+    )
+    return {
+        "broker": "kite",
+        "client": client,
+        "instruments": instruments,
+        "overrides": overrides,
+        "by_ticker": by_ticker,
+        "by_symbol": by_symbol,
+        "summary_raw": margins_raw,
+        "positions_raw": holdings_raw,
+        "positions_payload_raw": positions_payload,
+        "account_currency": account_currency,
+        "broker_cash": broker_cash_account,
+        "broker_cash_usd": float(broker_cash_account),
+        "broker_net_worth": broker_net_worth_account,
+        "broker_net_worth_usd": None,
+        "broker_positions": broker_positions,
+        "fx_rates": {},
+        "fx_rate_gbp_per_usd": None,
         "discrepancies": discrepancies,
     }
 
@@ -907,10 +1014,17 @@ def _state_from_broker_snapshot(
     context: dict,
     post_positions: list[dict],
 ) -> ProductionState:
-    broker_positions_internal = positions_to_internal_positions(
-        post_positions,
-        context.get("overrides") or {},
-    )
+    broker = str(context.get("broker") or "").strip().lower()
+    if broker == "kite":
+        broker_positions_internal = kite_positions_to_internal_positions(
+            post_positions,
+            context.get("overrides") or {},
+        )
+    else:
+        broker_positions_internal = t212_positions_to_internal_positions(
+            post_positions,
+            context.get("overrides") or {},
+        )
     broker_currency = str(summary.get("broker_currency") or "").strip().upper()
     fx_rate = _safe_float(summary.get("broker_fx_rate_gbp_per_usd"), default=0.0)
     broker_cash_after = _safe_float(summary.get("broker_cash_after"), default=new_state.cash)
@@ -920,6 +1034,8 @@ def _state_from_broker_snapshot(
         synced_cash_usd = broker_cash_after
     elif broker_currency == "GBP" and fx_rate > 0:
         synced_cash_usd = broker_cash_after / fx_rate
+    else:
+        synced_cash_usd = broker_cash_after
 
     return ProductionState(
         last_date=new_state.last_date,
@@ -961,6 +1077,45 @@ def _ensure_trading212_universe(
             f"Missing {len(missing)} (first 10): {preview}"
         )
     _log("broker_universe_validation_complete", mapped=len(mapping))
+    return mapping
+
+
+def _ensure_kite_universe(
+    df: pd.DataFrame,
+    by_ticker: dict[str, dict],
+    by_symbol: dict[str, list[dict]],
+    overrides: dict[str, tuple[str, str]],
+) -> dict[str, tuple[str, str]]:
+    tickers = sorted(set(df.index.get_level_values("ticker").unique()))
+    _log("broker_universe_validation_start", broker="kite", candidate_tickers=len(tickers))
+    missing: list[str] = []
+    mapping: dict[str, tuple[str, str]] = {}
+    index_by_ticker = by_ticker if by_ticker else None
+    index_by_symbol = by_symbol if by_symbol else None
+    for ticker in tickers:
+        mapped = resolve_kite_instrument(
+            ticker,
+            overrides,
+            by_key=index_by_ticker,
+            by_symbol=index_by_symbol,
+        )
+        if not mapped:
+            missing.append(ticker)
+            continue
+        mapping[ticker] = mapped
+    if missing:
+        preview = ", ".join(missing[:10])
+        _log(
+            "broker_universe_validation_failed",
+            broker="kite",
+            missing=len(missing),
+            preview=preview,
+        )
+        raise ValueError(
+            "Missing Kite mappings for tickers. "
+            f"Missing {len(missing)} (first 10): {preview}"
+        )
+    _log("broker_universe_validation_complete", broker="kite", mapped=len(mapping))
     return mapping
 
 
@@ -1228,12 +1383,327 @@ def _execute_trading212_orders(
     return orders, missing, issues
 
 
+def _normalized_kite_quantity(shares: float) -> int:
+    return max(0, int(round(abs(_safe_float(shares)))))
+
+
+def _execute_kite_orders(
+    trades: list[dict],
+    context: dict,
+    dry_run: bool,
+) -> tuple[list[dict], list[str], list[dict]]:
+    client: KiteClient = context["client"]
+    by_ticker = context.get("by_ticker") or {}
+    by_symbol = context.get("by_symbol") or {}
+    overrides = context.get("overrides") or {}
+    missing: list[str] = []
+    orders: list[dict] = []
+    issues: list[dict] = []
+    mapped_trades: list[dict] = []
+    _log(
+        "broker_order_execution_start",
+        broker="kite",
+        trades=len(trades),
+        dry_run=bool(dry_run),
+        phases=["SELL", "BUY"],
+    )
+    for trade in trades:
+        shares = _safe_float(trade.get("shares"))
+        if abs(shares) <= 1e-6:
+            continue
+        ticker = str(trade.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        action = str(trade.get("action") or "").strip().upper()
+        phase = "SELL" if action == "SELL" or shares < 0 else "BUY"
+        exchange_symbol = resolve_kite_instrument(
+            ticker,
+            overrides,
+            by_key=by_ticker if by_ticker else None,
+            by_symbol=by_symbol if by_symbol else None,
+        )
+        if not exchange_symbol:
+            missing.append(ticker)
+            _log("broker_order_mapping_missing", broker="kite", ticker=ticker)
+            continue
+        quantity = _normalized_kite_quantity(shares)
+        if quantity <= 0:
+            continue
+        exchange, tradingsymbol = exchange_symbol
+        mapped_trades.append(
+            {
+                "ticker": ticker,
+                "action": action or ("SELL" if shares < 0 else "BUY"),
+                "shares": shares,
+                "quantity": quantity,
+                "phase": phase,
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+            }
+        )
+        if dry_run:
+            _log(
+                "broker_order_dry_run_skip",
+                broker="kite",
+                ticker=ticker,
+                quantity=quantity,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+            )
+    if dry_run:
+        _log(
+            "broker_order_execution_complete",
+            broker="kite",
+            orders=0,
+            missing_mappings=len(missing),
+            issues=0,
+        )
+        return orders, missing, issues
+
+    halt_execution = False
+    for phase in ("SELL", "BUY"):
+        if halt_execution:
+            break
+        phase_trades = [item for item in mapped_trades if item["phase"] == phase]
+        if not phase_trades:
+            continue
+        _log("broker_phase_place_start", broker="kite", phase=phase, orders=len(phase_trades))
+        placed: list[dict] = []
+        for item in phase_trades:
+            ticker = item["ticker"]
+            quantity = int(item["quantity"])
+            exchange = str(item["exchange"])
+            tradingsymbol = str(item["tradingsymbol"])
+            transaction_type = "SELL" if phase == "SELL" else "BUY"
+            try:
+                _log(
+                    "broker_order_place_start",
+                    broker="kite",
+                    phase=phase,
+                    ticker=ticker,
+                    quantity=quantity,
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                )
+                order_resp = client.place_market_order(
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=transaction_type,
+                    quantity=quantity,
+                )
+                order_id = _extract_order_id(order_resp)
+                _log(
+                    "broker_order_place_response",
+                    broker="kite",
+                    phase=phase,
+                    ticker=ticker,
+                    order_id=order_id,
+                    response_keys=sorted(order_resp.keys()) if isinstance(order_resp, dict) else [],
+                )
+                if order_id is None:
+                    issue = {
+                        "phase": phase,
+                        "ticker": ticker,
+                        "error": "missing_order_id",
+                        "details": order_resp,
+                    }
+                    issues.append(issue)
+                    orders.append(
+                        {
+                            "ticker": ticker,
+                            "action": transaction_type,
+                            "quantity": item["shares"],
+                            "filled_quantity": 0.0,
+                            "exec_price": None,
+                            "currency": "INR",
+                            "status": "FAILED",
+                            "order_id": None,
+                            "payload": {"issue": issue, "response": order_resp},
+                        }
+                    )
+                    _log("broker_order_issue", broker="kite", phase=phase, ticker=ticker, error="missing_order_id")
+                    halt_execution = True
+                    break
+                placed.append(
+                    {
+                        "phase": phase,
+                        "ticker": ticker,
+                        "action": transaction_type,
+                        "shares": item["shares"],
+                        "quantity": quantity,
+                        "exchange": exchange,
+                        "tradingsymbol": tradingsymbol,
+                        "order_id": str(order_id),
+                    }
+                )
+            except Exception as exc:
+                issue = {
+                    "phase": phase,
+                    "ticker": ticker,
+                    "error": "order_execution_error",
+                    "details": str(exc),
+                }
+                issues.append(issue)
+                _log(
+                    "broker_order_exception",
+                    broker="kite",
+                    phase=phase,
+                    ticker=ticker,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                orders.append(
+                    {
+                        "ticker": ticker,
+                        "action": transaction_type,
+                        "quantity": item["shares"],
+                        "filled_quantity": 0.0,
+                        "exec_price": None,
+                        "currency": "INR",
+                        "status": "FAILED",
+                        "order_id": None,
+                        "payload": {"issue": issue},
+                    }
+                )
+                halt_execution = True
+                break
+        if halt_execution:
+            break
+        if not placed:
+            continue
+
+        order_ids = [item["order_id"] for item in placed]
+        _log("broker_phase_monitor_start", broker="kite", phase=phase, orders=len(order_ids), order_ids=order_ids)
+        try:
+            bulk_status = client.wait_for_orders(order_ids)
+        except Exception as exc:
+            issue = {
+                "phase": phase,
+                "error": "order_monitor_error",
+                "details": str(exc),
+                "order_ids": order_ids,
+            }
+            issues.append(issue)
+            _log(
+                "broker_phase_monitor_exception",
+                broker="kite",
+                phase=phase,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                orders=len(order_ids),
+            )
+            for item in placed:
+                orders.append(
+                    {
+                        "ticker": item["ticker"],
+                        "action": item["action"],
+                        "quantity": item["shares"],
+                        "filled_quantity": 0.0,
+                        "exec_price": None,
+                        "currency": "INR",
+                        "status": "UNKNOWN",
+                        "order_id": item["order_id"],
+                        "payload": {"issue": issue},
+                    }
+                )
+            halt_execution = True
+            break
+
+        phase_has_unfilled = False
+        for item in placed:
+            order_id = item["order_id"]
+            filled = bulk_status.get(order_id) or {"id": order_id, "status": "PENDING"}
+            status = str(filled.get("status", "")).upper()
+            filled_qty = abs(_safe_float(filled.get("filledQuantity")))
+            filled_value = abs(_safe_float(filled.get("filledValue")))
+            fill_price = abs(_safe_float(filled.get("fillPrice")))
+            exec_price = None
+            if fill_price > 0:
+                exec_price = fill_price
+            elif filled_qty > 0 and filled_value > 0:
+                exec_price = filled_value / filled_qty
+            currency_code = str(filled.get("currency") or "INR").strip().upper() or "INR"
+            orders.append(
+                {
+                    "ticker": item["ticker"],
+                    "action": item["action"],
+                    "quantity": item["shares"],
+                    "filled_quantity": filled_qty,
+                    "exec_price": exec_price,
+                    "currency": currency_code,
+                    "status": status,
+                    "order_id": order_id,
+                    "payload": filled,
+                }
+            )
+            _log(
+                "broker_order_wait_result",
+                broker="kite",
+                phase=phase,
+                ticker=item["ticker"],
+                order_id=order_id,
+                status=status,
+                filled_qty=filled_qty,
+                expected_qty=abs(_safe_float(item["quantity"])),
+            )
+            if status != "FILLED" or not _float_close(filled_qty, abs(_safe_float(item["quantity"]))):
+                issues.append(
+                    {
+                        "phase": phase,
+                        "ticker": item["ticker"],
+                        "order_id": order_id,
+                        "status": status,
+                        "filled_quantity": filled_qty,
+                        "expected_quantity": abs(_safe_float(item["quantity"])),
+                        "details": "Order not fully filled; halting further order placement for this run.",
+                    }
+                )
+                phase_has_unfilled = True
+        if phase_has_unfilled:
+            _log("broker_phase_unfilled", broker="kite", phase=phase, details="Halting execution after this phase.")
+            halt_execution = True
+
+    _log(
+        "broker_order_execution_complete",
+        broker="kite",
+        orders=len(orders),
+        missing_mappings=len(missing),
+        issues=len(issues),
+    )
+    return orders, missing, issues
+
+
 def _build_broker_positions_rows(
     positions: list[dict],
     account_currency: str,
+    broker: str = "trading212",
 ) -> list[dict]:
     rows: list[dict] = []
+    broker_name = str(broker or "").strip().lower()
     for pos in positions:
+        if broker_name == "kite":
+            exchange = str(pos.get("exchange") or "").strip().upper()
+            tradingsymbol = str(pos.get("tradingsymbol") or "").strip().upper()
+            quantity = _safe_float(pos.get("quantity")) + _safe_float(pos.get("t1_quantity"))
+            average_price = _safe_float(pos.get("average_price"))
+            current_price = _safe_float(pos.get("last_price"))
+            wallet_current_value = _safe_float(pos.get("value"))
+            if wallet_current_value <= 0 and quantity > 0 and current_price > 0:
+                wallet_current_value = quantity * current_price
+            rows.append(
+                {
+                    "ticker": f"{exchange}:{tradingsymbol}" if exchange and tradingsymbol else tradingsymbol,
+                    "quantity": quantity,
+                    "average_price": average_price if average_price > 0 else None,
+                    "current_price": current_price if current_price > 0 else None,
+                    "instrument_currency": account_currency,
+                    "account_currency": account_currency,
+                    "wallet_current_value": wallet_current_value if wallet_current_value > 0 else None,
+                    "payload": pos,
+                }
+            )
+            continue
+
         instrument = pos.get("instrument") or {}
         wallet = pos.get("walletImpact") or {}
         rows.append(
@@ -1251,14 +1721,33 @@ def _build_broker_positions_rows(
     return rows
 
 
-def _build_broker_account_row(summary: dict, account_currency: str) -> dict:
+def _build_broker_account_row(
+    summary: dict,
+    account_currency: str,
+    broker: str = "trading212",
+    positions: list[dict] | None = None,
+) -> dict:
+    broker_name = str(broker or "").strip().lower()
+    if broker_name == "kite":
+        holdings = positions or []
+        cash = kite_account_cash_available(summary)
+        net_worth = kite_account_net_worth(summary, holdings)
+        investments = net_worth - cash
+        return {
+            "currency": account_currency,
+            "cash": cash,
+            "investments": investments,
+            "net_worth": net_worth,
+            "payload": summary,
+        }
+
     cash = summary.get("cash") or {}
     investments = summary.get("investments") or {}
     return {
         "currency": account_currency,
         "cash": cash.get("availableToTrade"),
         "investments": investments.get("currentValue"),
-        "net_worth": account_net_worth(summary),
+        "net_worth": t212_account_net_worth(summary),
         "payload": summary,
     }
 
@@ -1418,7 +1907,7 @@ def main():
             )
             return
 
-    strategy_roots = args.strategy_roots or ["alphas"]
+    strategy_roots = args.strategy_roots or list(config.DEFAULT_STRATEGY_ROOTS)
     strategy_names = args.strategies or list_strategy_names(strategy_roots)
     _log("strategy_discovery_complete", strategy_roots=strategy_roots, discovered=len(strategy_names))
     if not strategy_names:
@@ -1694,10 +2183,11 @@ def main():
     broker_order_issues: list[dict] = []
     broker_account_row: dict | None = None
     broker_positions_rows: list[dict] = []
+    broker_name = _active_broker_name()
     excluded_tickers = db_load_excluded_tickers()
     state_for_trades = state
-    if trading212_enabled():
-        _log("broker_integration_enabled", broker="trading212")
+    if broker_name == "trading212":
+        _log("broker_integration_enabled", broker=broker_name)
         broker_context = _build_trading212_context(state)
         tradable_df = _apply_universe_filter_with_exclusions(sector_df, excluded_tickers)
         _ensure_trading212_universe(
@@ -1721,6 +2211,31 @@ def main():
             )
         else:
             _log("broker_state_for_signals_disabled")
+    elif broker_name == "kite":
+        _log("broker_integration_enabled", broker=broker_name)
+        broker_context = _build_kite_context(state)
+        tradable_df = _apply_universe_filter_with_exclusions(sector_df, excluded_tickers)
+        _ensure_kite_universe(
+            tradable_df,
+            broker_context.get("by_ticker") or {},
+            broker_context.get("by_symbol") or {},
+            broker_context.get("overrides") or {},
+        )
+        if config.KITE_USE_BROKER_STATE_FOR_SIGNALS:
+            state_for_trades = _state_from_broker_context(
+                state,
+                broker_context,
+                price_lookup=price_lookup,
+            )
+            _log(
+                "broker_state_for_signals_enabled",
+                broker=broker_name,
+                cash_usd=state_for_trades.cash,
+                positions=len(state_for_trades.positions),
+                prev_weights=len(state_for_trades.prev_weights),
+            )
+        else:
+            _log("broker_state_for_signals_disabled", broker=broker_name)
     else:
         _log("broker_integration_disabled")
 
@@ -1747,19 +2262,27 @@ def main():
     summary["regime_scope"] = args.regime_scope
     summary["cash_adjustment"] = float(total_cash)
     if broker_context:
-        summary["broker_name"] = "trading212"
+        summary["broker_name"] = broker_name
         summary["broker_currency"] = broker_context.get("account_currency")
         summary["broker_discrepancies"] = broker_context.get("discrepancies")
         summary["broker_fx_rates"] = broker_context.get("fx_rates")
         summary["broker_fx_rate_gbp_per_usd"] = broker_context.get("fx_rate_gbp_per_usd")
         broker_exec_start = time.monotonic()
-        broker_orders, broker_missing, broker_order_issues = _execute_trading212_orders(
-            trades,
-            broker_context,
-            args.dry_run,
-        )
+        if broker_name == "kite":
+            broker_orders, broker_missing, broker_order_issues = _execute_kite_orders(
+                trades,
+                broker_context,
+                args.dry_run,
+            )
+        else:
+            broker_orders, broker_missing, broker_order_issues = _execute_trading212_orders(
+                trades,
+                broker_context,
+                args.dry_run,
+            )
         _log(
             "broker_order_execution_summary",
+            broker=broker_name,
             elapsed_sec=round(time.monotonic() - broker_exec_start, 2),
             orders=len(broker_orders),
             missing=len(broker_missing),
@@ -1769,53 +2292,86 @@ def main():
             missing = sorted(set(broker_missing))
             summary["broker_missing_tickers"] = missing
             raise ValueError(
-                "Trading212 mapping missing for generated trades. "
+                f"{broker_name.capitalize()} mapping missing for generated trades. "
                 f"Missing {len(missing)} (first 10): {', '.join(missing[:10])}"
             )
         if broker_order_issues:
             summary["broker_order_issues"] = broker_order_issues
             summary["broker_order_issue_count"] = len(broker_order_issues)
-            _log("broker_order_issues_recorded", count=len(broker_order_issues))
+            _log("broker_order_issues_recorded", broker=broker_name, count=len(broker_order_issues))
         if args.dry_run:
             post_summary = broker_context.get("summary_raw", {})
             post_positions = broker_context.get("positions_raw", [])
         else:
-            client: Trading212Client = broker_context["client"]
+            client = broker_context["client"]
             _log("broker_post_trade_snapshot_start")
-            try:
-                post_summary = client.get_account_summary()
-            except Trading212ApiError as exc:
-                post_summary = broker_context.get("summary_raw", {}) or {}
-                summary["broker_snapshot_warning"] = (
-                    "Using pre-trade account summary due to post-trade snapshot rate limit/error."
-                )
-                _log(
-                    "broker_post_trade_summary_failed",
-                    status_code=exc.status_code,
-                    error=str(exc),
-                )
-            try:
-                post_positions = client.get_positions()
-            except Trading212ApiError as exc:
-                post_positions = broker_context.get("positions_raw", []) or []
-                summary["broker_snapshot_warning"] = (
-                    "Using pre-trade positions due to post-trade snapshot rate limit/error."
-                )
-                _log(
-                    "broker_post_trade_positions_failed",
-                    status_code=exc.status_code,
-                    error=str(exc),
-                )
+            if broker_name == "kite":
+                try:
+                    post_summary = client.get_margins()
+                except KiteApiError as exc:
+                    post_summary = broker_context.get("summary_raw", {}) or {}
+                    summary["broker_snapshot_warning"] = (
+                        "Using pre-trade account summary due to post-trade snapshot rate limit/error."
+                    )
+                    _log(
+                        "broker_post_trade_summary_failed",
+                        broker=broker_name,
+                        status_code=exc.status_code,
+                        error=str(exc),
+                    )
+                try:
+                    post_positions = client.get_holdings()
+                except KiteApiError as exc:
+                    post_positions = broker_context.get("positions_raw", []) or []
+                    summary["broker_snapshot_warning"] = (
+                        "Using pre-trade positions due to post-trade snapshot rate limit/error."
+                    )
+                    _log(
+                        "broker_post_trade_positions_failed",
+                        broker=broker_name,
+                        status_code=exc.status_code,
+                        error=str(exc),
+                    )
+            else:
+                try:
+                    post_summary = client.get_account_summary()
+                except Trading212ApiError as exc:
+                    post_summary = broker_context.get("summary_raw", {}) or {}
+                    summary["broker_snapshot_warning"] = (
+                        "Using pre-trade account summary due to post-trade snapshot rate limit/error."
+                    )
+                    _log(
+                        "broker_post_trade_summary_failed",
+                        broker=broker_name,
+                        status_code=exc.status_code,
+                        error=str(exc),
+                    )
+                try:
+                    post_positions = client.get_positions()
+                except Trading212ApiError as exc:
+                    post_positions = broker_context.get("positions_raw", []) or []
+                    summary["broker_snapshot_warning"] = (
+                        "Using pre-trade positions due to post-trade snapshot rate limit/error."
+                    )
+                    _log(
+                        "broker_post_trade_positions_failed",
+                        broker=broker_name,
+                        status_code=exc.status_code,
+                        error=str(exc),
+                    )
             _log("broker_post_trade_snapshot_complete", positions=len(post_positions))
         broker_context["post_summary"] = post_summary
         broker_context["post_positions"] = post_positions
         broker_account_row = _build_broker_account_row(
             post_summary,
-            broker_context.get("account_currency") or "GBP",
+            broker_context.get("account_currency") or "INR",
+            broker=broker_name,
+            positions=post_positions,
         )
         broker_positions_rows = _build_broker_positions_rows(
             post_positions,
-            broker_context.get("account_currency") or "GBP",
+            broker_context.get("account_currency") or "INR",
+            broker=broker_name,
         )
         broker_cash_before = _safe_float(broker_context.get("broker_cash"))
         broker_cash_after = _safe_float(broker_account_row.get("cash"))
@@ -1940,7 +2496,7 @@ def main():
                 )[:5]
             )
             print(
-                "Warning: One or more Trading212 orders were not fully executed. "
+                f"Warning: One or more {broker_name} orders were not fully executed. "
                 "Persisting state from broker snapshot to avoid drift."
                 + (f" Affected tickers: {issue_preview}" if issue_preview else "")
             )
@@ -1961,9 +2517,9 @@ def main():
         if price_snapshot:
             db_replace_prices(summary["date"], price_snapshot)
         if broker_context and broker_account_row is not None:
-            db_upsert_broker_account(summary["date"], "trading212", broker_account_row)
-            db_replace_broker_positions(summary["date"], "trading212", broker_positions_rows)
-            db_replace_broker_orders(summary["date"], "trading212", broker_orders)
+            db_upsert_broker_account(summary["date"], broker_name, broker_account_row)
+            db_replace_broker_positions(summary["date"], broker_name, broker_positions_rows)
+            db_replace_broker_orders(summary["date"], broker_name, broker_orders)
         db_upsert_state(state_to_persist)
         if pending_entries:
             retry_pending_tickers = failed_new_tickers & pending_ticker_candidates

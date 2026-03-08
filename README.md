@@ -154,6 +154,13 @@ Production storage + API:
 - `DATABASE_URL` / `POSTGRES_URL` is required for production runs, queueing adjustments, and API endpoints
 - `API_KEY` for API auth
 
+Broker integration:
+
+- `USE_TRADING212=true` enables Trading212 (requires `TRADING212_API_KEY`, `TRADING212_API_SECRET`)
+- `USE_KITE=true` enables Zerodha Kite (requires `KITE_API_KEY` and either `KITE_ACCESS_TOKEN` or `KITE_REQUEST_TOKEN` + `KITE_API_SECRET`)
+- Set only one broker integration at a time (`USE_TRADING212` or `USE_KITE`)
+- Optional Kite routing/mapping knobs: `KITE_DEFAULT_EXCHANGE`, `KITE_PRODUCT`, `KITE_ORDER_VARIETY`, `KITE_TICKER_MAP_FILE`
+
 ## Notes
 
 - `.env` holds secrets/keys and is ignored by git.

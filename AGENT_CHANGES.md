@@ -2,6 +2,21 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-03-03
+- Added Zerodha Kite broker integration in `src/kite.py`:
+  - New API client (`KiteClient`) with auth/session support (`KITE_ACCESS_TOKEN` or `KITE_REQUEST_TOKEN` + `KITE_API_SECRET`), request retries, order placement, order polling, holdings/margins fetch, and instrument-cache helpers.
+  - Added ticker mapping + symbol resolution utilities for India tickers (`.NS`/`.BO`) with optional overrides via `data/kite_ticker_map.json`.
+- Updated broker configuration in `src/config.py` with Kite-specific flags and runtime controls:
+  - `USE_KITE`, `KITE_BASE_URL`, `KITE_TIMEOUT`, retry knobs, order timeout/poll knobs, product/variety/exchange defaults, instruments cache/map paths, token file path, and auto-session generation toggle.
+- Wired `scripts/production/daily_run.py` for multi-broker execution (`kite` or `trading212`):
+  - Added broker selection guard (fails fast if both brokers are enabled at once).
+  - Added Kite context bootstrap, universe pre-check, market-order execution (`SELL` then `BUY`), post-trade broker snapshot, broker-state-for-signals support, and broker-synced state persistence.
+  - Generalized broker persistence paths so DB writes use the active broker name instead of hardcoded `trading212`.
+  - Generalized broker account/positions row builders and snapshot-state sync for non-USD/GBP broker currencies.
+- Updated `scripts/production/api_server.py` broker endpoint defaults to use the currently configured broker (`DEFAULT_BROKER` env override supported).
+- Added unit tests in `tests/test_kite.py` for Kite symbol resolution, position mapping, order snapshot normalization, account metrics, and request response unwrapping.
+- Updated `README.md` with Kite broker configuration and activation notes.
+
 ## 2026-02-27
 - Optimized broker API payload control in `scripts/production/api_server.py`:
   - Added `include_payload` query param (default `false`) to `/broker-summary`, `/broker-positions`, `/broker-orders`, and `/latest-broker-orders`.
@@ -374,3 +389,109 @@ This file tracks code changes made by the assistant so they can be reviewed or r
 - Updated broker-aware smoothing behavior in `scripts/production/daily_run.py`: `_state_from_broker_context(...)` now derives `prev_weights` from broker positions + latest price snapshot so turnover smoothing remains active while anchored to actual holdings.
 - Added broker-prev-weight diagnostics (`broker_prev_weights_computed`, `broker_prev_weights_missing_prices`, `broker_prev_weights_skipped`) and wired price lookup from the target-date snapshot into broker-state preparation.
 - Extended `tests/test_daily_run_trading212_execution.py` with coverage for broker-derived `prev_weights` computation.
+
+## 2026-03-03
+- Added configurable rebalance cadence for backtests via `REBALANCE_EVERY_N_DAYS` in `src/config.py` and `rebalance_every_n_days` support in `src/rule_backtester.py`.
+  - Backtester now marks portfolio to market daily but executes trades only on cadence days (`day_index % rebalance_every_n_days == 0`).
+  - Existing cash-feasibility logic remains unchanged on rebalance days; non-rebalance days do not generate trades/costs.
+- Added CLI support for cadence control:
+  - `scripts/backtesting/backtester.py` now accepts `--rebalance-every`, passes it to the core backtester, validates `>= 1`, and persists it to `results.json`.
+  - `scripts/backtesting/strategy_sweep.py` now accepts `--rebalance-every`, applies it in both serial and parallel sweep paths, validates `>= 1`, and records it in sweep outputs.
+  - `src/strategy_sweep.py` now forwards `rebalance_every_n_days` into each evaluated `RuleBasedBacktester`.
+- Expanded tests:
+  - `tests/test_rule_backtester.py` adds coverage for cadence impact on trade-day frequency and for invalid non-positive cadence values.
+  - `tests/test_backtester_cli_smoke.py` now verifies `--rebalance-every` is accepted and persisted, and hardens env defaults for deterministic universe filtering in CI/sandbox.
+- Validation runs:
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q tests/test_rule_backtester.py tests/test_backtester_cli_smoke.py` (4 passed).
+  - Ran multi-cadence backtest comparison for `rule_trend_following + rule_mean_reversion` over 2010-01-01 to 2025-01-01; best CAGR observed at 3-day rebalance cadence.
+- Imported India strategy pack from `Autonomous_Trading_US_Deterministic` (`swing_trading_india` branch) into `alphas_india/`:
+  - Added `alphas_india/README.md`
+  - Added six India strategies with descriptions:
+    - `india_rule_trend_carry_slow`
+    - `india_rule_quality_defensive_slow`
+    - `india_rule_pullback_reentry_slow`
+    - `india_rule_range_stability_slow`
+    - `india_rule_crash_resilient_slow`
+    - `india_rule_liquidity_momentum_core`
+- Updated region defaults in `src/config.py`:
+  - Default `TRADING_REGION` changed from `us` to `india`.
+  - Added `DEFAULT_STRATEGY_ROOTS` (env-configurable via `DEFAULT_STRATEGY_ROOTS`, default `alphas_india`).
+- Wired strategy-root defaults to `config.DEFAULT_STRATEGY_ROOTS` across core entry points:
+  - `scripts/production/daily_run.py`
+  - `scripts/backtesting/backtester.py`
+  - `scripts/backtesting/strategy_sweep.py`
+  - `scripts/backtesting/sector_experiments.py`
+  - `src/walkforward.py`
+  - `src/selection_diagnostics.py`
+- Updated `scripts/production/daily_run.py` default regime mapping:
+  - Added `DEFAULT_REGIME_MAPPING_INDIA` for the new India strategies.
+  - Kept US mapping as `DEFAULT_REGIME_MAPPING_US`.
+  - Default mapping now selects India vs US map based on `config.TRADING_REGION`.
+- Validation runs:
+  - `pytest -q tests/test_rule_backtester.py` (3 passed).
+  - `pytest -q tests/test_backtester_cli_smoke.py` (1 passed).
+- Ported backtester controls from `Autonomous_Trading_US_Deterministic` into `Trad_Prod_India`:
+  - Added regime-switch confirmation helpers and CLI flags in `scripts/backtesting/backtester.py`:
+    - `--confirm-days`
+    - `--confirm-days-sideways`
+  - Added execution-control CLI flags in `scripts/backtesting/backtester.py`:
+    - `--min-weight-change`
+    - `--min-trade-dollars`
+    - `--max-daily-turnover`
+  - Backtester now applies regime confirmation prior to simulation (`_apply_regime_confirmation(...)`).
+- Extended `src/rule_backtester.py` with runtime controls:
+  - `run(..., rebalance_every, min_weight_change, min_trade_dollars, max_daily_turnover, show_progress)`
+  - turnover-capped target scaling
+  - adaptive turnover overlay via `ADAPTIVE_TURNOVER_*`
+  - minimum trade/weight-change filters
+  - one-time initial deployment bypass for trade-throttling controls
+- Added corresponding config knobs in `src/config.py`:
+  - `REBALANCE_EVERY` (with alias `REBALANCE_EVERY_N_DAYS`)
+  - `MIN_WEIGHT_CHANGE_TO_TRADE`
+  - `MIN_TRADE_DOLLARS`
+  - `MAX_DAILY_TURNOVER`
+  - `ADAPTIVE_TURNOVER_ENABLED`
+  - `ADAPTIVE_TURNOVER_RISK_CAP`
+  - `ADAPTIVE_TURNOVER_RISK_REGIMES`
+  - `CONFIRM_DAYS`
+  - `CONFIRM_DAYS_SIDEWAYS`
+- Set non-restrictive defaults for new trade-throttle settings to preserve prior baseline behavior unless explicitly enabled:
+  - `MIN_WEIGHT_CHANGE_TO_TRADE=0.0`
+  - `MIN_TRADE_DOLLARS=0.0`
+  - `MAX_DAILY_TURNOVER=None` by default (set only when provided).
+- Validation runs after port:
+  - `pytest -q tests/test_rule_backtester.py` (3 passed).
+  - `pytest -q tests/test_backtester_cli_smoke.py` (1 passed).
+- Parity alignment pass versus `Autonomous_Trading_US_Deterministic` (`swing_trading_india`) for backtesting:
+  - Updated `src/config.py` backtest defaults to deterministic baseline:
+    - `INITIAL_CAPITAL` default to `1_000_000` (env override supported)
+    - `TOP_K`, `ROLLING_WINDOW_FOR_VOL`, `USE_VOL_PARITY` now env-driven like deterministic
+    - `REBALANCE_EVERY` default to `28` (alias `REBALANCE_EVERY_N_DAYS` retained)
+    - `WEIGHT_SMOOTHING` default to `0.0`
+    - `MIN_WEIGHT_CHANGE_TO_TRADE=0.01`, `MIN_TRADE_DOLLARS=20000`, `MAX_DAILY_TURNOVER=0.35`
+    - `ENABLE_UNIVERSE_QUALITY_FILTER` default to `False` for backtest parity
+  - Added `BACKTEST_ENFORCE_CASH_BALANCE` (default `False`) and gated buy-side cash scaling in `src/rule_backtester.py` behind it to match deterministic leverage behavior.
+  - Applied universe quality filtering in `src/rule_backtester.py` only when `ENABLE_UNIVERSE_QUALITY_FILTER` is enabled.
+  - Restored deterministic-style `cash_weight` logging in `src/rule_backtester.py` (`1 - sum(weights)`).
+  - Updated unit tests to explicitly set new throttle/cash flags for deterministic assertions:
+    - `tests/test_rule_backtester.py`
+  - Synced India backtest dataset to deterministic snapshot by replacing:
+    - `Trad_Prod_India/data/daily_data_india.parquet`
+    - source: `Autonomous_Trading_US_Deterministic/data/daily_data_india.parquet`
+  - Re-ran parity command in `Trad_Prod_India`; metrics now match deterministic exactly (`CAGR 56.7985%`, `Final Net Worth 306,260,669.87` over `2013-01-01` to `2026-01-01`).
+
+## 2026-03-08
+- Ran an India ensemble backtest with fixed regime mapping and higher smoothing (`WEIGHT_SMOOTHING=0.85`) using:
+  - `TRADING_REGION=india DATA_FILE=data/daily_data_india.parquet WEIGHT_SMOOTHING=0.85 MPLCONFIGDIR=/tmp/matplotlib caffeinate -i python3 scripts/backtesting/backtester.py --strategy-roots alphas_india --strategies india_rule_crash_resilient_slow india_rule_liquidity_momentum_core india_rule_pullback_reentry_slow --start-date 2013-01-01 --end-date 2026-01-01 --confirm-days 20 --confirm-days-sideways 30 --rebalance-every 28 --min-weight-change 0.01 --regime-mapping '{"bear_high_vol":"india_rule_range_stability_slow","bear_low_vol":"india_rule_trend_carry_slow","bull_high_vol":"india_rule_pullback_reentry_slow","bull_low_vol":"india_rule_pullback_reentry_slow","sideways_high_vol":"india_rule_range_stability_slow","sideways_low_vol":"india_rule_liquidity_momentum_core"}'`
+  - Result: `CAGR 53.9592%`, `Sharpe 1.5702`, `Max Drawdown -66.5310%`, `Final Net Worth 242,696,010.50`.
+- Ran a focused parameter sweep on the same India setup and found improved settings:
+  - Best observed config: `WEIGHT_SMOOTHING=0.00`, `--rebalance-every 14`, `--max-daily-turnover 0.35`.
+  - Best observed metrics: `CAGR 59.5616%`, `Sharpe 1.5978`, `Max Drawdown -60.8747%`, `Final Net Worth 382,533,520.47`.
+- Updated `scripts/backtesting/backtester.py` to capture invocation metadata per run:
+  - Added command capture (`sys.executable + sys.argv`) into `results.json` (`command`, `argv`).
+  - Added append-only run log file at `runs/backtesting/backtester_runs.jsonl` with command, output paths, parameters, and metrics.
+  - Prints `Run log appended to ...` on successful log write; logs a warning without failing the backtest if run-log write fails.
+- Updated `tests/test_backtester_cli_smoke.py` to verify:
+  - `results.json` contains the captured command.
+  - `runs/backtesting/backtester_runs.jsonl` is written and includes an entry for the smoke strategy run.
+- Updated `AGENTS.md` with a latest backtest snapshot including baseline and improved India results.
