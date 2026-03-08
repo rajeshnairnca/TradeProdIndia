@@ -37,7 +37,7 @@ def update_market_data(
     interval: str = "1d",
     rolling_window: int | None = None,
     vix_ticker: str = config.DEFAULT_VIX_TICKER,
-    screener: str = "america",
+    screener: str = "india",
     exchange_list: list[str] | None = None,
     timeout: float | None = None,
     require_all_tickers: bool = True,
@@ -68,7 +68,7 @@ def update_market_data(
     tickers = sorted(existing.index.get_level_values("ticker").unique())
     rolling_window = rolling_window or config.ADV_LOOKBACK
     lookback_rows = max(lookback_days, 300, rolling_window + 50)
-    exchange_list = exchange_list or ["NASDAQ", "NYSE", "AMEX"]
+    exchange_list = exchange_list or ["NSE", "BSE"]
     source = _resolve_market_data_source(market_data_source)
     source_label = "TradingView" if source == "tradingview" else "Kite /quote/ohlc"
 
@@ -112,7 +112,7 @@ def update_market_data(
                 normalized_map[t] = exchange or "UNKNOWN"
             exchange_map = normalized_map
         symbol_by_ticker = {}
-        fallback_exchange = exchange_list[0] if exchange_list else "NYSE"
+        fallback_exchange = exchange_list[0] if exchange_list else "NSE"
         for ticker in tickers:
             mapped = exchange_map.get(ticker)
             exchange = mapped if mapped and mapped != "UNKNOWN" else fallback_exchange

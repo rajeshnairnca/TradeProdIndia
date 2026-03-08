@@ -1,7 +1,5 @@
 import numpy as np
 
-from . import config
-
 
 def _india_brokerage(trade_dollars: np.ndarray) -> np.ndarray:
     trade_value = np.abs(trade_dollars)
@@ -16,26 +14,8 @@ def _india_brokerage(trade_dollars: np.ndarray) -> np.ndarray:
     return stt + stamp_charges + nse_charges + sebi_charges + gst + dp_charges
 
 
-def _us_brokerage(
-    trade_dollars: np.ndarray, trade_shares: np.ndarray | None = None
-) -> np.ndarray:
-    trade_value = np.abs(trade_dollars)
-    commission = trade_value * config.US_COMMISSION_RATE
-    sell_mask = trade_dollars < -1.0
-    sec_fee = np.where(sell_mask, trade_value * config.US_SEC_FEE_RATE, 0.0)
-    if trade_shares is None:
-        finra_fee = np.zeros_like(trade_value)
-    else:
-        finra_fee = np.where(
-            sell_mask, np.abs(trade_shares) * config.US_FINRA_FEE_PER_SHARE, 0.0
-        )
-    return commission + sec_fee + finra_fee
-
-
 def vectorized_brokerage_calculator(
     trade_dollars: np.ndarray, trade_shares: np.ndarray | None = None
 ) -> np.ndarray:
-    region = config.TRADING_REGION
-    if region == "us":
-        return _us_brokerage(trade_dollars, trade_shares=trade_shares)
+    _ = trade_shares
     return _india_brokerage(trade_dollars)

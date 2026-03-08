@@ -49,19 +49,19 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--catalog-file", default="data/tradingviewdata.txt", help="TradingView symbol catalog JSON.")
-    parser.add_argument("--universe-file", default="data/universe_us.txt", help="Current universe ticker list.")
+    parser.add_argument("--universe-file", default="data/universe_india.txt", help="Current universe ticker list.")
     parser.add_argument(
         "--allowed-exchanges",
-        default="NASDAQ,NYSE,AMEX",
+        default="NSE,BSE",
         help="Comma-separated exchange allowlist when parsing TradingView symbols.",
     )
     parser.add_argument(
         "--exchange-priority",
-        default="NASDAQ,NYSE,AMEX",
+        default="NSE,BSE",
         help="Comma-separated preferred order when a ticker appears on multiple exchanges.",
     )
     parser.add_argument("--max-candidates", type=int, default=3000, help="Max symbols to evaluate per run.")
-    parser.add_argument("--screener", default="america", help="TradingView screener.")
+    parser.add_argument("--screener", default="india", help="TradingView screener.")
     parser.add_argument("--interval", default="1d", help="TradingView interval.")
     parser.add_argument("--tv-timeout", type=float, default=None, help="TradingView request timeout in seconds.")
     parser.add_argument("--batch-size", type=int, default=200, help="TradingView batch size.")

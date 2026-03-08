@@ -8,8 +8,7 @@ This repository contains a deterministic, rule-based trading system. It loads st
 
 ```
 .
-├── alphas/                   # Promoted strategies (each folder: strategy.py + description.txt)
-│   └── _ensembles/           # Backtest outputs by region
+├── alphas_india/             # Promoted India strategies (each folder: strategy.py + description.txt)
 ├── data/                     # Local data: parquet, raw DB, universe lists
 ├── scripts/                  # CLI entry points
 │   ├── backtesting/          # Backtester, sweeps, sector experiments
@@ -25,7 +24,7 @@ This repository contains a deterministic, rule-based trading system. It loads st
 
 ## Strategy Format
 
-Each strategy lives at `alphas/<strategy_name>/strategy.py` and must define:
+Each strategy lives at `alphas_india/<strategy_name>/strategy.py` and must define:
 
 - `DESCRIPTION`: short text summary
 - `REGIME_TAGS`: list of regime labels (any of: `bull_low_vol`, `bull_high_vol`, `bear_low_vol`, `bear_high_vol`, `sideways_low_vol`, `sideways_high_vol`)
@@ -48,10 +47,10 @@ For production containers, use `requirements.production.txt` (see `Dockerfile`).
 
 ```bash
 # Single strategy
-caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following
+caffeinate -i python3 scripts/backtesting/backtester.py --strategies india_rule_trend_carry_slow
 
 # Ensemble
-caffeinate -i python3 scripts/backtesting/backtester.py --strategies rule_trend_following rule_mean_reversion
+caffeinate -i python3 scripts/backtesting/backtester.py --strategies india_rule_crash_resilient_slow india_rule_liquidity_momentum_core india_rule_pullback_reentry_slow
 
 # Sweep combinations
 caffeinate -i python3 scripts/backtesting/strategy_sweep.py --min-size 2 --max-size 4 --max-combos 200 --jobs 7
@@ -63,7 +62,7 @@ Sector experiments:
 caffeinate -i python3 scripts/backtesting/sector_experiments.py --sectors Technology --regime-scope sector --plot
 ```
 
-Outputs are written under `alphas/_ensembles/<region>/...` (backtester, sweeps) or `runs/` (sector experiments).
+Outputs are written under `runs/_ensembles/india/...` (backtester, sweeps) or `runs/` (sector experiments).
 
 ## Production Pipeline
 
@@ -87,7 +86,7 @@ Useful options:
 Queue adjustments (cash or tickers):
 
 ```bash
-python3 scripts/production/queue_adjustments.py --add-cash 50000 --add-tickers NVDA,TSLA
+python3 scripts/production/queue_adjustments.py --add-cash 50000 --add-tickers RELIANCE.NS,TCS.NS
 ```
 
 Backfill Postgres (requires `DATABASE_URL` / `POSTGRES_URL`):
@@ -124,12 +123,12 @@ The API is DB-only and requires `DATABASE_URL` / `POSTGRES_URL`.
 
 - `data/daily_data_*.parquet` is the primary price/feature store.
 - `data/market_data.db` is the raw SQLite store for yfinance ingestion.
-- `data/universe_us.txt` and `data/universe_us_exchange_map.json` control the production universe and exchange mapping.
+- `data/universe_india.txt` controls the default India ticker universe for extraction.
 
 Yfinance extraction:
 
 ```bash
-python3 "scripts/data_extraction/data_extract_yfinance - days - v6.py" --output-file data/daily_data_us.parquet
+python3 "scripts/data_extraction/data_extract_yfinance - days - v6.py" --output-file data/daily_data_india.parquet
 ```
 
 ## Testing
@@ -144,10 +143,9 @@ The suite includes deterministic unit tests and a fast CLI smoke backtest.
 
 Common env flags (see `src/config.py`):
 
-- `TRADING_REGION` (`us` or `india`)
 - `DATA_FILE` (override parquet path)
 - `DATA_ROOT` (prefix for relative paths)
-- `UNIVERSE_FILTER` (`all`, `none`, `nasdaq100`, or comma-separated tickers)
+- `UNIVERSE_FILTER` (`all`, `none`, or comma-separated tickers)
 - `REGIME_MODE` (`heuristic`, `hmm`, `hmm_rolling`)
 - `HMM_N_COMPONENTS`, `HMM_WARMUP_PERIOD`, `HMM_STEP_SIZE`, `HMM_STATE_LABELS`
 - `BEAR_CASH_OUT`, `BEAR_GROSS_TARGET`, `REGIME_GROSS_TARGETS`

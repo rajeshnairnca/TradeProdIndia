@@ -105,7 +105,7 @@ def parse_args():
         default=config.REBALANCE_EVERY_N_DAYS,
         help="Rebalance cadence in trading days (default from REBALANCE_EVERY_N_DAYS).",
     )
-    parser.add_argument("--output-root", default="alphas", help="Root directory to store sweep results.")
+    parser.add_argument("--output-root", default="runs", help="Root directory to store sweep results.")
     parser.add_argument("--jobs", type=int, default=1, help="Parallel workers for sweeps (1 = serial).")
     return parser.parse_args()
 

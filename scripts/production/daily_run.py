@@ -46,7 +46,6 @@ from src.production_db import (
 from src.run_calendar import evaluate_run_day, resolve_schedule_date
 from src.regime import compute_market_regime_table
 from src.strategy import list_strategy_names, load_strategies
-from src.universe import NASDAQ100_TICKERS
 from src.universe_quality import apply_quality_filter
 from src.kite import (
     KiteApiError,
@@ -90,15 +89,6 @@ TRADE_COLUMNS = [
     "strategies",
 ]
 
-DEFAULT_REGIME_MAPPING_US = {
-    "bear_high_vol": "rule_mean_reversion",
-    "bear_low_vol": "rule_low_vol_defensive",
-    "bull_high_vol": "rule_quality_min_vol",
-    "bull_low_vol": "rule_momentum_acceleration",
-    "sideways_high_vol": "rule_range_reversion",
-    "sideways_low_vol": "rule_trend_strength",
-}
-
 DEFAULT_REGIME_MAPPING_INDIA = {
     "bear_high_vol": "india_rule_crash_resilient_slow",
     "bear_low_vol": "india_rule_quality_defensive_slow",
@@ -108,9 +98,7 @@ DEFAULT_REGIME_MAPPING_INDIA = {
     "sideways_low_vol": "india_rule_liquidity_momentum_core",
 }
 
-DEFAULT_REGIME_MAPPING = (
-    DEFAULT_REGIME_MAPPING_INDIA if config.TRADING_REGION == "india" else DEFAULT_REGIME_MAPPING_US
-)
+DEFAULT_REGIME_MAPPING = DEFAULT_REGIME_MAPPING_INDIA
 
 
 def _utc_now() -> str:
@@ -343,11 +331,11 @@ def parse_args():
         default=config.DEFAULT_VIX_TICKER,
         help="VIX symbol (TradingView format for tradingview source, exchange:symbol for Kite).",
     )
-    parser.add_argument("--tv-screener", default="america", help="TradingView screener (default: america).")
+    parser.add_argument("--tv-screener", default="india", help="TradingView screener (default: india).")
     parser.add_argument(
         "--tv-exchanges",
-        default="NASDAQ,NYSE,AMEX",
-        help="Comma-separated exchange fallback list (default: NASDAQ,NYSE,AMEX).",
+        default="NSE,BSE",
+        help="Comma-separated exchange fallback list (default: NSE,BSE).",
     )
     parser.add_argument("--tv-timeout", type=float, default=None, help="TradingView request timeout in seconds.")
     parser.add_argument(
@@ -529,9 +517,6 @@ def _apply_universe_filter_with_exclusions(
     universe_filter = config.UNIVERSE_FILTER
     if not universe_filter or universe_filter in ("all", "none"):
         filtered = df
-    elif universe_filter == "nasdaq100":
-        allowed = set(NASDAQ100_TICKERS)
-        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
     else:
         allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
         filtered = df[df.index.get_level_values("ticker").isin(allowed)]
@@ -1203,6 +1188,8 @@ def _state_from_broker_context(
         positions=broker_positions,
         prev_weights=prev_weights,
         total_costs_usd=state.total_costs_usd,
+        rebalance_day_index=state.rebalance_day_index,
+        initial_deploy_completed=state.initial_deploy_completed,
     )
 
 
@@ -1241,6 +1228,8 @@ def _state_from_broker_snapshot(
         positions=broker_positions_internal,
         prev_weights=dict(new_state.prev_weights),
         total_costs_usd=new_state.total_costs_usd,
+        rebalance_day_index=new_state.rebalance_day_index,
+        initial_deploy_completed=new_state.initial_deploy_completed,
     )
 
 
@@ -2479,6 +2468,10 @@ def main():
         regime_table=regime_table,
         strategy_selector=mapping_selector,
         excluded_tickers=excluded_tickers,
+        rebalance_every=args.rebalance_every,
+        min_weight_change=args.min_weight_change,
+        min_trade_dollars=args.min_trade_dollars,
+        max_daily_turnover=args.max_daily_turnover,
     )
     _log(
         "trade_generation_complete",

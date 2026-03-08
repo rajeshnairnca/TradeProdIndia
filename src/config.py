@@ -78,7 +78,7 @@ USE_VOL_PARITY = _env_bool("USE_VOL_PARITY", True)
 
 USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", False)
 BACKTEST_USE_FULL_HISTORY = _env_bool("BACKTEST_USE_FULL_HISTORY", True)
-REBALANCE_EVERY = max(1, _env_int("REBALANCE_EVERY", _env_int("REBALANCE_EVERY_N_DAYS", 28)))
+REBALANCE_EVERY = max(1, _env_int("REBALANCE_EVERY", _env_int("REBALANCE_EVERY_N_DAYS", 14)))
 # Backward-compatible alias used by older scripts/tests.
 REBALANCE_EVERY_N_DAYS = REBALANCE_EVERY
 BEAR_CASH_OUT = _env_bool("BEAR_CASH_OUT", False)
@@ -86,10 +86,7 @@ BEAR_GROSS_TARGET = _env_optional_float("BEAR_GROSS_TARGET")
 REGIME_GROSS_TARGETS = _env_json_dict("REGIME_GROSS_TARGETS")
 
 # ---- Market/Cost Configuration ----
-TRADING_REGION = _env_str("TRADING_REGION", "india").lower()
-US_COMMISSION_RATE = _env_float("US_COMMISSION_RATE", 0.0015)
-US_FINRA_FEE_PER_SHARE = _env_float("US_FINRA_FEE_PER_SHARE", 0.000195)
-US_SEC_FEE_RATE = _env_float("US_SEC_FEE_RATE", 0.0000278)
+TRADING_REGION = "india"
 UNIVERSE_FILTER = os.getenv("UNIVERSE_FILTER", "all").strip().lower()
 EXCLUDED_TICKERS_FILE = _env_str("EXCLUDED_TICKERS_FILE", "data/universe_excluded.txt")
 ENABLE_UNIVERSE_QUALITY_FILTER = _env_bool("ENABLE_UNIVERSE_QUALITY_FILTER", False)
@@ -104,33 +101,30 @@ UNIVERSE_QUALITY_END_DATE = _env_str("UNIVERSE_QUALITY_END_DATE", "")
 
 # ---- Data Configuration ----
 DATA_ROOT = _env_str("DATA_ROOT", "").strip()
-REGION_DATA_FILES = {
-    "us": "data/daily_data_us.parquet",
-    "india": "data/daily_data_india.parquet",
-}
-DATA_FILE = _env_str("DATA_FILE", REGION_DATA_FILES.get(TRADING_REGION, "data/daily_data.parquet"))
+DATA_FILE = _env_str("DATA_FILE", "data/daily_data_india.parquet")
 MARKET_DATA_SOURCE = _env_str("MARKET_DATA_SOURCE", "auto").lower()
 TRADINGVIEW_EXCHANGE_MAP_FILE = _env_str(
     "TRADINGVIEW_EXCHANGE_MAP_FILE",
-    "data/universe_us_exchange_map.json",
+    "data/universe_india_exchange_map.json",
 )
 DEFAULT_VIX_TICKER = _env_str(
     "DEFAULT_VIX_TICKER",
-    "NSE:INDIAVIX" if TRADING_REGION == "india" else "CBOE:VIX",
+    "NSE:INDIAVIX",
 )
 DEFAULT_HISTORY_VIX_TICKER = _env_str(
     "DEFAULT_HISTORY_VIX_TICKER",
-    "^INDIAVIX" if TRADING_REGION == "india" else "^VIX",
+    "^INDIAVIX",
 )
+_DEFAULT_STRATEGY_ROOT = "alphas_india"
 DEFAULT_STRATEGY_ROOTS = tuple(
     part.strip()
-    for part in _env_str("DEFAULT_STRATEGY_ROOTS", "alphas_india").split(",")
+    for part in _env_str("DEFAULT_STRATEGY_ROOTS", _DEFAULT_STRATEGY_ROOT).split(",")
     if part.strip()
-) or ("alphas_india",)
+) or (_DEFAULT_STRATEGY_ROOT,)
 RUN_CALENDAR_TIMEZONE = _env_str("RUN_CALENDAR_TIMEZONE", "America/New_York")
 # Railway cron already skips weekends in this setup; keep weekend blocking opt-in.
 RUN_CALENDAR_SKIP_WEEKENDS = _env_bool("RUN_CALENDAR_SKIP_WEEKENDS", False)
-RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS = _env_bool("RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS", True)
+RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS = _env_bool("RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS", False)
 
 
 def resolve_path(path: str) -> str:

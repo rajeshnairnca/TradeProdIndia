@@ -9,7 +9,6 @@ from . import config
 from .portfolio import get_target_weights
 from .regime import compute_market_regime_table, get_regime_state, regime_top_k
 from .strategy import load_strategies
-from .universe import NASDAQ100_TICKERS
 from .universe_quality import apply_quality_filter
 
 
@@ -34,8 +33,6 @@ def _filter_tickers_by_universe_filter(tickers: set[str]) -> set[str]:
     universe_filter = (config.UNIVERSE_FILTER or "").strip().lower()
     if not universe_filter or universe_filter in {"all", "none"}:
         return set(tickers)
-    if universe_filter == "nasdaq100":
-        return set(tickers).intersection(set(NASDAQ100_TICKERS))
     requested = {item.strip().upper() for item in universe_filter.split(",") if item.strip()}
     return set(tickers).intersection(requested)
 

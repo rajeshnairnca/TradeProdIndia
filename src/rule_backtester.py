@@ -13,7 +13,6 @@ from .costs import vectorized_brokerage_calculator
 from .portfolio import get_target_weights
 from .regime import get_regime_state, regime_gross_target, regime_top_k
 from .strategy import StrategySpec
-from .universe import NASDAQ100_TICKERS
 from .universe_quality import apply_quality_filter
 from .utils import calculate_performance_metrics
 
@@ -41,10 +40,7 @@ class RuleBasedBacktester:
         self.df = df
         universe_filter = config.UNIVERSE_FILTER
         if universe_filter and universe_filter not in ("all", "none"):
-            if universe_filter == "nasdaq100":
-                allowed = set(NASDAQ100_TICKERS)
-            else:
-                allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
+            allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
             self.df = self.df[self.df.index.get_level_values("ticker").isin(allowed)]
         excluded = _load_excluded_tickers()
         if excluded:

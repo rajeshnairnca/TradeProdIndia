@@ -140,7 +140,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Backtest rule-based alpha strategies.")
     parser.add_argument("--strategies", nargs="+", help="List of strategy names to include.")
     parser.add_argument("--strategy-roots", action="append", default=[], help="Root directory containing strategies.")
-    parser.add_argument("--output-root", default="alphas", help="Root directory to store ensemble results.")
+    parser.add_argument("--output-root", default="runs", help="Root directory to store ensemble results.")
     parser.add_argument("--use-full-history", action="store_true", help="Backtest on full history instead of holdout.")
     parser.add_argument("--start-date", type=str, help="Optional YYYY-MM-DD to start backtest.")
     parser.add_argument("--end-date", type=str, help="Optional YYYY-MM-DD to end backtest (exclusive).")

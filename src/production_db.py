@@ -324,9 +324,17 @@ def init_db() -> None:
                 positions jsonb,
                 prev_weights jsonb,
                 total_costs_usd double precision,
+                rebalance_day_index integer NOT NULL DEFAULT 0,
+                initial_deploy_completed boolean NOT NULL DEFAULT false,
                 updated_at timestamptz DEFAULT now()
             );
             """
+        )
+        cur.execute(
+            "ALTER TABLE production_state ADD COLUMN IF NOT EXISTS rebalance_day_index integer NOT NULL DEFAULT 0;"
+        )
+        cur.execute(
+            "ALTER TABLE production_state ADD COLUMN IF NOT EXISTS initial_deploy_completed boolean NOT NULL DEFAULT false;"
         )
         cur.execute(
             """
@@ -1108,15 +1116,19 @@ def upsert_state(state: ProductionState) -> None:
                 cash,
                 positions,
                 prev_weights,
-                total_costs_usd
+                total_costs_usd,
+                rebalance_day_index,
+                initial_deploy_completed
             )
-            VALUES (1, %s, %s, %s, %s, %s)
+            VALUES (1, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
                 last_date = EXCLUDED.last_date,
                 cash = EXCLUDED.cash,
                 positions = EXCLUDED.positions,
                 prev_weights = EXCLUDED.prev_weights,
                 total_costs_usd = EXCLUDED.total_costs_usd,
+                rebalance_day_index = EXCLUDED.rebalance_day_index,
+                initial_deploy_completed = EXCLUDED.initial_deploy_completed,
                 updated_at = now();
             """,
             (
@@ -1125,6 +1137,8 @@ def upsert_state(state: ProductionState) -> None:
                 psycopg2.extras.Json(state.positions),
                 psycopg2.extras.Json(state.prev_weights),
                 state.total_costs_usd,
+                int(state.rebalance_day_index),
+                bool(state.initial_deploy_completed),
             ),
         )
 
@@ -1137,7 +1151,14 @@ def load_state() -> ProductionState | None:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT last_date, cash, positions, prev_weights, total_costs_usd
+            SELECT
+                last_date,
+                cash,
+                positions,
+                prev_weights,
+                total_costs_usd,
+                rebalance_day_index,
+                initial_deploy_completed
             FROM production_state
             WHERE id = 1;
             """
@@ -1145,13 +1166,23 @@ def load_state() -> ProductionState | None:
         row = cur.fetchone()
         if not row:
             return None
-        last_date, cash, positions, prev_weights, total_costs = row
+        (
+            last_date,
+            cash,
+            positions,
+            prev_weights,
+            total_costs,
+            rebalance_day_index,
+            initial_deploy_completed,
+        ) = row
         return ProductionState(
             last_date=str(last_date) if last_date else None,
             cash=float(cash or 0.0),
             positions=positions or {},
             prev_weights=prev_weights or {},
             total_costs_usd=float(total_costs or 0.0),
+            rebalance_day_index=max(0, int(rebalance_day_index or 0)),
+            initial_deploy_completed=bool(initial_deploy_completed),
         )
 
 

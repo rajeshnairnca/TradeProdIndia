@@ -14,7 +14,6 @@ from .costs import vectorized_brokerage_calculator
 from .portfolio import get_target_weights
 from .regime import get_regime_state, regime_gross_target, regime_top_k
 from .strategy import StrategySpec
-from .universe import NASDAQ100_TICKERS
 from .universe_quality import apply_quality_filter
 
 REQUIRED_INDICATOR_COLS = [
@@ -36,9 +35,11 @@ REQUIRED_INDICATOR_COLS = [
 class ProductionState:
     last_date: str | None
     cash: float
-    positions: dict[str, int]
+    positions: dict[str, int | float]
     prev_weights: dict[str, float]
     total_costs_usd: float = 0.0
+    rebalance_day_index: int = 0
+    initial_deploy_completed: bool = False
 
 
 def load_state(path: str | Path, default_cash: float) -> ProductionState:
@@ -50,9 +51,11 @@ def load_state(path: str | Path, default_cash: float) -> ProductionState:
     return ProductionState(
         last_date=payload.get("last_date"),
         cash=float(payload.get("cash", default_cash)),
-        positions={k: int(v) for k, v in payload.get("positions", {}).items()},
+        positions={k: float(v) for k, v in payload.get("positions", {}).items()},
         prev_weights={k: float(v) for k, v in payload.get("prev_weights", {}).items()},
         total_costs_usd=float(payload.get("total_costs_usd", 0.0)),
+        rebalance_day_index=max(0, int(payload.get("rebalance_day_index", 0) or 0)),
+        initial_deploy_completed=bool(payload.get("initial_deploy_completed", False)),
     )
 
 
@@ -65,6 +68,8 @@ def save_state(path: str | Path, state: ProductionState) -> None:
         "positions": state.positions,
         "prev_weights": state.prev_weights,
         "total_costs_usd": state.total_costs_usd,
+        "rebalance_day_index": int(state.rebalance_day_index),
+        "initial_deploy_completed": bool(state.initial_deploy_completed),
     }
     with state_path.open("w") as f:
         json.dump(payload, f, indent=2)
@@ -76,7 +81,7 @@ def update_market_data(
     interval: str = "1d",
     rolling_window: int | None = None,
     vix_ticker: str = config.DEFAULT_VIX_TICKER,
-    screener: str = "america",
+    screener: str = "india",
     exchange_list: list[str] | None = None,
     timeout: float | None = None,
     require_all_tickers: bool = True,
@@ -102,7 +107,7 @@ def update_market_data(
     tickers = sorted(existing.index.get_level_values("ticker").unique())
     rolling_window = rolling_window or config.ADV_LOOKBACK
     lookback_rows = max(lookback_days, 300, rolling_window + 50)
-    exchange_list = exchange_list or ["NASDAQ", "NYSE", "AMEX"]
+    exchange_list = exchange_list or ["NSE", "BSE"]
     interval_value = _resolve_tv_interval(interval)
     exchange_map_path = exchange_map_path or config.TRADINGVIEW_EXCHANGE_MAP_FILE
     exchange_map = _load_exchange_map(exchange_map_path)
@@ -120,7 +125,7 @@ def update_market_data(
     updated_tickers: set[str] = set()
     resolved_tickers: set[str] = set()
     symbol_by_ticker = {}
-    fallback_exchange = exchange_list[0] if exchange_list else "NYSE"
+    fallback_exchange = exchange_list[0] if exchange_list else "NSE"
     for ticker in tickers:
         mapped = exchange_map.get(ticker)
         exchange = mapped if mapped and mapped != "UNKNOWN" else fallback_exchange
@@ -762,6 +767,11 @@ def generate_trades_for_date(
     apply_regime_overlays: bool = True,
     strategy_selector: Callable[[pd.Timestamp, dict, list[StrategySpec]], list[StrategySpec] | None] | None = None,
     excluded_tickers: set[str] | None = None,
+    rebalance_every: int | None = None,
+    min_weight_change: float | None = None,
+    min_trade_dollars: float | None = None,
+    max_daily_turnover: float | None = None,
+    enforce_cash_balance: bool | None = None,
 ) -> tuple[list[dict], ProductionState, dict]:
     df = _apply_universe_filter(df, excluded_tickers=excluded_tickers)
     if df.empty:
@@ -774,6 +784,32 @@ def generate_trades_for_date(
     strategies_list = list(strategies)
     if not strategies_list:
         raise ValueError("No strategies provided.")
+
+    rebalance_every = int(rebalance_every) if rebalance_every is not None else int(config.REBALANCE_EVERY)
+    rebalance_every = max(1, rebalance_every)
+    min_weight_change = (
+        float(min_weight_change)
+        if min_weight_change is not None
+        else float(config.MIN_WEIGHT_CHANGE_TO_TRADE)
+    )
+    min_weight_change = max(0.0, min_weight_change)
+    min_trade_dollars = (
+        float(min_trade_dollars)
+        if min_trade_dollars is not None
+        else float(config.MIN_TRADE_DOLLARS)
+    )
+    min_trade_dollars = max(0.0, min_trade_dollars)
+    max_daily_turnover = (
+        float(max_daily_turnover)
+        if max_daily_turnover is not None
+        else config.MAX_DAILY_TURNOVER
+    )
+    if max_daily_turnover is not None and max_daily_turnover <= 0:
+        max_daily_turnover = None
+    if enforce_cash_balance is None:
+        enforce_cash_balance = bool(config.BACKTEST_ENFORCE_CASH_BALANCE)
+    day_index = max(0, int(getattr(state, "rebalance_day_index", 0) or 0))
+    initial_deploy_completed = bool(getattr(state, "initial_deploy_completed", False))
 
     universe = df.index.get_level_values("ticker").unique().tolist()
     state_snapshot = get_regime_state(regime_table, target_date)
@@ -834,17 +870,69 @@ def generate_trades_for_date(
         if total > cap:
             weights = weights * (cap / total)
 
-    cash_weight = max(0.0, 1.0 - np.sum(weights))
     net_worth = float(state.cash) + float(np.sum(positions_arr * prices))
     if net_worth <= 0:
         raise ValueError("Net worth is non-positive; cannot generate trades.")
+    current_holdings_dollars = positions_arr * prices
+    current_weights = np.zeros_like(weights)
+    if net_worth > 1e-9:
+        current_weights = np.clip(current_holdings_dollars / net_worth, 0.0, 1.0)
+
+    should_rebalance = (day_index % rebalance_every) == 0
+    is_initial_deploy = (
+        should_rebalance
+        and (not initial_deploy_completed)
+        and (not np.any(positions_arr))
+        and (float(np.sum(np.abs(current_weights))) <= 1e-9)
+    )
+
+    regime_label = str(state_snapshot.get("regime_label", "unknown"))
+    effective_turnover_cap = max_daily_turnover
+    if (
+        effective_turnover_cap is not None
+        and config.ADAPTIVE_TURNOVER_ENABLED
+        and config.ADAPTIVE_TURNOVER_RISK_CAP > 0
+    ):
+        risk_regimes = set(config.ADAPTIVE_TURNOVER_RISK_REGIMES or ())
+        if regime_label in risk_regimes:
+            effective_turnover_cap = min(
+                effective_turnover_cap,
+                float(config.ADAPTIVE_TURNOVER_RISK_CAP),
+            )
+    if effective_turnover_cap is not None and not is_initial_deploy:
+        current_turnover = float(np.sum(np.abs(weights - current_weights)))
+        if current_turnover > effective_turnover_cap + 1e-12:
+            scale = effective_turnover_cap / (current_turnover + 1e-12)
+            weights = current_weights + (weights - current_weights) * scale
+            weights = np.clip(weights, 0.0, None)
+            total = np.sum(weights)
+            if total > 1e-9:
+                cap = max(0.0, 1.0 - reserve)
+                if total > cap:
+                    weights = weights * (cap / total)
+            else:
+                weights = np.zeros_like(weights)
 
     target_alloc_dollars = weights * net_worth
     desired_shares = np.round(target_alloc_dollars / (prices + 1e-9)).astype(np.int64)
     desired_alloc_dollars = desired_shares * prices
-    current_holdings_dollars = positions_arr * prices
     trade_dollars = desired_alloc_dollars - current_holdings_dollars
     trade_shares = desired_shares - positions_arr
+    if not should_rebalance:
+        trade_dollars = np.zeros_like(trade_dollars)
+        trade_shares = np.zeros_like(trade_shares)
+    else:
+        if not is_initial_deploy:
+            if min_weight_change > 0:
+                small_weight_move = np.abs(weights - current_weights) < min_weight_change
+                trade_dollars[small_weight_move] = 0.0
+                trade_shares[small_weight_move] = 0
+            if min_trade_dollars > 0:
+                small_trade_notional = np.abs(trade_dollars) < min_trade_dollars
+                trade_dollars[small_trade_notional] = 0.0
+                trade_shares[small_trade_notional] = 0
+        if is_initial_deploy and np.any(np.abs(trade_dollars) > 1.0):
+            initial_deploy_completed = True
 
     safe_adv_dollars = np.nan_to_num(adv * prices, nan=0.0, posinf=0.0, neginf=0.0)
     safe_adv_dollars = np.maximum(safe_adv_dollars, config.MIN_ADV_DOLLARS_SLIPPAGE)
@@ -854,7 +942,7 @@ def generate_trades_for_date(
     total_costs = slippage_costs + brokerage_costs
 
     cash_after = float(state.cash) - float(np.sum(trade_dollars)) - total_costs
-    if cash_after < -1e-6 and np.any(trade_dollars > 0):
+    if enforce_cash_balance and cash_after < -1e-6 and np.any(trade_dollars > 0):
         buy_mask = trade_dollars > 0
         current_holdings_dollars = positions_arr * prices
 
@@ -902,11 +990,11 @@ def generate_trades_for_date(
         total_costs = adj_costs
 
     cash = float(state.cash) - float(np.sum(trade_dollars)) - total_costs
-    positions = desired_shares
+    positions = positions_arr + trade_shares
 
     net_worth = cash + float(np.sum(positions * prices))
     portfolio_value = float(np.sum(positions * prices))
-    cash_weight = max(0.0, cash / net_worth) if net_worth > 0 else 0.0
+    cash_weight = max(0.0, 1.0 - np.sum(weights))
 
     trades: list[dict] = []
     for i in range(len(trade_dollars)):
@@ -937,6 +1025,8 @@ def generate_trades_for_date(
         positions={ticker: int(shares) for ticker, shares in zip(universe, positions) if shares != 0},
         prev_weights={ticker: float(w) for ticker, w in zip(universe, weights) if abs(w) > 1e-9},
         total_costs_usd=cumulative_costs,
+        rebalance_day_index=day_index + 1,
+        initial_deploy_completed=initial_deploy_completed,
     )
 
     summary = {
@@ -950,6 +1040,8 @@ def generate_trades_for_date(
         "strategies": active_strategy_names,
         "daily_costs_usd": float(total_costs),
         "total_costs_usd": float(cumulative_costs),
+        "rebalance_day_index": int(day_index + 1),
+        "should_rebalance": bool(should_rebalance),
     }
 
     return trades, new_state, summary
@@ -960,9 +1052,6 @@ def _apply_universe_filter(df: pd.DataFrame, excluded_tickers: set[str] | None =
     universe_filter = config.UNIVERSE_FILTER
     if not universe_filter or universe_filter in ("all", "none"):
         filtered = df
-    elif universe_filter == "nasdaq100":
-        allowed = set(NASDAQ100_TICKERS)
-        filtered = df[df.index.get_level_values("ticker").isin(allowed)]
     else:
         allowed = {t.strip().upper() for t in universe_filter.split(",") if t.strip()}
         filtered = df[df.index.get_level_values("ticker").isin(allowed)]

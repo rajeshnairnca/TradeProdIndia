@@ -13,7 +13,7 @@ import yfinance as yf
 from tqdm import tqdm
 
 # --- Defaults ---
-DEFAULT_DATA_FILENAME = os.path.join("data", "daily_data.parquet")
+DEFAULT_DATA_FILENAME = os.path.join("data", "daily_data_india.parquet")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 # from src.universe import NASDAQ100_TICKERS
@@ -626,8 +626,8 @@ DEFAULT_PERIOD = "20y"
 DEFAULT_INTERVAL = "1d"
 DEFAULT_MIN_TRADING_DAYS = 50
 DEFAULT_ROLLING_WINDOW = 21
-DEFAULT_VIX_TICKER = "^VIX"
-DEFAULT_STOCKS_FILE = "data/universe_us.txt"
+DEFAULT_VIX_TICKER = "^INDIAVIX"
+DEFAULT_STOCKS_FILE = "data/universe_india.txt"
 
 
 def parse_args():
@@ -637,12 +637,20 @@ def parse_args():
         default=DEFAULT_STOCKS_FILE,
         help=f"Path to a newline-delimited list of tickers (default: {DEFAULT_STOCKS_FILE}).",
     )
-    parser.add_argument("--output-file", default=DEFAULT_DATA_FILENAME, help="Path to parquet output (default: data/daily_data.parquet)")
+    parser.add_argument(
+        "--output-file",
+        default=DEFAULT_DATA_FILENAME,
+        help=f"Path to parquet output (default: {DEFAULT_DATA_FILENAME})",
+    )
     parser.add_argument("--period", default=DEFAULT_PERIOD, help="yfinance history period (default: 20y)")
     parser.add_argument("--interval", default=DEFAULT_INTERVAL, help="yfinance interval (default: 1d)")
     parser.add_argument("--min-trading-days", type=int, default=DEFAULT_MIN_TRADING_DAYS, help="Minimum days per ticker to keep (default: 50)")
     parser.add_argument("--rolling-window", type=int, default=DEFAULT_ROLLING_WINDOW, help="Rolling window for ADV/vol/VIX z (default: 21)")
-    parser.add_argument("--vix-ticker", default=DEFAULT_VIX_TICKER, help="VIX symbol (default: ^VIX)")
+    parser.add_argument(
+        "--vix-ticker",
+        default=DEFAULT_VIX_TICKER,
+        help=f"VIX symbol (default: {DEFAULT_VIX_TICKER})",
+    )
     return parser.parse_args()
 
 

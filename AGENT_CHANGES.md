@@ -33,6 +33,11 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - `tests/test_kite.py`: coverage for `get_quote_ohlc(...)` response unwrapping.
   - `tests/test_production_market_data_kite_source.py`: validates the Kite source path in `update_market_data(...)` without network calls.
   - `tests/test_daily_run_kite_execution.py`: added a regression for regime confirmation streak behavior.
+- Aligned production trade generation with backtester execution controls for day-by-day parity:
+  - Updated `src/production.py::generate_trades_for_date(...)` to apply `rebalance_every`, `min_weight_change`, `min_trade_dollars`, `max_daily_turnover`, initial-deploy bypass, adaptive turnover risk cap, and backtest-style cash-balance enforcement toggle.
+  - Added persistent cadence state to `ProductionState` (`rebalance_day_index`, `initial_deploy_completed`) and wired it through `src/production_db.py` state schema/upsert/load and broker state adapters in `scripts/production/daily_run.py`.
+  - Updated `scripts/production/daily_run.py` to pass runtime parity knobs into `generate_trades_for_date(...)`.
+  - Added `tests/test_production_trade_parity.py` to cover rebalance cadence gating, min-weight-change suppression on non-initial days, and initial-deploy threshold bypass.
 
 ## 2026-03-03
 - Added Zerodha Kite broker integration in `src/kite.py`:
@@ -527,3 +532,63 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - `results.json` contains the captured command.
   - `runs/backtesting/backtester_runs.jsonl` is written and includes an entry for the smoke strategy run.
 - Updated `AGENTS.md` with a latest backtest snapshot including baseline and improved India results.
+- Made improved India execution controls the default baseline in config:
+  - `REBALANCE_EVERY` default `14` (`src/config.py`)
+  - `WEIGHT_SMOOTHING` default `0.0` (`src/config.py`)
+  - `MAX_DAILY_TURNOVER` default `0.35` when env is unset (`src/config.py`)
+  - Also made default strategy roots region-aware:
+    - India -> `alphas_india`
+    - US -> `alphas`
+- Verified production-vs-backtest parity over the India backtest window (`2013-01-01` to `2026-01-01`) using the same regime mapping and default controls:
+  - Trade count parity: `1535` vs `1535`
+  - Trade sequence parity: exact match (`trade_match=True`)
+  - Final net worth parity: `382,533,520.4748076` vs `382,533,520.47480756` (floating-point epsilon only)
+- Refactored core runtime/backtesting paths to India-only defaults:
+  - `src/config.py`
+    - hard-set `TRADING_REGION = "india"`
+    - default `DATA_FILE = data/daily_data_india.parquet`
+    - India-only VIX defaults (`NSE:INDIAVIX`, `^INDIAVIX`)
+    - fixed `DEFAULT_STRATEGY_ROOTS` to `alphas_india`
+    - default exchange-map path switched to `data/universe_india_exchange_map.json`
+    - run-calendar US-holiday skip default set to `False`
+  - `src/costs.py`
+    - removed US brokerage branch; brokerage calculator now uses India schedule only
+  - Removed `nasdaq100` universe-filter branch and `src/universe.py` from:
+    - `src/rule_backtester.py`
+    - `src/production.py`
+    - `src/selection_diagnostics.py`
+    - `scripts/production/daily_run.py`
+  - India market-data defaults updated:
+    - `src/production.py` and `src/production_market_data.py` now default to TradingView `screener=india` and exchange fallback `NSE,BSE`
+    - `scripts/production/daily_run.py` now defaults `--tv-screener india`, `--tv-exchanges NSE,BSE`
+  - Removed US default regime map in production runtime:
+    - `scripts/production/daily_run.py` now uses `DEFAULT_REGIME_MAPPING_INDIA` only.
+- Removed US alpha pack directory:
+  - deleted `alphas/rule_*` strategy folders (project now uses `alphas_india/` only).
+- Redirected backtest/sweep artifacts away from deleted `alphas/` root:
+  - `scripts/backtesting/backtester.py` default `--output-root` changed from `alphas` to `runs`
+  - `scripts/backtesting/strategy_sweep.py` default `--output-root` changed from `alphas` to `runs`
+  - verified output path: `runs/_ensembles/india/...`
+- Updated India-focused docs and repo guidelines:
+  - `README.md` (layout, commands, outputs, config notes)
+  - `AGENTS.md` (strategy roots, key command examples, pre-commit validation command)
+- Updated data-extraction defaults for India:
+  - `scripts/data_extraction/data_extract_yfinance - days - v6.py`
+    - default output: `data/daily_data_india.parquet`
+    - default VIX: `^INDIAVIX`
+    - default stocks file: `data/universe_india.txt`
+  - generated `data/universe_india.txt` from `data/daily_data_india.parquet` tickers (484 symbols)
+  - generated `data/universe_india_exchange_map.json` (NSE/BSE mapping by suffix).
+- Start-date sensitivity study (rebalance=14) over first 14 trading starts from January 2013:
+  - command basis: same India regime mapping/parameters as current best run (`WEIGHT_SMOOTHING=0`, `rebalance-every=14`, `max_daily_turnover=0.35`)
+  - baseline `2013-01-01`: `CAGR 59.5616%`, `Final Net Worth 382,533,520.47`
+  - best in sample: `2013-01-18` with `CAGR 59.6594%`, `Final Net Worth 376,234,584.88`
+  - worst in sample: `2013-01-10` with `CAGR 51.1932%`, `Final Net Worth 190,365,666.13`
+  - range across 14 starts:
+    - CAGR range: `8.4662` percentage points
+    - Final net worth range: `192,167,854.35`
+  - saved detailed table: `runs/backtesting/start_date_sensitivity_2013_jan_offsets.csv`
+- Re-validated production/backtest parity after India-only refactor (same India mapping and defaults):
+  - dates replayed: `3208`
+  - trades: `1535` (backtest) vs `1535` (production), exact sequence match
+  - final net worth parity preserved (`382,533,520.4748076` vs `382,533,520.47480756`)
