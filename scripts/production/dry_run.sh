@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Dry run checklist:
 # 1) Queue pending adjustments (cash + tickers)
-# 2) Run production with --skip-update (no TradingView calls)
+# 2) Run production with --skip-update (no market-data calls)
 # 3) Start API server locally
 
 python3 scripts/production/queue_adjustments.py --add-cash 50000 --cash-note "dry-run" --add-tickers NVDA,TSLA

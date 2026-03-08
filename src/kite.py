@@ -388,6 +388,21 @@ class KiteClient:
                 cleaned.append(payload)
         return cleaned
 
+    def get_quote_ohlc(self, instruments: list[str]) -> dict[str, dict[str, Any]]:
+        cleaned = [str(item).strip().upper() for item in instruments if str(item).strip()]
+        if not cleaned:
+            return {}
+        data = self._request("GET", "/quote/ohlc", params={"i": cleaned})
+        if not isinstance(data, dict):
+            return {}
+        output: dict[str, dict[str, Any]] = {}
+        for key, payload in data.items():
+            instrument = str(key or "").strip().upper()
+            if not instrument or not isinstance(payload, dict):
+                continue
+            output[instrument] = payload
+        return output
+
     def place_market_order(
         self,
         *,
@@ -760,4 +775,3 @@ def account_net_worth(
             continue
         investments += quantity * price
     return cash + investments
-

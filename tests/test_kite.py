@@ -104,3 +104,30 @@ def test_kite_client_place_market_order_unwraps_data(monkeypatch: pytest.MonkeyP
     )
     assert payload["order_id"] == "abc-1"
 
+
+def test_kite_client_get_quote_ohlc_unwraps_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = KiteClient(
+        credentials=KiteCredentials(
+            api_key="api",
+            api_secret="secret",
+            access_token="token",
+            request_token="",
+        ),
+        base_url="https://api.kite.trade",
+        timeout=0.1,
+    )
+
+    def fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return _FakeResponse(
+            status_code=200,
+            text=(
+                '{"status":"success","data":{"NSE:SBIN":{"instrument_token":779521,'
+                '"ohlc":{"open":741.0,"high":748.0,"low":739.0,"close":745.0},"volume":1200}}}'
+            ),
+            reason="OK",
+        )
+
+    monkeypatch.setattr(client._session, "request", fake_request)
+    payload = client.get_quote_ohlc(["nse:sbin"])
+    assert "NSE:SBIN" in payload
+    assert payload["NSE:SBIN"]["ohlc"]["close"] == 745.0

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -36,7 +36,7 @@ def update_market_data(
     lookback_days: int = 420,
     interval: str = "1d",
     rolling_window: int | None = None,
-    vix_ticker: str = "CBOE:VIX",
+    vix_ticker: str = config.DEFAULT_VIX_TICKER,
     screener: str = "america",
     exchange_list: list[str] | None = None,
     timeout: float | None = None,
@@ -45,9 +45,12 @@ def update_market_data(
     exchange_map: dict[str, str] | None = None,
     batch_size: int = 200,
     max_batches: int = 3,
+    market_data_source: str = "auto",
+    kite_quote_batch_size: int = 1000,
+    kite_quote_max_batches: int = 0,
     return_diagnostics: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
-    """Incrementally update the daily parquet with latest TradingView bars."""
+    """Incrementally update the daily parquet with latest bars from the configured source."""
     import pandas_ta_classic as ta  # noqa: F401
 
     data_path = Path(data_path)
@@ -66,19 +69,8 @@ def update_market_data(
     rolling_window = rolling_window or config.ADV_LOOKBACK
     lookback_rows = max(lookback_days, 300, rolling_window + 50)
     exchange_list = exchange_list or ["NASDAQ", "NYSE", "AMEX"]
-    interval_value = _resolve_tv_interval(interval)
-    if exchange_map is None:
-        exchange_map_path = exchange_map_path or config.TRADINGVIEW_EXCHANGE_MAP_FILE
-        exchange_map = _load_exchange_map(exchange_map_path)
-    else:
-        normalized_map: dict[str, str] = {}
-        for ticker, ex in exchange_map.items():
-            t = str(ticker).strip().upper()
-            if not t:
-                continue
-            exchange = str(ex or "").strip().upper()
-            normalized_map[t] = exchange or "UNKNOWN"
-        exchange_map = normalized_map
+    source = _resolve_market_data_source(market_data_source)
+    source_label = "TradingView" if source == "tradingview" else "Kite /quote/ohlc"
 
     sector_map = {}
     if "sector" in existing.columns:
@@ -98,37 +90,97 @@ def update_market_data(
     updated_tickers: set[str] = set()
     resolved_tickers: set[str] = set()
     diagnostics: dict[str, dict] = {}
-    symbol_by_ticker: dict[str, str] = {}
-    fallback_exchange = exchange_list[0] if exchange_list else "NYSE"
-    for ticker in tickers:
-        mapped = exchange_map.get(ticker)
-        exchange = mapped if mapped and mapped != "UNKNOWN" else fallback_exchange
-        symbol_by_ticker[ticker] = f"{exchange}:{ticker}"
+    symbol_by_ticker: dict[str, str]
+    analysis_map: dict[str, object] = {}
+    quote_map: dict[str, dict[str, Any]] = {}
+    kite_client = None
+    request_batch_size = batch_size
+    request_max_batches = max_batches
 
-    analysis_map = _fetch_tv_analyses_batch(
-        symbol_by_ticker=symbol_by_ticker,
-        screener=screener,
-        interval=interval_value,
-        timeout=timeout,
-        batch_size=batch_size,
-        max_batches=max_batches,
-    )
-    for ticker in tqdm(tickers, desc="Processing TradingView data", unit="ticker"):
+    if source == "tradingview":
+        interval_value = _resolve_tv_interval(interval)
+        if exchange_map is None:
+            exchange_map_path = exchange_map_path or config.TRADINGVIEW_EXCHANGE_MAP_FILE
+            exchange_map = _load_exchange_map(exchange_map_path)
+        else:
+            normalized_map: dict[str, str] = {}
+            for ticker, ex in exchange_map.items():
+                t = str(ticker).strip().upper()
+                if not t:
+                    continue
+                exchange = str(ex or "").strip().upper()
+                normalized_map[t] = exchange or "UNKNOWN"
+            exchange_map = normalized_map
+        symbol_by_ticker = {}
+        fallback_exchange = exchange_list[0] if exchange_list else "NYSE"
+        for ticker in tickers:
+            mapped = exchange_map.get(ticker)
+            exchange = mapped if mapped and mapped != "UNKNOWN" else fallback_exchange
+            symbol_by_ticker[ticker] = f"{exchange}:{ticker}"
+        analysis_map = _fetch_tv_analyses_batch(
+            symbol_by_ticker=symbol_by_ticker,
+            screener=screener,
+            interval=interval_value,
+            timeout=timeout,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+    else:
+        from .kite import KiteClient
+
+        request_batch_size = max(1, int(kite_quote_batch_size))
+        request_max_batches = int(kite_quote_max_batches)
+        kite_client = KiteClient()
+        symbol_by_ticker = _build_kite_symbol_map(tickers=tickers, client=kite_client)
+        quote_map = _fetch_kite_ohlc_batch(
+            client=kite_client,
+            symbol_by_ticker=symbol_by_ticker,
+            batch_size=request_batch_size,
+            max_batches=request_max_batches,
+        )
+
+    for ticker in tqdm(tickers, desc=f"Processing {source_label} data", unit="ticker"):
         symbol = symbol_by_ticker.get(ticker, "")
-        analysis = analysis_map.get(ticker)
-        if analysis is None:
-            resolved_tickers.add(ticker)
-            diagnostics[ticker] = _diag_item(
-                ticker=ticker,
-                status="skipped",
-                reason="missing_analysis",
-                symbol=symbol,
-            )
-            continue
-
-        bar_time = getattr(analysis, "time", None)
-        bar_time = pd.to_datetime(bar_time) if bar_time is not None else pd.Timestamp.utcnow()
-        bar_date = _to_naive_timestamp(bar_time).normalize()
+        if source == "tradingview":
+            analysis = analysis_map.get(ticker)
+            if analysis is None:
+                resolved_tickers.add(ticker)
+                diagnostics[ticker] = _diag_item(
+                    ticker=ticker,
+                    status="skipped",
+                    reason="missing_analysis",
+                    symbol=symbol,
+                )
+                continue
+            bar_time = getattr(analysis, "time", None)
+            bar_time = pd.to_datetime(bar_time) if bar_time is not None else pd.Timestamp.utcnow()
+            bar_date = _to_naive_timestamp(bar_time).normalize()
+            indicators = analysis.indicators or {}
+            open_price = indicators.get("open")
+            high_price = indicators.get("high")
+            low_price = indicators.get("low")
+            close_price = indicators.get("close")
+            volume = indicators.get("volume")
+            invalid_ohlcv_message = "TradingView returned missing OHLCV fields."
+        else:
+            quote = quote_map.get(ticker)
+            if quote is None:
+                resolved_tickers.add(ticker)
+                diagnostics[ticker] = _diag_item(
+                    ticker=ticker,
+                    status="skipped",
+                    reason="missing_quote",
+                    symbol=symbol,
+                )
+                continue
+            bar_date = _resolve_kite_bar_date(quote)
+            ohlc = quote.get("ohlc") if isinstance(quote.get("ohlc"), dict) else {}
+            open_price = ohlc.get("open")
+            high_price = ohlc.get("high")
+            low_price = ohlc.get("low")
+            close_price = ohlc.get("close")
+            volume = quote.get("volume")
+            invalid_ohlcv_message = "Kite /quote/ohlc returned missing OHLCV fields."
 
         last_ticker_date = last_date_by_ticker.get(ticker)
         if last_ticker_date is None or pd.isna(last_ticker_date):
@@ -153,12 +205,6 @@ def update_market_data(
             )
             continue
 
-        indicators = analysis.indicators or {}
-        open_price = indicators.get("open")
-        high_price = indicators.get("high")
-        low_price = indicators.get("low")
-        close_price = indicators.get("close")
-        volume = indicators.get("volume")
         if any(val is None for val in (open_price, high_price, low_price, close_price, volume)):
             diagnostics[ticker] = _diag_item(
                 ticker=ticker,
@@ -167,7 +213,7 @@ def update_market_data(
                 symbol=symbol,
                 last_data_date=_fmt_date(last_ticker_date),
                 bar_date=_fmt_date(bar_date),
-                message="TradingView returned missing OHLCV fields.",
+                message=invalid_ohlcv_message,
             )
             continue
 
@@ -213,8 +259,8 @@ def update_market_data(
         total_tickers=len(tickers),
         updated_tickers=updated_tickers,
         unresolved_tickers=unresolved,
-        batch_size=batch_size,
-        max_batches=max_batches,
+        batch_size=request_batch_size,
+        max_batches=request_max_batches,
     )
 
     if not updated_rows:
@@ -230,7 +276,7 @@ def update_market_data(
             reasons.append(f"{ticker}:{item.get('reason', 'unknown')}")
         reason_preview = ", ".join(reasons)
         raise ValueError(
-            "Partial update detected from TradingView. "
+            f"Partial update detected from {source_label}. "
             f"Updated {len(updated_tickers)}/{len(tickers)} tickers. "
             f"Missing (first 10): {preview}. "
             f"Reasons (first 5): {reason_preview}"
@@ -241,15 +287,23 @@ def update_market_data(
     if getattr(updates_df["date"].dt, "tz", None) is not None:
         updates_df["date"] = updates_df["date"].dt.tz_convert(None)
 
-    vix_close = _fetch_vix_close(
-        vix_ticker,
-        screener=screener,
-        exchange_list=exchange_list,
-        interval=interval_value,
-        timeout=timeout,
-        fallback_series=_extract_vix_series(existing),
-    )
     vix_series = _extract_vix_series(existing)
+    if source == "tradingview":
+        interval_value = _resolve_tv_interval(interval)
+        vix_close = _fetch_vix_close(
+            vix_ticker,
+            screener=screener,
+            exchange_list=exchange_list,
+            interval=interval_value,
+            timeout=timeout,
+            fallback_series=vix_series,
+        )
+    else:
+        vix_close = _fetch_vix_close_kite(
+            vix_ticker=vix_ticker,
+            client=kite_client,
+            fallback_series=vix_series,
+        )
     if vix_close is not None:
         vix_series = vix_series.copy()
         target_date = updates_df["date"].max()
@@ -324,7 +378,7 @@ def add_universe_tickers(
     interval: str = "1d",
     min_trading_days: int = 50,
     rolling_window: int | None = None,
-    vix_ticker: str = "^VIX",
+    vix_ticker: str = config.DEFAULT_HISTORY_VIX_TICKER,
     recompute_cross_sectional: bool = True,
     fail_on_no_valid_tickers: bool = True,
     return_failed_tickers: bool = False,
@@ -558,6 +612,17 @@ def _fmt_date(value) -> str | None:
         return str(value)
 
 
+def _resolve_market_data_source(source: str) -> str:
+    key = str(source or "").strip().lower()
+    if key in {"", "auto"}:
+        return "kite_ohlc" if config.USE_KITE else "tradingview"
+    if key in {"tradingview", "kite_ohlc"}:
+        return key
+    raise ValueError(
+        f"Unsupported market data source: {source!r}. Expected one of: auto, tradingview, kite_ohlc."
+    )
+
+
 def _resolve_tv_interval(interval: str):
     from tradingview_ta import Interval
 
@@ -610,6 +675,130 @@ def _chunked(values: list[str], size: int) -> list[list[str]]:
     if size <= 0:
         return [values]
     return [values[i : i + size] for i in range(0, len(values), size)]
+
+
+def _build_kite_symbol_map(tickers: list[str], client) -> dict[str, str]:
+    from .kite import (
+        build_instrument_index as build_kite_instrument_index,
+        load_instruments_cache as load_kite_instruments_cache,
+        load_ticker_overrides as load_kite_ticker_overrides,
+        resolve_kite_instrument,
+    )
+
+    instruments = load_kite_instruments_cache(client)
+    overrides = load_kite_ticker_overrides()
+    by_key, by_symbol = build_kite_instrument_index(instruments)
+    symbol_by_ticker: dict[str, str] = {}
+    for ticker in tickers:
+        normalized_ticker = str(ticker).strip().upper()
+        if not normalized_ticker:
+            continue
+        mapped = resolve_kite_instrument(
+            normalized_ticker,
+            overrides=overrides,
+            by_key=by_key,
+            by_symbol=by_symbol,
+        )
+        if mapped is None:
+            continue
+        exchange, symbol = mapped
+        symbol_by_ticker[normalized_ticker] = f"{exchange}:{symbol}"
+    return symbol_by_ticker
+
+
+def _fetch_kite_ohlc_batch(
+    *,
+    client,
+    symbol_by_ticker: dict[str, str],
+    batch_size: int,
+    max_batches: int,
+) -> dict[str, dict[str, Any]]:
+    symbols = [str(symbol).strip().upper() for symbol in symbol_by_ticker.values() if str(symbol).strip()]
+    unique_symbols = list(dict.fromkeys(symbols))
+    batches = _chunked(unique_symbols, max(1, int(batch_size)))
+    max_batches = int(max_batches)
+    if max_batches > 0 and len(batches) > max_batches:
+        raise ValueError(
+            f"Kite /quote/ohlc batch limit exceeded: {len(batches)} batches for {len(unique_symbols)} symbols "
+            f"(max {max_batches})."
+        )
+    quotes_by_symbol: dict[str, dict[str, Any]] = {}
+    for batch in tqdm(batches, desc="Fetching Kite /quote/ohlc batches", unit="batch"):
+        if not batch:
+            continue
+        try:
+            result = client.get_quote_ohlc(batch)
+        except Exception as exc:  # noqa: BLE001
+            sample = ",".join(batch[:3])
+            raise RuntimeError(
+                f"Kite /quote/ohlc request failed for {len(batch)} symbols (sample: {sample})."
+            ) from exc
+        if result:
+            quotes_by_symbol.update(result)
+    return {ticker: quotes_by_symbol.get(symbol) for ticker, symbol in symbol_by_ticker.items()}
+
+
+def _resolve_kite_bar_date(quote: dict[str, Any]) -> pd.Timestamp:
+    timestamp = quote.get("timestamp") if isinstance(quote, dict) else None
+    if timestamp is None and isinstance(quote, dict):
+        timestamp = quote.get("last_trade_time")
+    if timestamp is not None:
+        try:
+            return _to_naive_timestamp(timestamp).normalize()
+        except Exception:  # noqa: BLE001
+            pass
+    return pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None).normalize()
+
+
+def _to_kite_instrument_symbol(value: str) -> str | None:
+    ticker = str(value or "").strip().upper()
+    if not ticker:
+        return None
+    if ":" in ticker:
+        exchange, symbol = ticker.split(":", 1)
+        exchange = exchange.strip().upper()
+        symbol = symbol.strip().upper()
+        if exchange and symbol:
+            return f"{exchange}:{symbol}"
+        return None
+    if ticker.endswith(".NS") and len(ticker) > 3:
+        return f"NSE:{ticker[:-3]}"
+    if ticker.endswith(".BO") and len(ticker) > 3:
+        return f"BSE:{ticker[:-3]}"
+    exchange = str(config.KITE_DEFAULT_EXCHANGE or "").strip().upper() or "NSE"
+    return f"{exchange}:{ticker}"
+
+
+def _fetch_vix_close_kite(vix_ticker: str, client, fallback_series: pd.Series) -> float | None:
+    fallback_value = float(fallback_series.iloc[-1]) if not fallback_series.empty else None
+    if client is None:
+        return fallback_value
+    symbol = _to_kite_instrument_symbol(vix_ticker)
+    if not symbol:
+        return fallback_value
+    try:
+        response = _fetch_kite_ohlc_batch(
+            client=client,
+            symbol_by_ticker={"__VIX__": symbol},
+            batch_size=1,
+            max_batches=0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Falling back to historical VIX series for %s via Kite: %s", vix_ticker, exc)
+        return fallback_value
+    quote = response.get("__VIX__")
+    if not isinstance(quote, dict):
+        return fallback_value
+    ohlc = quote.get("ohlc") if isinstance(quote.get("ohlc"), dict) else {}
+    close_price = ohlc.get("close")
+    if close_price is None:
+        close_price = quote.get("last_price")
+    if close_price is None:
+        return fallback_value
+    try:
+        return float(close_price)
+    except (TypeError, ValueError):
+        return fallback_value
 
 
 def _fetch_tv_analyses_batch(

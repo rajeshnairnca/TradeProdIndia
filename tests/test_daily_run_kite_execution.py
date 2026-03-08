@@ -33,7 +33,9 @@ if "psycopg2" not in sys.modules:
     sys.modules["psycopg2.extras"] = fake_extras
     sys.modules["psycopg2.sql"] = fake_sql
 
-from scripts.production.daily_run import _execute_kite_orders
+import pandas as pd
+
+from scripts.production.daily_run import _apply_regime_confirmation, _execute_kite_orders
 
 
 class _FakeKiteClient:
@@ -127,3 +129,30 @@ def test_execute_kite_orders_marks_unfilled_issue() -> None:
     assert orders[0]["status"] == "REJECTED"
     assert len(issues) == 1
 
+
+def test_apply_regime_confirmation_requires_streak_before_switch() -> None:
+    idx = pd.date_range("2026-01-01", periods=5, freq="D")
+    regime_table = pd.DataFrame(
+        {
+            "regime_label": [
+                "bull_low_vol",
+                "bear_high_vol",
+                "bear_high_vol",
+                "bear_high_vol",
+                "bear_high_vol",
+            ],
+        },
+        index=idx,
+    )
+    out = _apply_regime_confirmation(
+        regime_table,
+        confirm_days=3,
+        confirm_days_sideways=3,
+    )
+    assert list(out["regime_label"].astype(str)) == [
+        "bull_low_vol",
+        "bull_low_vol",
+        "bull_low_vol",
+        "bear_high_vol",
+        "bear_high_vol",
+    ]

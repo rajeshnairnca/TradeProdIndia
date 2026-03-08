@@ -67,14 +67,18 @@ Outputs are written under `alphas/_ensembles/<region>/...` (backtester, sweeps) 
 
 ## Production Pipeline
 
-Daily run (TradingView refresh + trade generation):
+Daily run (market-data refresh + trade generation):
 
 ```bash
 caffeinate -i python3 scripts/production/daily_run.py
 ```
 
 Useful options:
-- `--skip-update` to avoid TradingView calls (local dry runs)
+- `--market-data-source kite_ohlc` to force Kite `/quote/ohlc` ingestion (default is `auto`)
+- `--skip-update` to avoid market data calls (local dry runs)
+- Backtest-alignment knobs are available in production too:
+  `--confirm-days`, `--confirm-days-sideways`, `--rebalance-every`,
+  `--min-weight-change`, `--min-trade-dollars`, `--max-daily-turnover`, `--weight-smoothing`
 - `--print-trades` to emit trades to stdout
 - `--sector` and `--regime-scope` for sector-focused production runs
 
@@ -157,9 +161,11 @@ Production storage + API:
 Broker integration:
 
 - `USE_TRADING212=true` enables Trading212 (requires `TRADING212_API_KEY`, `TRADING212_API_SECRET`)
-- `USE_KITE=true` enables Zerodha Kite (requires `KITE_API_KEY` and either `KITE_ACCESS_TOKEN` or `KITE_REQUEST_TOKEN` + `KITE_API_SECRET`)
+- `USE_KITE=true` enables Zerodha Kite (default is `true`; requires `KITE_API_KEY` and either `KITE_ACCESS_TOKEN` or `KITE_REQUEST_TOKEN` + `KITE_API_SECRET`)
 - Set only one broker integration at a time (`USE_TRADING212` or `USE_KITE`)
 - Optional Kite routing/mapping knobs: `KITE_DEFAULT_EXCHANGE`, `KITE_PRODUCT`, `KITE_ORDER_VARIETY`, `KITE_TICKER_MAP_FILE`
+- Market-data source knobs: `MARKET_DATA_SOURCE` (`auto|tradingview|kite_ohlc`), `KITE_QUOTE_BATCH_SIZE`, `KITE_QUOTE_MAX_BATCHES`
+- VIX defaults can be overridden via `DEFAULT_VIX_TICKER` and `DEFAULT_HISTORY_VIX_TICKER`
 
 ## Notes
 

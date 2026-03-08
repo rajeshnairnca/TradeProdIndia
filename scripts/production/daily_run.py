@@ -124,6 +124,128 @@ def _log(message: str, **fields) -> None:
     print(payload, flush=True)
 
 
+def _apply_confirmed_switch(
+    pred_labels: pd.Series,
+    confirm_days: int,
+    confirm_days_sideways: int | None = None,
+) -> pd.Series:
+    confirm_days = max(1, int(confirm_days))
+    confirm_days_sideways = (
+        max(1, int(confirm_days_sideways))
+        if confirm_days_sideways is not None
+        else confirm_days
+    )
+    if pred_labels.empty or (confirm_days <= 1 and confirm_days_sideways <= 1):
+        return pred_labels
+    held = pd.Series(index=pred_labels.index, dtype=object)
+    current = None
+    candidate = None
+    streak = 0
+    for i, value in enumerate(pred_labels.to_numpy()):
+        if current is None:
+            current = value
+            held.iloc[i] = current
+            continue
+        if value == current:
+            candidate = None
+            streak = 0
+            held.iloc[i] = current
+            continue
+        if candidate == value:
+            streak += 1
+        else:
+            candidate = value
+            streak = 1
+        threshold = confirm_days_sideways if str(value).startswith("sideways_") else confirm_days
+        if streak >= threshold:
+            current = candidate
+            candidate = None
+            streak = 0
+        held.iloc[i] = current
+    return held
+
+
+def _apply_regime_confirmation(
+    regime_table: pd.DataFrame,
+    *,
+    confirm_days: int,
+    confirm_days_sideways: int,
+) -> pd.DataFrame:
+    if regime_table is None or regime_table.empty or "regime_label" not in regime_table.columns:
+        return regime_table
+    out = regime_table.copy()
+    label_series = out["regime_label"].astype(str)
+    confirmed = _apply_confirmed_switch(
+        label_series,
+        confirm_days=confirm_days,
+        confirm_days_sideways=confirm_days_sideways,
+    )
+    out["regime_label"] = confirmed.astype(str)
+
+    trend_state_map = {
+        "bull_low_vol": "bull",
+        "bull_high_vol": "bull",
+        "bear_low_vol": "bear",
+        "bear_high_vol": "bear",
+        "sideways_low_vol": "sideways",
+        "sideways_high_vol": "sideways",
+    }
+    trend_up_map = {
+        "bull_low_vol": True,
+        "bull_high_vol": True,
+        "bear_low_vol": False,
+        "bear_high_vol": False,
+        "sideways_low_vol": False,
+        "sideways_high_vol": False,
+    }
+    vol_high_map = {
+        "bull_low_vol": False,
+        "bull_high_vol": True,
+        "bear_low_vol": False,
+        "bear_high_vol": True,
+        "sideways_low_vol": False,
+        "sideways_high_vol": True,
+    }
+    trend_state_new = out["regime_label"].map(trend_state_map)
+    trend_up_new = out["regime_label"].map(trend_up_map)
+    vol_high_new = out["regime_label"].map(vol_high_map)
+
+    if "trend_state" in out.columns:
+        out["trend_state"] = trend_state_new.fillna(out["trend_state"])
+    else:
+        out["trend_state"] = trend_state_new.fillna("unknown")
+    if "trend_up" in out.columns:
+        out["trend_up"] = trend_up_new.fillna(out["trend_up"])
+    else:
+        out["trend_up"] = trend_up_new.fillna(False)
+    if "vol_high" in out.columns:
+        out["vol_high"] = vol_high_new.fillna(out["vol_high"])
+    else:
+        out["vol_high"] = vol_high_new.fillna(False)
+    return out
+
+
+def _apply_runtime_trading_overrides(args: argparse.Namespace) -> None:
+    config.CONFIRM_DAYS = max(1, int(args.confirm_days))
+    config.CONFIRM_DAYS_SIDEWAYS = max(1, int(args.confirm_days_sideways))
+    args.confirm_days = config.CONFIRM_DAYS
+    args.confirm_days_sideways = config.CONFIRM_DAYS_SIDEWAYS
+    config.REBALANCE_EVERY = max(1, int(args.rebalance_every))
+    config.REBALANCE_EVERY_N_DAYS = config.REBALANCE_EVERY
+    args.rebalance_every = config.REBALANCE_EVERY
+    config.MIN_WEIGHT_CHANGE_TO_TRADE = max(0.0, float(args.min_weight_change))
+    args.min_weight_change = config.MIN_WEIGHT_CHANGE_TO_TRADE
+    config.MIN_TRADE_DOLLARS = max(0.0, float(args.min_trade_dollars))
+    args.min_trade_dollars = config.MIN_TRADE_DOLLARS
+    max_turnover = None if args.max_daily_turnover is None else float(args.max_daily_turnover)
+    if max_turnover is not None and max_turnover <= 0:
+        max_turnover = None
+    config.MAX_DAILY_TURNOVER = max_turnover
+    args.max_daily_turnover = max_turnover
+    config.WEIGHT_SMOOTHING = max(0.0, float(args.weight_smoothing))
+    args.weight_smoothing = config.WEIGHT_SMOOTHING
+
+
 def _attach_cagr_payload(summary: dict) -> None:
     run_date = str(summary.get("date") or "").strip()
     if not run_date:
@@ -198,11 +320,29 @@ def parse_args():
     )
     parser.add_argument("--data-file", default=None, help="Override data file path.")
     parser.add_argument("--date", type=str, help="Override target date (YYYY-MM-DD). Defaults to last date in data.")
-    parser.add_argument("--skip-update", action="store_true", help="Skip TradingView data update.")
+    parser.add_argument("--skip-update", action="store_true", help="Skip market data update.")
+    parser.add_argument(
+        "--market-data-source",
+        choices=("auto", "tradingview", "kite_ohlc"),
+        default=(
+            config.MARKET_DATA_SOURCE
+            if config.MARKET_DATA_SOURCE in {"auto", "tradingview", "kite_ohlc"}
+            else "auto"
+        ),
+        help="Market data provider for incremental updates (default: auto).",
+    )
     parser.add_argument("--lookback-days", type=int, default=420, help="Days of lookback for incremental update.")
     parser.add_argument("--rolling-window", type=int, default=None, help="Rolling window for ADV/vol/VIX z.")
-    parser.add_argument("--interval", default="1d", help="TradingView interval (default: 1d).")
-    parser.add_argument("--vix-ticker", default="CBOE:VIX", help="TradingView VIX symbol (default: CBOE:VIX).")
+    parser.add_argument(
+        "--interval",
+        default="1d",
+        help="TradingView interval (used when --market-data-source=tradingview).",
+    )
+    parser.add_argument(
+        "--vix-ticker",
+        default=config.DEFAULT_VIX_TICKER,
+        help="VIX symbol (TradingView format for tradingview source, exchange:symbol for Kite).",
+    )
     parser.add_argument("--tv-screener", default="america", help="TradingView screener (default: america).")
     parser.add_argument(
         "--tv-exchanges",
@@ -210,6 +350,18 @@ def parse_args():
         help="Comma-separated exchange fallback list (default: NASDAQ,NYSE,AMEX).",
     )
     parser.add_argument("--tv-timeout", type=float, default=None, help="TradingView request timeout in seconds.")
+    parser.add_argument(
+        "--kite-quote-batch-size",
+        type=int,
+        default=config.KITE_QUOTE_BATCH_SIZE,
+        help="Kite /quote/ohlc batch size (default: 1000).",
+    )
+    parser.add_argument(
+        "--kite-quote-max-batches",
+        type=int,
+        default=config.KITE_QUOTE_MAX_BATCHES,
+        help="Optional cap on Kite /quote/ohlc batches; 0 disables the cap.",
+    )
     parser.add_argument("--add-cash", type=float, default=0.0, help="Add cash to the portfolio before trading.")
     parser.add_argument("--cash-note", default="manual", help="Optional note for cash injections.")
     parser.add_argument(
@@ -224,12 +376,58 @@ def parse_args():
     )
     parser.add_argument("--history-period", default="20y", help="yfinance period for new tickers (default: 20y).")
     parser.add_argument("--history-interval", default="1d", help="yfinance interval for new tickers (default: 1d).")
-    parser.add_argument("--history-vix-ticker", default="^VIX", help="yfinance VIX symbol (default: ^VIX).")
+    parser.add_argument(
+        "--history-vix-ticker",
+        default=config.DEFAULT_HISTORY_VIX_TICKER,
+        help="yfinance VIX symbol used for history backfill.",
+    )
     parser.add_argument(
         "--min-trading-days",
         type=int,
         default=50,
         help="Minimum history days required for new tickers.",
+    )
+    parser.add_argument(
+        "--confirm-days",
+        type=int,
+        default=config.CONFIRM_DAYS,
+        help="Required consecutive days before switching non-sideways regimes.",
+    )
+    parser.add_argument(
+        "--confirm-days-sideways",
+        type=int,
+        default=config.CONFIRM_DAYS_SIDEWAYS,
+        help="Required consecutive days before switching into sideways regimes.",
+    )
+    parser.add_argument(
+        "--rebalance-every",
+        type=int,
+        default=config.REBALANCE_EVERY,
+        help="Rebalance interval in trading days.",
+    )
+    parser.add_argument(
+        "--min-weight-change",
+        type=float,
+        default=config.MIN_WEIGHT_CHANGE_TO_TRADE,
+        help="Minimum per-asset absolute target weight change required to trade.",
+    )
+    parser.add_argument(
+        "--min-trade-dollars",
+        type=float,
+        default=config.MIN_TRADE_DOLLARS,
+        help="Minimum absolute trade notional required to execute a trade.",
+    )
+    parser.add_argument(
+        "--max-daily-turnover",
+        type=float,
+        default=config.MAX_DAILY_TURNOVER,
+        help="Optional cap on daily turnover as sum(abs(weight changes)); <=0 disables.",
+    )
+    parser.add_argument(
+        "--weight-smoothing",
+        type=float,
+        default=config.WEIGHT_SMOOTHING,
+        help="Blend factor for previous weights vs fresh weights (0 = none).",
     )
     parser.add_argument(
         "--skip-pending",
@@ -250,7 +448,7 @@ def parse_args():
     parser.add_argument(
         "--allow-partial-updates",
         action="store_true",
-        help="Allow data updates if some tickers fail TradingView fetch.",
+        help="Allow data updates if some tickers fail source fetch.",
     )
     return parser.parse_args()
 
@@ -1861,6 +2059,7 @@ def _prior_broker_cost_totals(target_date: str) -> tuple[float, float]:
 
 def main():
     args = parse_args()
+    _apply_runtime_trading_overrides(args)
     _log(
         "daily_run_start",
         dry_run=bool(args.dry_run),
@@ -1868,6 +2067,17 @@ def main():
         sector=args.sector,
         regime_scope=args.regime_scope,
         force=bool(args.force),
+        confirm_days=int(args.confirm_days),
+        confirm_days_sideways=int(args.confirm_days_sideways),
+        rebalance_every=int(args.rebalance_every),
+        min_weight_change=float(args.min_weight_change),
+        min_trade_dollars=float(args.min_trade_dollars),
+        max_daily_turnover=(
+            None
+            if args.max_daily_turnover is None or float(args.max_daily_turnover) <= 0
+            else float(args.max_daily_turnover)
+        ),
+        weight_smoothing=float(args.weight_smoothing),
     )
     if not db_enabled():
         raise RuntimeError(
@@ -2070,7 +2280,18 @@ def main():
 
     if not args.skip_update:
         update_start = time.monotonic()
-        _log("market_update_start", lookback_days=args.lookback_days, interval=args.interval)
+        resolved_market_source = (
+            args.market_data_source
+            if args.market_data_source != "auto"
+            else ("kite_ohlc" if config.USE_KITE else "tradingview")
+        )
+        _log(
+            "market_update_start",
+            lookback_days=args.lookback_days,
+            interval=args.interval,
+            source_requested=args.market_data_source,
+            source_resolved=resolved_market_source,
+        )
         df = update_market_data(
             data_path,
             lookback_days=args.lookback_days,
@@ -2082,6 +2303,9 @@ def main():
             timeout=args.tv_timeout,
             require_all_tickers=not args.allow_partial_updates,
             exchange_map=universe_map,
+            market_data_source=args.market_data_source,
+            kite_quote_batch_size=args.kite_quote_batch_size,
+            kite_quote_max_batches=args.kite_quote_max_batches,
         )
         _log("market_update_complete", elapsed_sec=round(time.monotonic() - update_start, 2))
     if df is None:
@@ -2242,6 +2466,11 @@ def main():
     trade_gen_start = time.monotonic()
     _log("trade_generation_start")
     regime_table = compute_market_regime_table(df if args.regime_scope == "global" else sector_df)
+    regime_table = _apply_regime_confirmation(
+        regime_table,
+        confirm_days=args.confirm_days,
+        confirm_days_sideways=args.confirm_days_sideways,
+    )
     trades, new_state, summary = generate_trades_for_date(
         sector_df,
         strategies,
@@ -2261,6 +2490,17 @@ def main():
     summary["sector"] = sector
     summary["regime_scope"] = args.regime_scope
     summary["cash_adjustment"] = float(total_cash)
+    summary["confirm_days"] = int(args.confirm_days)
+    summary["confirm_days_sideways"] = int(args.confirm_days_sideways)
+    summary["rebalance_every"] = int(args.rebalance_every)
+    summary["min_weight_change"] = float(args.min_weight_change)
+    summary["min_trade_dollars"] = float(args.min_trade_dollars)
+    summary["max_daily_turnover"] = (
+        None
+        if args.max_daily_turnover is None or float(args.max_daily_turnover) <= 0
+        else float(args.max_daily_turnover)
+    )
+    summary["weight_smoothing"] = float(args.weight_smoothing)
     if broker_context:
         summary["broker_name"] = broker_name
         summary["broker_currency"] = broker_context.get("account_currency")

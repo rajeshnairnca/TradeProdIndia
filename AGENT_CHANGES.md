@@ -2,6 +2,38 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-03-08
+- Switched production market-data refresh to support Kite `/quote/ohlc` as a first-class source in `src/production_market_data.py`:
+  - Added `market_data_source` selection (`auto`, `tradingview`, `kite_ohlc`) where `auto` now prefers Kite when `USE_KITE=true`.
+  - Added Kite symbol resolution + batch quote fetching helpers and wired incremental OHLCV updates through the existing indicator/feature pipeline.
+  - Added Kite-based VIX close fallback logic that reuses historical VIX values if a Kite symbol is unavailable.
+  - Updated partial-update error messaging and diagnostics to reflect the active source.
+- Extended `src/kite.py` with `KiteClient.get_quote_ohlc(...)` for batched quote retrieval from `/quote/ohlc`.
+- Updated `scripts/production/daily_run.py` CLI to expose source selection and Kite quote batch controls:
+  - `--market-data-source` (`auto|tradingview|kite_ohlc`)
+  - `--kite-quote-batch-size`
+  - `--kite-quote-max-batches`
+- Made production defaults Kite-first while preserving fallback compatibility:
+  - Added config knobs in `src/config.py`: `MARKET_DATA_SOURCE`, `DEFAULT_VIX_TICKER`, `DEFAULT_HISTORY_VIX_TICKER`, `KITE_QUOTE_BATCH_SIZE`, `KITE_QUOTE_MAX_BATCHES`.
+  - Updated `scripts/production/daily_run.py` to use config-backed defaults (including VIX defaults) and to log requested vs resolved market data source.
+  - Updated `scripts/production/api_server.py` default broker selection to prefer Kite when no explicit `DEFAULT_BROKER` is set.
+  - Updated default VIX ticker arguments in `src/production_market_data.py` and `src/production.py` to use config-managed defaults.
+- Updated operational docs/scripts to match the Kite-first flow:
+  - `README.md` production pipeline text now references generic market-data refresh with explicit `--market-data-source kite_ohlc` guidance and the new env knobs.
+  - `scripts/production/dry_run.sh` comments now refer to market-data calls instead of TradingView-specific calls.
+- Defaulted Kite broker enablement in config:
+  - Changed `src/config.py` `USE_KITE` default from `false` to `true`.
+  - Documented this default in `README.md`.
+- Aligned production-run execution controls with backtester settings in `scripts/production/daily_run.py`:
+  - Added CLI knobs `--confirm-days`, `--confirm-days-sideways`, `--rebalance-every`, `--min-weight-change`, `--min-trade-dollars`, `--max-daily-turnover`, and `--weight-smoothing`.
+  - Added runtime config override wiring so production trade generation uses these values for the current run.
+  - Added regime confirmation smoothing on production `regime_table` before trade generation (matching backtester’s confirmation logic).
+  - Persisted these run knobs into the run summary payload for traceability.
+- Added tests:
+  - `tests/test_kite.py`: coverage for `get_quote_ohlc(...)` response unwrapping.
+  - `tests/test_production_market_data_kite_source.py`: validates the Kite source path in `update_market_data(...)` without network calls.
+  - `tests/test_daily_run_kite_execution.py`: added a regression for regime confirmation streak behavior.
+
 ## 2026-03-03
 - Added Zerodha Kite broker integration in `src/kite.py`:
   - New API client (`KiteClient`) with auth/session support (`KITE_ACCESS_TOKEN` or `KITE_REQUEST_TOKEN` + `KITE_API_SECRET`), request retries, order placement, order polling, holdings/margins fetch, and instrument-cache helpers.

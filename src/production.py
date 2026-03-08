@@ -75,7 +75,7 @@ def update_market_data(
     lookback_days: int = 420,
     interval: str = "1d",
     rolling_window: int | None = None,
-    vix_ticker: str = "CBOE:VIX",
+    vix_ticker: str = config.DEFAULT_VIX_TICKER,
     screener: str = "america",
     exchange_list: list[str] | None = None,
     timeout: float | None = None,
@@ -257,7 +257,7 @@ def add_universe_tickers(
     interval: str = "1d",
     min_trading_days: int = 50,
     rolling_window: int | None = None,
-    vix_ticker: str = "^VIX",
+    vix_ticker: str = config.DEFAULT_HISTORY_VIX_TICKER,
     recompute_cross_sectional: bool = True,
 ) -> pd.DataFrame:
     """Add new tickers with full yfinance history, then write back to the parquet."""

@@ -109,9 +109,18 @@ REGION_DATA_FILES = {
     "india": "data/daily_data_india.parquet",
 }
 DATA_FILE = _env_str("DATA_FILE", REGION_DATA_FILES.get(TRADING_REGION, "data/daily_data.parquet"))
+MARKET_DATA_SOURCE = _env_str("MARKET_DATA_SOURCE", "auto").lower()
 TRADINGVIEW_EXCHANGE_MAP_FILE = _env_str(
     "TRADINGVIEW_EXCHANGE_MAP_FILE",
     "data/universe_us_exchange_map.json",
+)
+DEFAULT_VIX_TICKER = _env_str(
+    "DEFAULT_VIX_TICKER",
+    "NSE:INDIAVIX" if TRADING_REGION == "india" else "CBOE:VIX",
+)
+DEFAULT_HISTORY_VIX_TICKER = _env_str(
+    "DEFAULT_HISTORY_VIX_TICKER",
+    "^INDIAVIX" if TRADING_REGION == "india" else "^VIX",
 )
 DEFAULT_STRATEGY_ROOTS = tuple(
     part.strip()
@@ -207,7 +216,7 @@ TRADING212_INSTRUMENTS_CACHE = _env_str("TRADING212_INSTRUMENTS_CACHE", "data/tr
 TRADING212_TICKER_MAP_FILE = _env_str("TRADING212_TICKER_MAP_FILE", "data/trading212_ticker_map.json")
 TRADING212_FX_RATE_USD_GBP = _env_optional_float("TRADING212_FX_RATE_USD_GBP")
 
-USE_KITE = _env_bool("USE_KITE", False)
+USE_KITE = _env_bool("USE_KITE", True)
 KITE_BASE_URL = _env_str("KITE_BASE_URL", "https://api.kite.trade")
 KITE_TIMEOUT = _env_float("KITE_TIMEOUT", 20.0)
 KITE_HTTP_MAX_RETRIES = _env_int("KITE_HTTP_MAX_RETRIES", 4)
@@ -224,6 +233,8 @@ KITE_TICKER_MAP_FILE = _env_str("KITE_TICKER_MAP_FILE", "data/kite_ticker_map.js
 KITE_INSTRUMENTS_EXCHANGE = _env_str("KITE_INSTRUMENTS_EXCHANGE", "NSE").upper()
 KITE_ACCESS_TOKEN_FILE = _env_str("KITE_ACCESS_TOKEN_FILE", "data/kite_access_token.txt")
 KITE_SESSION_GENERATE_ON_START = _env_bool("KITE_SESSION_GENERATE_ON_START", True)
+KITE_QUOTE_BATCH_SIZE = max(1, _env_int("KITE_QUOTE_BATCH_SIZE", 1000))
+KITE_QUOTE_MAX_BATCHES = _env_int("KITE_QUOTE_MAX_BATCHES", 0)
 HMM_N_COMPONENTS = _env_int("HMM_N_COMPONENTS", 4)
 HMM_WARMUP_PERIOD = _env_int("HMM_WARMUP_PERIOD", 2520)  # ~10 years
 HMM_STEP_SIZE = _env_int("HMM_STEP_SIZE", 5)  # ~1 month

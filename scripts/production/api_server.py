@@ -66,10 +66,21 @@ SUPPORTED_FX_CURRENCIES = {"USD", "GBP"}
 _fx_cache: dict[tuple[str, str], dict[str, object]] = {}
 DEFAULT_PAGE_LIMIT = int(os.getenv("API_DEFAULT_PAGE_LIMIT", "200"))
 MAX_PAGE_LIMIT = int(os.getenv("API_MAX_PAGE_LIMIT", "1000"))
-DEFAULT_BROKER_QUERY = (
-    os.getenv("DEFAULT_BROKER", "kite" if config.USE_KITE else "trading212").strip().lower()
-    or "trading212"
-)
+
+
+def _resolve_default_broker_query() -> str:
+    explicit = os.getenv("DEFAULT_BROKER", "").strip().lower()
+    if explicit:
+        return explicit
+    if config.USE_KITE:
+        return "kite"
+    if config.USE_TRADING212:
+        return "trading212"
+    # Kite is the preferred default for India deployments.
+    return "kite"
+
+
+DEFAULT_BROKER_QUERY = _resolve_default_broker_query()
 
 if not db_enabled():
     raise RuntimeError(
