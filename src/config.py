@@ -78,7 +78,7 @@ USE_VOL_PARITY = _env_bool("USE_VOL_PARITY", True)
 
 USE_REGIME_SYSTEM = _env_bool("USE_REGIME_SYSTEM", False)
 BACKTEST_USE_FULL_HISTORY = _env_bool("BACKTEST_USE_FULL_HISTORY", True)
-REBALANCE_EVERY = max(1, _env_int("REBALANCE_EVERY", _env_int("REBALANCE_EVERY_N_DAYS", 14)))
+REBALANCE_EVERY = max(1, _env_int("REBALANCE_EVERY", _env_int("REBALANCE_EVERY_N_DAYS", 10)))
 # Backward-compatible alias used by older scripts/tests.
 REBALANCE_EVERY_N_DAYS = REBALANCE_EVERY
 BEAR_CASH_OUT = _env_bool("BEAR_CASH_OUT", False)
@@ -166,8 +166,8 @@ ADAPTIVE_TURNOVER_RISK_REGIMES = tuple(
 )
 
 # ---- Regime Switch Confirmation Defaults ----
-CONFIRM_DAYS = max(1, _env_int("CONFIRM_DAYS", 20))
-CONFIRM_DAYS_SIDEWAYS = max(1, _env_int("CONFIRM_DAYS_SIDEWAYS", 30))
+CONFIRM_DAYS = max(1, _env_int("CONFIRM_DAYS", 30))
+CONFIRM_DAYS_SIDEWAYS = max(1, _env_int("CONFIRM_DAYS_SIDEWAYS", 45))
 MIN_ADV_SHARES = 250_000.0  # minimum ADV shares required to trade
 MIN_ADV_DOLLARS_FILTER = 20_000_000.0  # minimum ADV$ required to trade
 MIN_ADV_DOLLARS_SLIPPAGE = 1_000_000.0  # minimum ADV$ used for slippage scaling

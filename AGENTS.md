@@ -25,7 +25,7 @@
 
 ## Commit & Pull Request Practices
 - Use concise, imperative commits (e.g., `Add walkforward gating`); group related changes per commit.  
-- Before any commit, run: `TRADING_REGION=india DATA_FILE=data/daily_data_india.parquet REGIME_MODE=heuristic WEIGHT_SMOOTHING=0.00 caffeinate -i python3 scripts/backtesting/backtester.py --strategy-roots alphas_india --strategies india_rule_crash_resilient_slow india_rule_liquidity_momentum_core india_rule_pullback_reentry_slow --start-date 2013-01-01 --end-date 2026-01-01 --confirm-days 20 --confirm-days-sideways 30 --rebalance-every 14 --min-weight-change 0.01 --max-daily-turnover 0.35 --regime-mapping '{"bear_high_vol":"india_rule_range_stability_slow","bear_low_vol":"india_rule_trend_carry_slow","bull_high_vol":"india_rule_pullback_reentry_slow","bull_low_vol":"india_rule_pullback_reentry_slow","sideways_high_vol":"india_rule_range_stability_slow","sideways_low_vol":"india_rule_liquidity_momentum_core"}'`.  
+- Before any commit, run: `TRADING_REGION=india DATA_FILE=data/daily_data_india.parquet REGIME_MODE=heuristic WEIGHT_SMOOTHING=0.00 caffeinate -i python3 scripts/backtesting/backtester.py --strategy-roots alphas_india --strategies india_rule_crash_resilient_slow india_rule_liquidity_momentum_core india_rule_pullback_reentry_slow --start-date 2013-01-01 --end-date 2026-01-01 --confirm-days 30 --confirm-days-sideways 45 --rebalance-every 10 --min-weight-change 0.01 --max-daily-turnover 0.35 --regime-mapping '{"bear_high_vol":"india_rule_range_stability_slow","bear_low_vol":"india_rule_trend_carry_slow","bull_high_vol":"india_rule_pullback_reentry_slow","bull_low_vol":"india_rule_pullback_reentry_slow","sideways_high_vol":"india_rule_range_stability_slow","sideways_low_vol":"india_rule_liquidity_momentum_core"}'`.  
 - PRs should describe the goal, key changes, and how you validated (commands run, datasets used, any shortcuts). Include links to logs/artifacts in `runs/` or `logs/` when relevant.  
 - Note any deviations from default workflows (custom hyperparams, truncated datasets) so others can reproduce.
 
@@ -35,5 +35,7 @@
 ## Latest Backtest Snapshot (2026-03-08)
 - Baseline run (India mapping set, `WEIGHT_SMOOTHING=0.85`, `rebalance-every=28`, `2013-01-01` to `2026-01-01`):
   - `CAGR 53.9592%`, `Sharpe 1.5702`, `Max Drawdown -66.5310%`, `Final Net Worth 242,696,010.50`.
-- Improved run (same strategies/mapping/date range, `WEIGHT_SMOOTHING=0.00`, `rebalance-every=14`):
+- Higher-return run (same strategies/mapping/date range, `WEIGHT_SMOOTHING=0.00`, `confirm-days=20`, `confirm-days-sideways=30`, `rebalance-every=14`):
   - `CAGR 59.5616%`, `Sharpe 1.5978`, `Max Drawdown -60.8747%`, `Final Net Worth 382,533,520.47`.
+- Robust-default run (same strategies/mapping/date range, `WEIGHT_SMOOTHING=0.00`, `confirm-days=30`, `confirm-days-sideways=45`, `rebalance-every=10`):
+  - `CAGR 57.2796%`, `Sharpe 1.5428`, `Max Drawdown -61.3914%`, `Final Net Worth 318,442,707.36`.

@@ -592,3 +592,63 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - dates replayed: `3208`
   - trades: `1535` (backtest) vs `1535` (production), exact sequence match
   - final net worth parity preserved (`382,533,520.4748076` vs `382,533,520.47480756`)
+- Added start-date robustness experiment harness:
+  - New script: `scripts/backtesting/phase_robustness.py`
+  - Features:
+    - runs offset panel across first `N` trading starts from anchor date (default `N = rebalance-every`)
+    - reports robustness stats (`median`, `p10`, `p90`, min/max/range) for CAGR and final net worth
+    - builds and reports a staggered-sleeves aggregate portfolio (equal-weight average return across offsets on common date window)
+    - writes artifacts:
+      - `offset_detail.csv`
+      - `staggered_equity.csv`
+      - `summary.json`
+- Ran mitigation experiments for India mapping (`2013-01-01` to `2026-01-01`, `rebalance-every=14`, same strategy/mapping set):
+  - Baseline controls (`WEIGHT_SMOOTHING=0.00`, `min_weight_change=0.01`, `min_trade_dollars=20000`, `max_daily_turnover=0.35`)
+    - output: `runs/backtesting/phase_robustness_20260308_222014`
+    - offset stats:
+      - median CAGR `56.5220%`
+      - p10 CAGR `52.2116%`
+      - CAGR range `8.4662` points
+      - final net worth range `192,167,854.35`
+    - staggered sleeves:
+      - CAGR `56.4958%`, Sharpe `1.5447`, Max DD `-65.8090%`, Final `292,426,955.93`
+  - Threshold-softened controls (`WEIGHT_SMOOTHING=0.00`, `min_weight_change=0.0`, `min_trade_dollars=0`, `max_daily_turnover=0.35`)
+    - output: `runs/backtesting/phase_robustness_20260308_222137`
+    - offset stats:
+      - median CAGR `59.9422%`
+      - p10 CAGR `56.4459%`
+      - CAGR range `9.4627` points
+      - final net worth range `325,134,786.86`
+    - staggered sleeves:
+      - CAGR `61.1155%`, Sharpe `1.8897`, Max DD `-38.9547%`, Final `422,867,412.47`
+  - Smoothing-only controls (`WEIGHT_SMOOTHING=0.30`, `min_weight_change=0.01`, `min_trade_dollars=20000`, `max_daily_turnover=0.35`)
+    - output: `runs/backtesting/phase_robustness_20260308_222255`
+    - offset stats:
+      - median CAGR `55.5869%`
+      - p10 CAGR `51.7080%`
+      - CAGR range `8.3192` points
+      - final net worth range `178,918,034.78`
+    - staggered sleeves:
+      - CAGR `55.8820%`, Sharpe `1.5346`, Max DD `-66.3053%`, Final `278,212,123.71`
+
+## 2026-03-09
+- Ran additional phase-robustness batches on branch `testing` and promoted the learned defaults to `main`.
+- Added broad robustness matrix outputs under `runs/backtesting/phase_experiments_20260309_185139`, including:
+  - subperiod comparison (`2013-2018`, `2018-2022`, `2022-2026`) for rebalance `10` vs `14`
+  - cost stress sweep (`SLIPPAGE_COEFF` 0.008/0.012/0.016)
+  - confirmation sweep (`10/15`, `20/30`, `30/45`)
+  - turnover-cap sweep (`0.20`, `0.25`, `0.30`, `0.35`)
+  - sleeve-count sweep (`1`, `2`, `4`, `7`, `10`)
+- Head-to-head robustness confirmation:
+  - Current config (`rebalance=14`, `confirm=20/30`) output: `runs/backtesting/phase_robustness_20260309_190607`
+  - Proposed robust config (`rebalance=10`, `confirm=30/45`) output: `runs/backtesting/phase_robustness_20260309_190656`
+  - Result: proposed config materially improved robustness (`p10 CAGR` up, `CAGR range` down) with lower median CAGR.
+- Updated default settings in `src/config.py` to robust defaults:
+  - `REBALANCE_EVERY=10` (alias `REBALANCE_EVERY_N_DAYS` follows)
+  - `CONFIRM_DAYS=30`
+  - `CONFIRM_DAYS_SIDEWAYS=45`
+- Updated `AGENTS.md` command snapshot and latest-metrics block to reflect the new robust default run.
+- Verified defaults are active on `main` by running backtester without passing confirm/rebalance flags:
+  - command omitted `--confirm-days`, `--confirm-days-sideways`, `--rebalance-every`
+  - run-log confirmed defaults used (`confirm_days=30`, `confirm_days_sideways=45`, `rebalance_every=10`)
+  - result: `CAGR 57.2796%`, `Sharpe 1.5428`, `Max Drawdown -61.3914%`, `Final Net Worth 318,442,707.36`.
