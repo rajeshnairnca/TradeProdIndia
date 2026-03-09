@@ -21,3 +21,4 @@ alphas/_ensembles/
 /runs
 /temp_model.zip
 /vec_normalize_temp.pkl
+params_inventory.json
