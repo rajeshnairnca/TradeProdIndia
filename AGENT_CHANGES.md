@@ -2,6 +2,14 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-03-09
+- Added `scripts/backtesting/entry_indicator.py` to compute a data-driven market-entry timing signal (`RED`/`AMBER`/`GREEN`) from historical strategy behavior:
+  - Replays the mapped strategy stack over history.
+  - Builds factor percentiles (strategy momentum, drawdown, market momentum, breadth).
+  - Calibrates expected forward-return stats by entry-score bucket.
+  - Emits `entry_score`, `recommended_deploy_fraction`, and forward-return expectations for any `--as-of-date`.
+  - Supports `--ignore-stock-filters` to evaluate a baseline signal independent of excluded ticker/quality filters.
+
 ## 2026-03-08
 - Switched production market-data refresh to support Kite `/quote/ohlc` as a first-class source in `src/production_market_data.py`:
   - Added `market_data_source` selection (`auto`, `tradingview`, `kite_ohlc`) where `auto` now prefers Kite when `USE_KITE=true`.
