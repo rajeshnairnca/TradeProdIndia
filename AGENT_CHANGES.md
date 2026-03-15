@@ -2,6 +2,46 @@
 
 This file tracks code changes made by the assistant so they can be reviewed or reverted.
 
+## 2026-03-15
+- Added an explicit Kite live-execution safety gate:
+  - New config/env flag: `EXECUTE_TRADES_ON_KITE` (also reads lowercase `execute_trades_on_kite`), default `false`.
+  - Updated `scripts/production/daily_run.py` so Kite order placement only occurs when this flag is `true`; otherwise the run stays in signal-only mode (orders skipped, no live placement) while still generating trades and persisting run outputs.
+  - Added run logging/summary fields (`execute_trades_on_kite`) to make execution mode visible in production telemetry.
+  - Updated `README.md` broker integration docs with the new flag.
+- Added DB-backed Kite auth state persistence so always-on API and cron workers can share broker auth safely:
+  - `src/production_db.py` now creates `production_broker_auth_state` and exposes:
+    - `load_broker_auth_state(broker)`
+    - `upsert_broker_auth_state(broker, ...)`
+  - Auth state stores access/request tokens, API key/user metadata, session payload, and pending OAuth state + expiry.
+- Extended `src/kite.py` to use shared DB auth state in addition to env/file:
+  - `kite_enabled()` now recognizes DB-backed token/request-token availability.
+  - `_load_credentials()` now reads access/request tokens (and fallback API key) from DB when env vars are not set.
+  - Session/token persistence now upserts token/session metadata into DB so cron jobs can consume the latest token without local file sharing.
+- Added Kite OAuth helper endpoints to `scripts/production/api_server.py`:
+  - `GET /kite/auth/login` (API-key protected): returns Zerodha login URL with generated state + configured callback URL.
+  - `GET /kite/auth/callback` (public callback): validates state, exchanges `request_token` for `access_token`, persists auth state in DB.
+  - `GET /kite/auth/status` (API-key protected): reports effective token presence/source and pending-login state.
+- Added new Kite auth config knobs in `src/config.py`:
+  - `KITE_REDIRECT_URL` (optional explicit callback URL)
+  - `KITE_AUTH_STATE_TTL_SECONDS` (pending OAuth state expiry; default 900s, minimum 60s).
+- Added full-universe production run support in `scripts/production/daily_run.py`:
+  - `--sector` now supports `ALL` (also `*`/`any`) to disable sector filtering and trade across the full universe.
+  - Broker-universe validation and trade generation now run on the effective trade universe (`sector` slice or full universe in ALL mode).
+  - Selection-diagnostics snapshot persistence is skipped in `ALL` mode (existing diagnostics format is sector-scoped).
+- Aligned `scripts/production/daily_run.py` default strategy/mapping behavior with the validated India backtest setup:
+  - default base strategies are now:
+    - `india_rule_crash_resilient_slow`
+    - `india_rule_liquidity_momentum_core`
+    - `india_rule_pullback_reentry_slow`
+  - default regime mapping now uses:
+    - `bear_high_vol -> india_rule_range_stability_slow`
+    - `bear_low_vol -> india_rule_trend_carry_slow`
+    - `bull_high_vol -> india_rule_pullback_reentry_slow`
+    - `bull_low_vol -> india_rule_pullback_reentry_slow`
+    - `sideways_high_vol -> india_rule_range_stability_slow`
+    - `sideways_low_vol -> india_rule_liquidity_momentum_core`
+  - default `--sector` is now `ALL` for full-universe runs.
+
 ## 2026-03-09
 - Added `scripts/backtesting/entry_indicator.py` to compute a data-driven market-entry timing signal (`RED`/`AMBER`/`GREEN`) from historical strategy behavior:
   - Replays the mapped strategy stack over history.
@@ -660,3 +700,59 @@ This file tracks code changes made by the assistant so they can be reviewed or r
   - command omitted `--confirm-days`, `--confirm-days-sideways`, `--rebalance-every`
   - run-log confirmed defaults used (`confirm_days=30`, `confirm_days_sideways=45`, `rebalance_every=10`)
   - result: `CAGR 57.2796%`, `Sharpe 1.5428`, `Max Drawdown -61.3914%`, `Final Net Worth 318,442,707.36`.
+- Added `src/emerging_universe.py` to build a monthly, no-lookahead emerging-universe schedule from liquidity expansion + momentum filters.
+- Extended `RuleBasedBacktester` with optional `allowed_tickers_by_date` so daily tradable masks can follow a schedule (used for monthly dynamic universes).
+- Added `scripts/backtesting/emerging_universe_compare.py` to run side-by-side baseline vs emerging-universe overlay backtests and save diagnostics.
+- Added optional emerging-universe flags to `scripts/backtesting/backtester.py` (`--enable-emerging-universe` and related thresholds), including schedule diagnostics export in run artifacts.
+- Added `scripts/production/universe_addition_recommender.py` to recommend new ticker additions without removing existing universe members.
+- Updated the recommender to support DB-first operation for Railway:
+  - reads candidate metrics from `production_universe_monitor_candidates`
+  - reads current universe from `production_universe_map`
+  - writes scored/recommended outputs to run artifacts
+  - can optionally enqueue recommended tickers into `production_pending_adjustments` via `--enqueue-adjustments`.
+- Tightened `scripts/production/universe_addition_recommender.py` defaults/filters after survivorship-bias analysis:
+  - stricter default liquidity and recommendation thresholds (`min_volume`, `min_dollar_volume`, `min_recommend`)
+  - uptrend requirement enabled by default (`close > SMA50 > SMA200`, with opt-out flag)
+  - DB-specific persistence/quality gates added (`pass_streak`, `monitor_pass`, `quality_pass`, `quality_rows`, `quality_median_adv_dollars`)
+  - recommendation score now includes persistence and quality components (not just liquidity/trend).
+
+## 2026-03-10
+- Added DB persistence for universe-addition recommender outputs:
+  - `src/production_db.py` now provisions:
+    - `production_universe_addition_recommendations_state`
+    - `production_universe_addition_recommendations_records`
+  - added helper `replace_universe_addition_recommendations_snapshot(...)` to upsert run metadata and full scored candidate rows into DB.
+  - `reset_production_data(...)` now truncates the new recommendation snapshot tables.
+- Updated `scripts/production/universe_addition_recommender.py` to persist every `--source=db` run to the new DB tables automatically (in addition to CSV artifacts), including:
+  - run identifiers (`run_id`, `run_date`, `generated_at_utc`)
+  - per-candidate scored fields and `is_recommended` flag
+  - summary flag `db_snapshot_persisted`.
+- Evaluated Flutter API contract suggestions and applied India-focused backend compatibility updates without changing existing response envelopes:
+  - `scripts/production/api_server.py`
+    - kept existing endpoint envelopes for all app-consumed routes.
+    - enforced India default broker fallback to `kite` when `DEFAULT_BROKER` is not set.
+    - normalized broker/summaries currency fields to a base currency (`INR` by default via `BASE_CURRENCY`) for India region.
+    - extended `/queue-adjustments` parsing so ticker exchange inputs accept both `EXCHANGE:TICKER` and `TICKER:EXCHANGE` forms (including `RELIANCE:NSE`) via both `tickers[]` and `ticker_exchanges`.
+  - `scripts/production/daily_run.py`
+    - normalized pending ticker exchange parsing and retry/requeue logic to handle both exchange pair formats (`EXCHANGE:TICKER` and `TICKER:EXCHANGE`).
+  - `src/run_calendar.py`
+    - replaced hardcoded US-federal-holiday logic with configurable market-holiday logic (India-ready) sourced from:
+      - `RUN_CALENDAR_MARKET_HOLIDAYS` (CSV dates),
+      - `RUN_CALENDAR_MARKET_HOLIDAYS_JSON` (JSON payload),
+      - `RUN_CALENDAR_MARKET_HOLIDAYS_FILE` (default `data/india_market_holidays.json`).
+    - kept compatibility function names/paths (`list_us_federal_holidays`, `/run-calendar/us-federal-holidays`) while returning configured market holidays.
+    - switched default schedule timezone to `Asia/Kolkata`.
+  - `src/config.py`
+    - added run-calendar market-holiday env settings:
+      - `RUN_CALENDAR_MARKET_HOLIDAYS_FILE`
+      - `RUN_CALENDAR_MARKET_HOLIDAYS`
+      - `RUN_CALENDAR_MARKET_HOLIDAYS_JSON`
+    - updated default `RUN_CALENDAR_TIMEZONE` to `Asia/Kolkata`.
+- Added reusable entry-indicator core and API exposure:
+  - new module `src/entry_indicator.py` with shared `compute_entry_indicator_payload(...)` logic (used by CLI and API).
+  - refactored `scripts/backtesting/entry_indicator.py` into a thin wrapper around the shared core.
+  - added authenticated `GET /entry-indicator` in `scripts/production/api_server.py` with:
+    - optional query overrides (`strategy_roots`, `strategies`, `regime_mapping`, date/confirm/rebalance params),
+    - optional `refresh` flag,
+    - in-process response cache (`ENTRY_INDICATOR_CACHE_TTL_SECONDS`, default 1800s).
+  - smoke-validated indicator runtime on a short window (`2013-01-01` to `2014-12-31`) producing a valid JSON signal payload.

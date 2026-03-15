@@ -160,6 +160,7 @@ Broker integration:
 
 - `USE_TRADING212=true` enables Trading212 (requires `TRADING212_API_KEY`, `TRADING212_API_SECRET`)
 - `USE_KITE=true` enables Zerodha Kite (default is `true`; requires `KITE_API_KEY` and either `KITE_ACCESS_TOKEN` or `KITE_REQUEST_TOKEN` + `KITE_API_SECRET`)
+- `EXECUTE_TRADES_ON_KITE=true` is required for live Kite order placement; default is `false` so production runs generate signals without placing broker orders.
 - Set only one broker integration at a time (`USE_TRADING212` or `USE_KITE`)
 - Optional Kite routing/mapping knobs: `KITE_DEFAULT_EXCHANGE`, `KITE_PRODUCT`, `KITE_ORDER_VARIETY`, `KITE_TICKER_MAP_FILE`
 - Market-data source knobs: `MARKET_DATA_SOURCE` (`auto|tradingview|kite_ohlc`), `KITE_QUOTE_BATCH_SIZE`, `KITE_QUOTE_MAX_BATCHES`

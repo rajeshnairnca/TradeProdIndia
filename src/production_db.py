@@ -80,6 +80,7 @@ RUN_SUMMARY_FIELDS: tuple[str, ...] = (
     "broker_total_execution_cost",
     "broker_total_execution_cost_usd",
 )
+_UNSET = object()
 
 
 def db_enabled() -> bool:
@@ -398,6 +399,41 @@ def init_db() -> None:
             """
         )
         cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_broker_auth_state (
+                broker text PRIMARY KEY,
+                access_token text,
+                request_token text,
+                api_key text,
+                user_id text,
+                session_payload jsonb,
+                pending_state text,
+                pending_state_expires_at_epoch bigint,
+                updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_entry_indicator_state (
+                id integer PRIMARY KEY,
+                generated_at_utc timestamptz,
+                as_of_date date,
+                start_date date,
+                end_date date,
+                lookahead_days integer,
+                confirm_days integer,
+                confirm_days_sideways integer,
+                rebalance_every integer,
+                strategy_roots text,
+                strategies text,
+                regime_mapping jsonb,
+                payload jsonb NOT NULL,
+                updated_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
             "CREATE INDEX IF NOT EXISTS production_trades_run_date_idx ON production_trades (run_date);"
         )
         cur.execute(
@@ -426,6 +462,12 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_broker_account_run_date_idx ON production_broker_account (run_date);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_broker_auth_state_updated_at_idx ON production_broker_auth_state (updated_at);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_entry_indicator_updated_at_idx ON production_entry_indicator_state (updated_at);"
         )
         cur.execute(
             """
@@ -523,6 +565,65 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS production_universe_selection_records_ticker_idx ON production_universe_selection_diagnostics_records (ticker);"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_universe_addition_recommendations_state (
+                run_id text PRIMARY KEY,
+                run_date date,
+                generated_at_utc timestamptz,
+                source text,
+                input_file text,
+                input_format text,
+                current_universe_source text,
+                current_universe_size integer,
+                candidates_evaluated integer,
+                already_in_universe integer,
+                passes_filters_total integer,
+                recommended_additions integer,
+                payload jsonb NOT NULL,
+                created_at timestamptz DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_universe_addition_recommendations_records (
+                id bigserial PRIMARY KEY,
+                run_id text NOT NULL REFERENCES production_universe_addition_recommendations_state (run_id) ON DELETE CASCADE,
+                ticker text NOT NULL,
+                exchange text,
+                symbol text,
+                in_current_universe boolean,
+                passes_filters boolean,
+                fail_reasons text,
+                recommendation_score double precision,
+                is_recommended boolean,
+                close double precision,
+                volume double precision,
+                dollar_volume double precision,
+                recommend_all double precision,
+                sma50 double precision,
+                sma200 double precision,
+                trend_up boolean,
+                market_cap double precision,
+                sector text,
+                monitor_pass boolean,
+                pass_streak double precision,
+                quality_pass boolean,
+                quality_rows double precision,
+                quality_median_adv_dollars double precision
+            );
+            """
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS production_universe_addition_records_run_ticker_uidx ON production_universe_addition_recommendations_records (run_id, ticker);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_addition_records_run_idx ON production_universe_addition_recommendations_records (run_id, is_recommended);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS production_universe_addition_state_run_date_idx ON production_universe_addition_recommendations_state (run_date, generated_at_utc DESC);"
         )
 
 
@@ -1100,6 +1201,252 @@ def delete_run_calendar_override(run_date: str) -> bool:
             (run_date_value,),
         )
         return cur.rowcount > 0
+
+
+def load_broker_auth_state(broker: str) -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    broker_value = str(broker or "").strip().lower()
+    if not broker_value:
+        return None
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT broker,
+                   access_token,
+                   request_token,
+                   api_key,
+                   user_id,
+                   session_payload,
+                   pending_state,
+                   pending_state_expires_at_epoch,
+                   updated_at
+            FROM production_broker_auth_state
+            WHERE broker = %s
+            LIMIT 1;
+            """,
+            (broker_value,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def upsert_broker_auth_state(
+    broker: str,
+    *,
+    access_token: Any = _UNSET,
+    request_token: Any = _UNSET,
+    api_key: Any = _UNSET,
+    user_id: Any = _UNSET,
+    session_payload: Any = _UNSET,
+    pending_state: Any = _UNSET,
+    pending_state_expires_at_epoch: Any = _UNSET,
+) -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    broker_value = str(broker or "").strip().lower()
+    if not broker_value:
+        raise ValueError("broker is required for broker auth state upsert.")
+
+    current = load_broker_auth_state(broker_value) or {}
+
+    def _pick(key: str, incoming: Any) -> Any:
+        if incoming is _UNSET:
+            return current.get(key)
+        return incoming
+
+    resolved_access_token = _pick("access_token", access_token)
+    resolved_request_token = _pick("request_token", request_token)
+    resolved_api_key = _pick("api_key", api_key)
+    resolved_user_id = _pick("user_id", user_id)
+    resolved_session_payload = _pick("session_payload", session_payload)
+    resolved_pending_state = _pick("pending_state", pending_state)
+    resolved_pending_state_expires = _pick(
+        "pending_state_expires_at_epoch", pending_state_expires_at_epoch
+    )
+    if (
+        resolved_pending_state_expires is not None
+        and resolved_pending_state_expires is not _UNSET
+    ):
+        try:
+            resolved_pending_state_expires = int(resolved_pending_state_expires)
+        except (TypeError, ValueError):
+            resolved_pending_state_expires = None
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO production_broker_auth_state (
+                broker,
+                access_token,
+                request_token,
+                api_key,
+                user_id,
+                session_payload,
+                pending_state,
+                pending_state_expires_at_epoch
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (broker) DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                request_token = EXCLUDED.request_token,
+                api_key = EXCLUDED.api_key,
+                user_id = EXCLUDED.user_id,
+                session_payload = EXCLUDED.session_payload,
+                pending_state = EXCLUDED.pending_state,
+                pending_state_expires_at_epoch = EXCLUDED.pending_state_expires_at_epoch,
+                updated_at = now();
+            """,
+            (
+                broker_value,
+                resolved_access_token,
+                resolved_request_token,
+                resolved_api_key,
+                resolved_user_id,
+                psycopg2.extras.Json(resolved_session_payload)
+                if resolved_session_payload is not None
+                else None,
+                resolved_pending_state,
+                resolved_pending_state_expires,
+            ),
+        )
+    return load_broker_auth_state(broker_value)
+
+
+def upsert_entry_indicator_snapshot(
+    payload: dict[str, Any],
+    *,
+    start_date: str,
+    end_date: str | None,
+    as_of_date: str | None,
+    lookahead_days: int,
+    confirm_days: int,
+    confirm_days_sideways: int,
+    rebalance_every: int,
+    strategy_roots: Iterable[str],
+    strategies: Iterable[str],
+    regime_mapping: dict[str, str] | None = None,
+) -> None:
+    if not db_enabled():
+        return
+    if not isinstance(payload, dict) or not payload:
+        return
+    init_db()
+
+    def _normalize_optional_date(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return _normalize_date_value(text)
+
+    start_date_value = _normalize_optional_date(start_date)
+    if not start_date_value:
+        raise ValueError("start_date is required for entry indicator snapshot.")
+    end_date_value = _normalize_optional_date(end_date)
+    as_of_date_value = _normalize_optional_date(as_of_date) or _normalize_optional_date(
+        str(payload.get("as_of_date") or "").strip() or None
+    )
+    generated_at_utc = str(payload.get("generated_at_utc") or "").strip() or None
+    strategy_roots_csv = ",".join(
+        str(item).strip() for item in strategy_roots if str(item).strip()
+    )
+    strategies_csv = ",".join(
+        str(item).strip() for item in strategies if str(item).strip()
+    )
+    mapping_payload = {
+        str(k).strip(): str(v).strip()
+        for k, v in (regime_mapping or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO production_entry_indicator_state (
+                id,
+                generated_at_utc,
+                as_of_date,
+                start_date,
+                end_date,
+                lookahead_days,
+                confirm_days,
+                confirm_days_sideways,
+                rebalance_every,
+                strategy_roots,
+                strategies,
+                regime_mapping,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                generated_at_utc = EXCLUDED.generated_at_utc,
+                as_of_date = EXCLUDED.as_of_date,
+                start_date = EXCLUDED.start_date,
+                end_date = EXCLUDED.end_date,
+                lookahead_days = EXCLUDED.lookahead_days,
+                confirm_days = EXCLUDED.confirm_days,
+                confirm_days_sideways = EXCLUDED.confirm_days_sideways,
+                rebalance_every = EXCLUDED.rebalance_every,
+                strategy_roots = EXCLUDED.strategy_roots,
+                strategies = EXCLUDED.strategies,
+                regime_mapping = EXCLUDED.regime_mapping,
+                payload = EXCLUDED.payload,
+                updated_at = now();
+            """,
+            (
+                1,
+                generated_at_utc,
+                as_of_date_value,
+                start_date_value,
+                end_date_value,
+                int(lookahead_days),
+                int(confirm_days),
+                int(confirm_days_sideways),
+                int(rebalance_every),
+                strategy_roots_csv,
+                strategies_csv,
+                psycopg2.extras.Json(mapping_payload) if mapping_payload else None,
+                psycopg2.extras.Json(payload),
+            ),
+        )
+
+
+def latest_entry_indicator_snapshot() -> dict[str, Any] | None:
+    if not db_enabled():
+        return None
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id,
+                   generated_at_utc,
+                   as_of_date,
+                   start_date,
+                   end_date,
+                   lookahead_days,
+                   confirm_days,
+                   confirm_days_sideways,
+                   rebalance_every,
+                   strategy_roots,
+                   strategies,
+                   regime_mapping,
+                   payload,
+                   updated_at
+            FROM production_entry_indicator_state
+            WHERE id = 1
+            LIMIT 1;
+            """
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def upsert_state(state: ProductionState) -> None:
@@ -2278,6 +2625,169 @@ def latest_universe_selection_diagnostics_state(
         return dict(row) if row else None
 
 
+def replace_universe_addition_recommendations_snapshot(
+    summary: dict[str, Any],
+    records: Iterable[dict[str, Any]],
+) -> None:
+    if not db_enabled():
+        return
+    init_db()
+
+    run_id = str(summary.get("run_id") or "").strip()
+    if not run_id:
+        return
+    run_date = summary.get("run_date")
+    run_date_value = _normalize_date_value(run_date) if run_date else None
+    generated_at_utc = summary.get("generated_at_utc")
+
+    rows: list[tuple[Any, ...]] = []
+    for item in records:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        rows.append(
+            (
+                run_id,
+                ticker,
+                item.get("exchange"),
+                item.get("symbol"),
+                item.get("in_current_universe"),
+                item.get("passes_filters"),
+                item.get("fail_reasons"),
+                item.get("recommendation_score"),
+                item.get("is_recommended"),
+                item.get("close"),
+                item.get("volume"),
+                item.get("dollar_volume"),
+                item.get("recommend_all"),
+                item.get("sma50"),
+                item.get("sma200"),
+                item.get("trend_up"),
+                item.get("market_cap"),
+                item.get("sector"),
+                item.get("monitor_pass"),
+                item.get("pass_streak"),
+                item.get("quality_pass"),
+                item.get("quality_rows"),
+                item.get("quality_median_adv_dollars"),
+            )
+        )
+
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO production_universe_addition_recommendations_state (
+                run_id,
+                run_date,
+                generated_at_utc,
+                source,
+                input_file,
+                input_format,
+                current_universe_source,
+                current_universe_size,
+                candidates_evaluated,
+                already_in_universe,
+                passes_filters_total,
+                recommended_additions,
+                payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id) DO UPDATE SET
+                run_date = EXCLUDED.run_date,
+                generated_at_utc = EXCLUDED.generated_at_utc,
+                source = EXCLUDED.source,
+                input_file = EXCLUDED.input_file,
+                input_format = EXCLUDED.input_format,
+                current_universe_source = EXCLUDED.current_universe_source,
+                current_universe_size = EXCLUDED.current_universe_size,
+                candidates_evaluated = EXCLUDED.candidates_evaluated,
+                already_in_universe = EXCLUDED.already_in_universe,
+                passes_filters_total = EXCLUDED.passes_filters_total,
+                recommended_additions = EXCLUDED.recommended_additions,
+                payload = EXCLUDED.payload;
+            """,
+            (
+                run_id,
+                run_date_value,
+                generated_at_utc,
+                summary.get("source"),
+                summary.get("input_file"),
+                summary.get("input_format"),
+                summary.get("current_universe_source"),
+                summary.get("current_universe_size"),
+                summary.get("candidates_evaluated"),
+                summary.get("already_in_universe"),
+                summary.get("passes_filters_total"),
+                summary.get("recommended_additions"),
+                psycopg2.extras.Json(summary),
+            ),
+        )
+
+        cur.execute(
+            """
+            DELETE FROM production_universe_addition_recommendations_records
+            WHERE run_id = %s;
+            """,
+            (run_id,),
+        )
+        if rows:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO production_universe_addition_recommendations_records (
+                    run_id,
+                    ticker,
+                    exchange,
+                    symbol,
+                    in_current_universe,
+                    passes_filters,
+                    fail_reasons,
+                    recommendation_score,
+                    is_recommended,
+                    close,
+                    volume,
+                    dollar_volume,
+                    recommend_all,
+                    sma50,
+                    sma200,
+                    trend_up,
+                    market_cap,
+                    sector,
+                    monitor_pass,
+                    pass_streak,
+                    quality_pass,
+                    quality_rows,
+                    quality_median_adv_dollars
+                )
+                VALUES %s
+                ON CONFLICT (run_id, ticker) DO UPDATE SET
+                    exchange = EXCLUDED.exchange,
+                    symbol = EXCLUDED.symbol,
+                    in_current_universe = EXCLUDED.in_current_universe,
+                    passes_filters = EXCLUDED.passes_filters,
+                    fail_reasons = EXCLUDED.fail_reasons,
+                    recommendation_score = EXCLUDED.recommendation_score,
+                    is_recommended = EXCLUDED.is_recommended,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    dollar_volume = EXCLUDED.dollar_volume,
+                    recommend_all = EXCLUDED.recommend_all,
+                    sma50 = EXCLUDED.sma50,
+                    sma200 = EXCLUDED.sma200,
+                    trend_up = EXCLUDED.trend_up,
+                    market_cap = EXCLUDED.market_cap,
+                    sector = EXCLUDED.sector,
+                    monitor_pass = EXCLUDED.monitor_pass,
+                    pass_streak = EXCLUDED.pass_streak,
+                    quality_pass = EXCLUDED.quality_pass,
+                    quality_rows = EXCLUDED.quality_rows,
+                    quality_median_adv_dollars = EXCLUDED.quality_median_adv_dollars;
+                """,
+                rows,
+            )
+
+
 def latest_universe_monitor_summary() -> dict[str, Any] | None:
     if not db_enabled():
         return None
@@ -2460,6 +2970,7 @@ def reset_production_data(preserve_universe_monitor: bool = True) -> None:
             "production_runs",
             "production_trades",
             "production_prices",
+            "production_entry_indicator_state",
             "production_state",
             "production_pending_adjustments",
             "production_broker_account",
@@ -2467,6 +2978,8 @@ def reset_production_data(preserve_universe_monitor: bool = True) -> None:
             "production_broker_orders",
             "production_universe_selection_diagnostics_state",
             "production_universe_selection_diagnostics_records",
+            "production_universe_addition_recommendations_state",
+            "production_universe_addition_recommendations_records",
         ]
         if not preserve_universe_monitor:
             tables.extend(

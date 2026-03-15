@@ -13,6 +13,7 @@ from .costs import vectorized_brokerage_calculator
 from .portfolio import get_target_weights
 from .regime import get_regime_state, regime_gross_target, regime_top_k
 from .strategy import StrategySpec
+from .emerging_universe import normalize_allowed_tickers_by_date
 from .universe_quality import apply_quality_filter
 from .utils import calculate_performance_metrics
 
@@ -36,6 +37,7 @@ class RuleBasedBacktester:
         rebalance_every_n_days: int | None = None,
         strategy_selector: Callable[[pd.Timestamp, dict, list[StrategySpec]], list[StrategySpec] | None]
         | None = None,
+        allowed_tickers_by_date: dict[pd.Timestamp, set[str]] | None = None,
     ):
         self.df = df
         universe_filter = config.UNIVERSE_FILTER
@@ -61,6 +63,7 @@ class RuleBasedBacktester:
             raise ValueError("rebalance_every_n_days must be >= 1.")
         self.rebalance_every_n_days = cadence
         self.strategy_selector = strategy_selector
+        self.allowed_tickers_by_date = normalize_allowed_tickers_by_date(allowed_tickers_by_date)
 
         self.strategies = list(strategies)
         if not self.strategies:
@@ -173,6 +176,14 @@ class RuleBasedBacktester:
 
             prices = day_data["Close"].to_numpy(dtype=float)
             mask = np.isfinite(prices) & (prices > 0)
+            allowed_today = self.allowed_tickers_by_date.get(pd.Timestamp(current_date).tz_localize(None))
+            if allowed_today is not None:
+                allowed_mask = np.fromiter(
+                    (ticker in allowed_today for ticker in self.universe),
+                    dtype=bool,
+                    count=len(self.universe),
+                )
+                mask = mask & allowed_mask
             prices = np.nan_to_num(prices, nan=0.0, posinf=0.0, neginf=0.0)
 
             vol = day_data.get("vol_21")

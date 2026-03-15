@@ -90,15 +90,20 @@ TRADE_COLUMNS = [
 ]
 
 DEFAULT_REGIME_MAPPING_INDIA = {
-    "bear_high_vol": "india_rule_crash_resilient_slow",
-    "bear_low_vol": "india_rule_quality_defensive_slow",
+    "bear_high_vol": "india_rule_range_stability_slow",
+    "bear_low_vol": "india_rule_trend_carry_slow",
     "bull_high_vol": "india_rule_pullback_reentry_slow",
-    "bull_low_vol": "india_rule_trend_carry_slow",
+    "bull_low_vol": "india_rule_pullback_reentry_slow",
     "sideways_high_vol": "india_rule_range_stability_slow",
     "sideways_low_vol": "india_rule_liquidity_momentum_core",
 }
 
 DEFAULT_REGIME_MAPPING = DEFAULT_REGIME_MAPPING_INDIA
+DEFAULT_BASE_STRATEGIES = [
+    "india_rule_crash_resilient_slow",
+    "india_rule_liquidity_momentum_core",
+    "india_rule_pullback_reentry_slow",
+]
 
 
 def _utc_now() -> str:
@@ -299,12 +304,20 @@ def _persist_selection_diagnostics_snapshot(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Daily production run: update data + generate trades.")
-    parser.add_argument("--strategies", nargs="+", help="List of strategy names to include.")
+    parser.add_argument(
+        "--strategies",
+        nargs="+",
+        default=list(DEFAULT_BASE_STRATEGIES),
+        help=(
+            "List of base strategy names to include. "
+            "Regime-mapped strategies are auto-added if missing."
+        ),
+    )
     parser.add_argument("--strategy-roots", action="append", default=[], help="Root directory containing strategies.")
     parser.add_argument(
         "--regime-mapping",
         type=str,
-        help="JSON mapping of regime_label -> strategy name (defaults to the tech mapping).",
+        help="JSON mapping of regime_label -> strategy name (defaults to the India production mapping).",
     )
     parser.add_argument("--data-file", default=None, help="Override data file path.")
     parser.add_argument("--date", type=str, help="Override target date (YYYY-MM-DD). Defaults to last date in data.")
@@ -426,7 +439,11 @@ def parse_args():
     parser.add_argument("--force", action="store_true", help="Run even if state already has the target date.")
     parser.add_argument("--print-trades", action="store_true", help="Print trades to stdout.")
     parser.add_argument("--max-print", type=int, default=100, help="Max trades to print.")
-    parser.add_argument("--sector", default="Technology", help="Sector filter (default: Technology).")
+    parser.add_argument(
+        "--sector",
+        default="ALL",
+        help="Sector filter (default: ALL for full-universe trading).",
+    )
     parser.add_argument(
         "--regime-scope",
         choices=("global", "sector"),
@@ -448,6 +465,11 @@ def _resolve_path(path: str) -> str:
     return os.path.join(PROJECT_ROOT, resolved)
 
 
+def _is_all_sector_mode(value: str | None) -> bool:
+    token = str(value or "").strip().lower()
+    return token in {"all", "*", "any"}
+
+
 def _normalize_exchange_map(mapping: dict[str, str]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for ticker, exchange in mapping.items():
@@ -457,6 +479,49 @@ def _normalize_exchange_map(mapping: dict[str, str]) -> dict[str, str]:
             continue
         normalized[t] = ex or "UNKNOWN"
     return normalized
+
+
+def _is_exchange_like(value: str | None) -> bool:
+    token = str(value or "").strip().upper()
+    if not token:
+        return False
+    if token in {"NSE", "BSE", "NFO", "BFO", "MCX"}:
+        return True
+    return token.isalpha() and len(token) <= 5
+
+
+def _parse_ticker_exchange_pair(
+    raw_ticker: str | None,
+    raw_exchange: str | None = None,
+) -> tuple[str | None, str | None]:
+    ticker = str(raw_ticker or "").strip().upper()
+    exchange = str(raw_exchange or "").strip().upper()
+    if ticker and ":" in ticker:
+        left, right = ticker.split(":", 1)
+        left = str(left or "").strip().upper()
+        right = str(right or "").strip().upper()
+        if not exchange:
+            if _is_exchange_like(left) and right:
+                exchange, ticker = left, right
+            elif _is_exchange_like(right) and left:
+                exchange, ticker = right, left
+            else:
+                ticker, exchange = left, right
+    if exchange and ":" in exchange:
+        left, right = exchange.split(":", 1)
+        left = str(left or "").strip().upper()
+        right = str(right or "").strip().upper()
+        if _is_exchange_like(left):
+            exchange = left
+            if not ticker and right:
+                ticker = right
+        elif _is_exchange_like(right):
+            exchange = right
+            if not ticker and left:
+                ticker = left
+    if not ticker:
+        return None, None
+    return ticker, (exchange or None)
 
 
 def _build_retry_pending_ticker_entries(
@@ -474,9 +539,10 @@ def _build_retry_pending_ticker_entries(
             tickers = [tickers]
         selected_tickers = sorted(
             {
-                str(ticker).strip().upper()
+                parsed_ticker
                 for ticker in (tickers or [])
-                if str(ticker).strip().upper() in retry_tickers
+                for parsed_ticker, _ in [_parse_ticker_exchange_pair(ticker, None)]
+                if parsed_ticker and parsed_ticker in retry_tickers
             }
         )
         if not selected_tickers:
@@ -487,20 +553,21 @@ def _build_retry_pending_ticker_entries(
         filtered_exchanges: dict[str, str] = {}
         if isinstance(exchanges_raw, dict):
             for ticker, exchange in exchanges_raw.items():
-                ticker_key = str(ticker).strip().upper()
+                ticker_key, exchange_key = _parse_ticker_exchange_pair(ticker, exchange)
                 if ticker_key not in selected_tickers:
                     continue
-                exchange_key = str(exchange).strip().upper()
-                filtered_exchanges[ticker_key] = exchange_key or "UNKNOWN"
+                filtered_exchanges[ticker_key] = str(exchange_key or "UNKNOWN").strip().upper()
         elif isinstance(exchanges_raw, list):
             for item in exchanges_raw:
                 if not isinstance(item, dict):
                     continue
-                ticker_key = str(item.get("ticker", "")).strip().upper()
+                ticker_key, exchange_key = _parse_ticker_exchange_pair(
+                    item.get("ticker"),
+                    item.get("exchange"),
+                )
                 if ticker_key not in selected_tickers:
                     continue
-                exchange_key = str(item.get("exchange", "")).strip().upper()
-                filtered_exchanges[ticker_key] = exchange_key or "UNKNOWN"
+                filtered_exchanges[ticker_key] = str(exchange_key or "UNKNOWN").strip().upper()
         retry_entry.pop("ticker_exchanges", None)
         if filtered_exchanges:
             retry_entry["exchanges"] = filtered_exchanges
@@ -2067,6 +2134,7 @@ def main():
             else float(args.max_daily_turnover)
         ),
         weight_smoothing=float(args.weight_smoothing),
+        execute_trades_on_kite=bool(config.EXECUTE_TRADES_ON_KITE),
     )
     if not db_enabled():
         raise RuntimeError(
@@ -2172,18 +2240,19 @@ def main():
                 exchanges = entry.get("exchanges") or entry.get("ticker_exchanges") or {}
                 if isinstance(exchanges, dict):
                     for ticker, exchange in exchanges.items():
-                        t = str(ticker).strip().upper()
-                        ex = str(exchange).strip().upper()
+                        t, ex = _parse_ticker_exchange_pair(ticker, exchange)
                         if t:
-                            pending_exchange_map[t] = ex or "UNKNOWN"
+                            pending_exchange_map[t] = str(ex or "UNKNOWN").strip().upper()
                 elif isinstance(exchanges, list):
                     for item in exchanges:
                         if not isinstance(item, dict):
                             continue
-                        t = str(item.get("ticker", "")).strip().upper()
-                        ex = str(item.get("exchange", "")).strip().upper()
+                        t, ex = _parse_ticker_exchange_pair(
+                            item.get("ticker"),
+                            item.get("exchange"),
+                        )
                         if t:
-                            pending_exchange_map[t] = ex or "UNKNOWN"
+                            pending_exchange_map[t] = str(ex or "UNKNOWN").strip().upper()
     _log(
         "pending_adjustments_load_complete",
         entries=len(pending_entries),
@@ -2321,23 +2390,31 @@ def main():
         universe_map = refreshed_universe_map
         db_replace_universe_map(universe_map)
 
-    sector = args.sector.strip()
-    sector_df = df[df["sector"].astype(str).str.lower() == sector.lower()]
-    if sector_df.empty:
-        available = sorted({s for s in df["sector"].dropna().unique().tolist()})
-        raise ValueError(f"No data for sector '{sector}'. Available sectors: {available}")
+    requested_sector = args.sector.strip()
+    all_sector_mode = _is_all_sector_mode(requested_sector)
+    if all_sector_mode:
+        sector = "ALL"
+        trade_df = df
+    else:
+        sector = requested_sector
+        trade_df = df[df["sector"].astype(str).str.lower() == sector.lower()]
+        if trade_df.empty:
+            available = sorted({s for s in df["sector"].dropna().unique().tolist()})
+            raise ValueError(f"No data for sector '{sector}'. Available sectors: {available}")
 
     target_date = (
         pd.to_datetime(args.date).tz_localize(None)
         if args.date
-        else pd.to_datetime(sector_df.index.get_level_values("date").max()).tz_localize(None)
+        else pd.to_datetime(trade_df.index.get_level_values("date").max()).tz_localize(None)
     )
     price_snapshot: list[dict[str, float]] = _build_price_snapshot(df, target_date)
     price_lookup = _price_lookup_from_snapshot(price_snapshot)
     _log(
         "target_selection_complete",
         target_date=target_date.strftime("%Y-%m-%d"),
-        sector_rows=len(sector_df),
+        sector=sector,
+        trade_rows=len(trade_df),
+        all_sector_mode=all_sector_mode,
         snapshot_prices=len(price_snapshot),
     )
 
@@ -2394,6 +2471,7 @@ def main():
     broker_orders: list[dict] = []
     broker_missing: list[str] = []
     broker_order_issues: list[dict] = []
+    broker_order_dry_run = bool(args.dry_run)
     broker_account_row: dict | None = None
     broker_positions_rows: list[dict] = []
     broker_name = _active_broker_name()
@@ -2402,7 +2480,7 @@ def main():
     if broker_name == "trading212":
         _log("broker_integration_enabled", broker=broker_name)
         broker_context = _build_trading212_context(state)
-        tradable_df = _apply_universe_filter_with_exclusions(sector_df, excluded_tickers)
+        tradable_df = _apply_universe_filter_with_exclusions(trade_df, excluded_tickers)
         _ensure_trading212_universe(
             tradable_df,
             broker_context.get("by_ticker") or {},
@@ -2427,7 +2505,7 @@ def main():
     elif broker_name == "kite":
         _log("broker_integration_enabled", broker=broker_name)
         broker_context = _build_kite_context(state)
-        tradable_df = _apply_universe_filter_with_exclusions(sector_df, excluded_tickers)
+        tradable_df = _apply_universe_filter_with_exclusions(trade_df, excluded_tickers)
         _ensure_kite_universe(
             tradable_df,
             broker_context.get("by_ticker") or {},
@@ -2454,14 +2532,15 @@ def main():
 
     trade_gen_start = time.monotonic()
     _log("trade_generation_start")
-    regime_table = compute_market_regime_table(df if args.regime_scope == "global" else sector_df)
+    regime_source_df = df if args.regime_scope == "global" else trade_df
+    regime_table = compute_market_regime_table(regime_source_df)
     regime_table = _apply_regime_confirmation(
         regime_table,
         confirm_days=args.confirm_days,
         confirm_days_sideways=args.confirm_days_sideways,
     )
     trades, new_state, summary = generate_trades_for_date(
-        sector_df,
+        trade_df,
         strategies,
         target_date=target_date,
         state=state_for_trades,
@@ -2502,16 +2581,30 @@ def main():
         summary["broker_fx_rate_gbp_per_usd"] = broker_context.get("fx_rate_gbp_per_usd")
         broker_exec_start = time.monotonic()
         if broker_name == "kite":
+            execute_trades_on_kite = bool(config.EXECUTE_TRADES_ON_KITE)
+            summary["execute_trades_on_kite"] = execute_trades_on_kite
+            if not execute_trades_on_kite and not args.dry_run:
+                _log(
+                    "broker_live_execution_disabled",
+                    broker="kite",
+                    execute_trades_on_kite=False,
+                    details=(
+                        "Signals/trades are generated, but order placement is disabled. "
+                        "Set EXECUTE_TRADES_ON_KITE=true to enable live execution."
+                    ),
+                )
+            broker_order_dry_run = bool(args.dry_run or not execute_trades_on_kite)
             broker_orders, broker_missing, broker_order_issues = _execute_kite_orders(
                 trades,
                 broker_context,
-                args.dry_run,
+                broker_order_dry_run,
             )
         else:
+            broker_order_dry_run = bool(args.dry_run)
             broker_orders, broker_missing, broker_order_issues = _execute_trading212_orders(
                 trades,
                 broker_context,
-                args.dry_run,
+                broker_order_dry_run,
             )
         _log(
             "broker_order_execution_summary",
@@ -2532,7 +2625,7 @@ def main():
             summary["broker_order_issues"] = broker_order_issues
             summary["broker_order_issue_count"] = len(broker_order_issues)
             _log("broker_order_issues_recorded", broker=broker_name, count=len(broker_order_issues))
-        if args.dry_run:
+        if broker_order_dry_run:
             post_summary = broker_context.get("summary_raw", {})
             post_positions = broker_context.get("positions_raw", [])
         else:
@@ -2632,7 +2725,7 @@ def main():
         summary["broker_notional_covered_orders"] = covered_orders
         notionals_complete = covered_orders >= filled_orders
         can_convert_flow = abs(float(total_cash)) <= 1e-12 or broker_currency == "USD" or fx_rate > 0
-        if args.dry_run:
+        if broker_order_dry_run:
             summary["broker_external_flow"] = None
             summary["broker_external_flow_usd"] = float(total_cash)
             summary["broker_execution_cost"] = None
@@ -2710,7 +2803,7 @@ def main():
 
     trades_df = pd.DataFrame(trades, columns=TRADE_COLUMNS)
     state_to_persist = new_state
-    if broker_context and not args.dry_run:
+    if broker_context and not broker_order_dry_run:
         post_positions = broker_context.get("post_positions") or broker_context.get("positions_raw", [])
         state_to_persist = _state_from_broker_snapshot(
             new_state=new_state,
@@ -2737,15 +2830,23 @@ def main():
     if not args.dry_run:
         _log("db_persist_start")
         db_upsert_run_summary(summary)
-        _persist_selection_diagnostics_snapshot(
-            full_df=df,
-            summary=summary,
-            sector=sector,
-            target_date=target_date,
-            regime_scope=args.regime_scope,
-            strategy_roots=strategy_roots,
-            excluded_tickers=excluded_tickers,
-        )
+        if not all_sector_mode:
+            _persist_selection_diagnostics_snapshot(
+                full_df=df,
+                summary=summary,
+                sector=sector,
+                target_date=target_date,
+                regime_scope=args.regime_scope,
+                strategy_roots=strategy_roots,
+                excluded_tickers=excluded_tickers,
+            )
+        else:
+            _log(
+                "selection_diagnostics_snapshot_skipped",
+                reason="all_sector_mode",
+                sector=sector,
+                run_date=summary.get("date"),
+            )
         db_replace_trades(summary["date"], trades)
         if price_snapshot:
             db_replace_prices(summary["date"], price_snapshot)

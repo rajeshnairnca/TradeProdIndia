@@ -77,11 +77,17 @@ def _payload_summary(payload: Any) -> str:
 def kite_enabled() -> bool:
     if not config.USE_KITE:
         return False
+    auth_state = _load_broker_auth_state() or {}
     api_key = os.getenv("KITE_API_KEY", "").strip()
+    if not api_key:
+        api_key = str(auth_state.get("api_key") or "").strip()
     if not api_key:
         return False
     access_token = os.getenv("KITE_ACCESS_TOKEN", "").strip()
     if access_token:
+        return True
+    db_access_token = str(auth_state.get("access_token") or "").strip()
+    if db_access_token:
         return True
     access_token_file = str(config.KITE_ACCESS_TOKEN_FILE or "").strip()
     if access_token_file:
@@ -89,15 +95,24 @@ def kite_enabled() -> bool:
         if token_path.exists() and token_path.read_text().strip():
             return True
     request_token = os.getenv("KITE_REQUEST_TOKEN", "").strip()
+    if not request_token:
+        request_token = str(auth_state.get("request_token") or "").strip()
     api_secret = os.getenv("KITE_API_SECRET", "").strip()
     return bool(request_token and api_secret)
 
 
 def _load_credentials() -> KiteCredentials:
+    auth_state = _load_broker_auth_state() or {}
     api_key = os.getenv("KITE_API_KEY", "").strip()
+    if not api_key:
+        api_key = str(auth_state.get("api_key") or "").strip()
     api_secret = os.getenv("KITE_API_SECRET", "").strip()
     request_token = os.getenv("KITE_REQUEST_TOKEN", "").strip()
+    if not request_token:
+        request_token = str(auth_state.get("request_token") or "").strip()
     access_token = os.getenv("KITE_ACCESS_TOKEN", "").strip()
+    if not access_token:
+        access_token = str(auth_state.get("access_token") or "").strip()
     if not access_token:
         access_token_file = str(config.KITE_ACCESS_TOKEN_FILE or "").strip()
         if access_token_file:
@@ -119,6 +134,37 @@ def _auth_header(credentials: KiteCredentials) -> str:
     return f"token {token}"
 
 
+def _load_broker_auth_state() -> dict[str, Any] | None:
+    try:
+        from .production_db import db_enabled, load_broker_auth_state
+    except Exception:
+        return None
+    try:
+        if not db_enabled():
+            return None
+        state = load_broker_auth_state("kite")
+        return state if isinstance(state, dict) else None
+    except Exception as exc:
+        print(f"[KiteClient] broker_auth_state_load_failed error={type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def _upsert_broker_auth_state(**kwargs: Any) -> None:
+    try:
+        from .production_db import db_enabled, upsert_broker_auth_state
+    except Exception:
+        return
+    try:
+        if not db_enabled():
+            return
+        upsert_broker_auth_state("kite", **kwargs)
+    except Exception as exc:
+        print(
+            f"[KiteClient] broker_auth_state_upsert_failed error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+
 class KiteClient:
     def __init__(
         self,
@@ -138,6 +184,10 @@ class KiteClient:
         token = str(access_token or "").strip()
         if not token:
             return
+        _upsert_broker_auth_state(
+            access_token=token,
+            api_key=self.credentials.api_key or None,
+        )
         access_token_file = str(config.KITE_ACCESS_TOKEN_FILE or "").strip()
         if not access_token_file:
             return
@@ -345,6 +395,15 @@ class KiteClient:
         if access_token:
             self.credentials.access_token = access_token
             self._persist_access_token(access_token)
+        _upsert_broker_auth_state(
+            access_token=access_token or None,
+            request_token=token,
+            api_key=self.credentials.api_key or None,
+            user_id=str(payload.get("user_id") or "").strip() or None,
+            session_payload=payload,
+            pending_state=None,
+            pending_state_expires_at_epoch=None,
+        )
         return payload
 
     def get_margins(self) -> dict[str, Any]:

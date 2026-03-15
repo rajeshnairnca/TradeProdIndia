@@ -14,6 +14,29 @@ from src.production_db import (
 )
 
 
+def _is_exchange_like(value: str | None) -> bool:
+    token = str(value or "").strip().upper()
+    if not token:
+        return False
+    if token in {"NSE", "BSE", "NFO", "BFO", "MCX"}:
+        return True
+    return token.isalpha() and len(token) <= 5
+
+
+def _parse_ticker_exchange_entry(entry: str) -> tuple[str | None, str | None]:
+    text = str(entry or "").strip().upper()
+    if not text:
+        return None, None
+    if ":" not in text:
+        return text, None
+    left, right = [part.strip().upper() for part in text.split(":", 1)]
+    if _is_exchange_like(left) and right:
+        return right, left
+    if _is_exchange_like(right) and left:
+        return left, right
+    return left or None, right or None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Queue cash or universe adjustments for the next run.")
     parser.add_argument("--add-cash", type=float, default=0.0, help="Cash to add on next production run.")
@@ -31,12 +54,12 @@ def parse_args():
     parser.add_argument(
         "--add-tickers-exchange",
         default=None,
-        help="Comma-separated EXCHANGE:TICKER entries to add with exchange info.",
+        help="Comma-separated EXCHANGE:TICKER or TICKER:EXCHANGE entries.",
     )
     parser.add_argument(
         "--add-tickers-exchange-file",
         default=None,
-        help="Path to newline-delimited EXCHANGE:TICKER entries.",
+        help="Path to newline-delimited EXCHANGE:TICKER or TICKER:EXCHANGE entries.",
     )
     parser.add_argument("--source", default="app", help="Source label for the adjustment.")
     return parser.parse_args()
@@ -73,18 +96,20 @@ def main():
     if args.add_tickers_exchange:
         exchange_entries = [t.strip() for t in args.add_tickers_exchange.split(",") if t.strip()]
         for exchange_entry in exchange_entries:
-            if ":" not in exchange_entry:
+            ticker, exchange = _parse_ticker_exchange_entry(exchange_entry)
+            if not ticker:
                 continue
-            exchange, ticker = exchange_entry.split(":", 1)
-            exchange_map[ticker.strip().upper()] = exchange.strip().upper()
+            if exchange:
+                exchange_map[ticker] = exchange
     if args.add_tickers_exchange_file:
         with open(args.add_tickers_exchange_file, "r") as f:
             for line in f:
                 entry = line.strip()
-                if not entry or ":" not in entry:
+                ticker, exchange = _parse_ticker_exchange_entry(entry)
+                if not ticker:
                     continue
-                exchange, ticker = entry.split(":", 1)
-                exchange_map[ticker.strip().upper()] = exchange.strip().upper()
+                if exchange:
+                    exchange_map[ticker] = exchange
     if exchange_map:
         tickers.extend(exchange_map.keys())
     tickers = sorted(set(tickers))

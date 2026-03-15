@@ -16,6 +16,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.append(PROJECT_ROOT)
 
 from src import config
+from src.emerging_universe import EmergingUniverseParams, build_emerging_universe_schedule
 from src.market_data_validation import validate_market_data_frame
 from src.regime import compute_market_regime_table
 from src.rule_backtester import RuleBasedBacktester
@@ -185,6 +186,20 @@ def parse_args():
         type=str,
         help="JSON mapping of regime_label -> strategy name for per-regime strategy selection.",
     )
+    parser.add_argument(
+        "--enable-emerging-universe",
+        action="store_true",
+        help="Enable monthly emerging-universe ticker schedule overlay.",
+    )
+    parser.add_argument("--emerging-top-n", type=int, default=150)
+    parser.add_argument("--emerging-min-history-days", type=int, default=252)
+    parser.add_argument("--emerging-min-price", type=float, default=20.0)
+    parser.add_argument("--emerging-min-adv-rank", type=float, default=0.05)
+    parser.add_argument("--emerging-max-adv-rank", type=float, default=0.85)
+    parser.add_argument("--emerging-min-ret-6m", type=float, default=0.10)
+    parser.add_argument("--emerging-min-ret-12m", type=float, default=-0.10)
+    parser.add_argument("--emerging-min-adv-growth-6m", type=float, default=1.05)
+    parser.add_argument("--emerging-rebalance-frequency", type=str, default="MS")
     return parser.parse_args()
 
 
@@ -274,11 +289,37 @@ def main():
         if split_index < len(all_dates):
             start_date = pd.to_datetime(all_dates[split_index])
 
+    emerging_params = None
+    allowed_tickers_by_date = None
+    schedule_diagnostics = None
+    if args.enable_emerging_universe:
+        emerging_params = EmergingUniverseParams(
+            enabled=True,
+            rebalance_frequency=args.emerging_rebalance_frequency,
+            top_n=max(1, int(args.emerging_top_n)),
+            min_history_days=max(1, int(args.emerging_min_history_days)),
+            min_price=float(args.emerging_min_price),
+            min_adv_rank=float(args.emerging_min_adv_rank),
+            max_adv_rank=float(args.emerging_max_adv_rank),
+            min_ret_6m=float(args.emerging_min_ret_6m),
+            min_ret_12m=float(args.emerging_min_ret_12m),
+            min_adv_growth_6m=float(args.emerging_min_adv_growth_6m),
+        )
+        schedule = build_emerging_universe_schedule(
+            df,
+            params=emerging_params,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        allowed_tickers_by_date = schedule.members_by_date
+        schedule_diagnostics = schedule.diagnostics
+
     backtester = RuleBasedBacktester(
         df,
         strategies,
         regime_table=regime_table,
         strategy_selector=mapping_selector,
+        allowed_tickers_by_date=allowed_tickers_by_date,
     )
     result = backtester.run(
         start_date=start_date,
@@ -311,6 +352,10 @@ def main():
         plot_path = os.path.join(output_dir, "backtest_performance.png")
         plt.savefig(plot_path)
         print(f"Performance plot saved to {plot_path}")
+    if schedule_diagnostics is not None and not schedule_diagnostics.empty:
+        schedule_path = os.path.join(output_dir, "emerging_universe_schedule_diagnostics.csv")
+        schedule_diagnostics.to_csv(schedule_path, index=False)
+        print(f"Emerging universe schedule diagnostics saved to {schedule_path}")
 
     invocation_command = _build_invocation_command()
     results_payload = {
@@ -331,6 +376,9 @@ def main():
         "end_date": end_date.strftime("%Y-%m-%d") if isinstance(end_date, pd.Timestamp) else None,
         "command": invocation_command,
         "argv": list(sys.argv[1:]),
+        "emerging_universe_enabled": bool(args.enable_emerging_universe),
+        "emerging_universe_params": emerging_params.__dict__ if emerging_params is not None else None,
+        "emerging_universe_schedule_days": int(len(allowed_tickers_by_date or {})),
     }
     results_path = os.path.join(output_dir, "results.json")
     with open(results_path, "w", encoding="utf-8") as f:

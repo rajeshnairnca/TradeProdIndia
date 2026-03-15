@@ -121,10 +121,16 @@ DEFAULT_STRATEGY_ROOTS = tuple(
     for part in _env_str("DEFAULT_STRATEGY_ROOTS", _DEFAULT_STRATEGY_ROOT).split(",")
     if part.strip()
 ) or (_DEFAULT_STRATEGY_ROOT,)
-RUN_CALENDAR_TIMEZONE = _env_str("RUN_CALENDAR_TIMEZONE", "America/New_York")
+RUN_CALENDAR_TIMEZONE = _env_str("RUN_CALENDAR_TIMEZONE", "Asia/Kolkata")
 # Railway cron already skips weekends in this setup; keep weekend blocking opt-in.
 RUN_CALENDAR_SKIP_WEEKENDS = _env_bool("RUN_CALENDAR_SKIP_WEEKENDS", False)
 RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS = _env_bool("RUN_CALENDAR_SKIP_US_FEDERAL_HOLIDAYS", False)
+RUN_CALENDAR_MARKET_HOLIDAYS_FILE = _env_str(
+    "RUN_CALENDAR_MARKET_HOLIDAYS_FILE",
+    "data/india_market_holidays.json",
+)
+RUN_CALENDAR_MARKET_HOLIDAYS = _env_str("RUN_CALENDAR_MARKET_HOLIDAYS", "")
+RUN_CALENDAR_MARKET_HOLIDAYS_JSON = _env_str("RUN_CALENDAR_MARKET_HOLIDAYS_JSON", "")
 
 
 def resolve_path(path: str) -> str:
@@ -211,6 +217,10 @@ TRADING212_TICKER_MAP_FILE = _env_str("TRADING212_TICKER_MAP_FILE", "data/tradin
 TRADING212_FX_RATE_USD_GBP = _env_optional_float("TRADING212_FX_RATE_USD_GBP")
 
 USE_KITE = _env_bool("USE_KITE", True)
+EXECUTE_TRADES_ON_KITE = _env_bool(
+    "EXECUTE_TRADES_ON_KITE",
+    _env_bool("execute_trades_on_kite", False),
+)
 KITE_BASE_URL = _env_str("KITE_BASE_URL", "https://api.kite.trade")
 KITE_TIMEOUT = _env_float("KITE_TIMEOUT", 20.0)
 KITE_HTTP_MAX_RETRIES = _env_int("KITE_HTTP_MAX_RETRIES", 4)
@@ -227,6 +237,8 @@ KITE_TICKER_MAP_FILE = _env_str("KITE_TICKER_MAP_FILE", "data/kite_ticker_map.js
 KITE_INSTRUMENTS_EXCHANGE = _env_str("KITE_INSTRUMENTS_EXCHANGE", "NSE").upper()
 KITE_ACCESS_TOKEN_FILE = _env_str("KITE_ACCESS_TOKEN_FILE", "data/kite_access_token.txt")
 KITE_SESSION_GENERATE_ON_START = _env_bool("KITE_SESSION_GENERATE_ON_START", True)
+KITE_REDIRECT_URL = _env_str("KITE_REDIRECT_URL", "")
+KITE_AUTH_STATE_TTL_SECONDS = max(60, _env_int("KITE_AUTH_STATE_TTL_SECONDS", 900))
 KITE_QUOTE_BATCH_SIZE = max(1, _env_int("KITE_QUOTE_BATCH_SIZE", 1000))
 KITE_QUOTE_MAX_BATCHES = _env_int("KITE_QUOTE_MAX_BATCHES", 0)
 HMM_N_COMPONENTS = _env_int("HMM_N_COMPONENTS", 4)

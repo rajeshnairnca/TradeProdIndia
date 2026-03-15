@@ -1,18 +1,27 @@
 import os
 import sys
 import time
+import json
+import secrets
+from datetime import datetime, timezone
 from typing import List, Literal, Optional
+from urllib.parse import urlencode
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(PROJECT_ROOT)
 
 import pandas as pd
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from src import config
 from src.cagr_metrics import compute_cagr_summary
+from src.entry_indicator import (
+    DEFAULT_BASE_STRATEGIES as ENTRY_DEFAULT_BASE_STRATEGIES,
+    DEFAULT_REGIME_MAPPING as ENTRY_DEFAULT_REGIME_MAPPING,
+    compute_entry_indicator_payload,
+)
 from src.production_db import (
     RUN_SUMMARY_FIELDS as DB_RUN_SUMMARY_FIELDS,
     append_pending_adjustments as db_append_pending_adjustments,
@@ -26,6 +35,7 @@ from src.production_db import (
     list_latest_broker_orders as db_list_latest_broker_orders,
     list_latest_broker_positions as db_list_latest_broker_positions,
     list_latest_trades as db_list_latest_trades,
+    latest_entry_indicator_snapshot as db_latest_entry_indicator_snapshot,
     list_pending_adjustments as db_list_pending_adjustments,
     list_run_calendar_overrides_paginated as db_list_run_calendar_overrides_paginated,
     list_run_summaries_paginated as db_list_run_summaries_paginated,
@@ -42,6 +52,7 @@ from src.production_db import (
     list_trades as db_list_trades,
     list_universe_monitor_candidates as db_list_universe_monitor_candidates,
     list_universe_selection_diagnostics_records as db_list_universe_selection_diagnostics_records,
+    load_broker_auth_state as db_load_broker_auth_state,
     load_excluded_tickers as db_load_excluded_tickers,
     load_run_calendar_override as db_load_run_calendar_override,
     load_universe_map as db_load_universe_map,
@@ -49,8 +60,11 @@ from src.production_db import (
     replace_excluded_tickers as db_replace_excluded_tickers,
     load_state as db_load_state,
     reset_production_data as db_reset_production_data,
+    upsert_broker_auth_state as db_upsert_broker_auth_state,
+    upsert_entry_indicator_snapshot as db_upsert_entry_indicator_snapshot,
     upsert_run_calendar_override as db_upsert_run_calendar_override,
 )
+from src.kite import KiteClient, KiteCredentials
 from src.run_calendar import (
     RUN_CALENDAR_ACTION_FORCE_RUN,
     RUN_CALENDAR_ACTION_SKIP,
@@ -66,17 +80,23 @@ SUPPORTED_FX_CURRENCIES = {"USD", "GBP"}
 _fx_cache: dict[tuple[str, str], dict[str, object]] = {}
 DEFAULT_PAGE_LIMIT = int(os.getenv("API_DEFAULT_PAGE_LIMIT", "200"))
 MAX_PAGE_LIMIT = int(os.getenv("API_MAX_PAGE_LIMIT", "1000"))
+BASE_CURRENCY = os.getenv("BASE_CURRENCY", "INR").strip().upper() or "INR"
+_INDIA_REGION = str(getattr(config, "TRADING_REGION", "")).strip().lower() == "india"
+ENTRY_INDICATOR_CACHE_TTL_SECONDS = int(
+    os.getenv("ENTRY_INDICATOR_CACHE_TTL_SECONDS", "1800")
+)
+_entry_indicator_cache: dict[tuple, dict[str, object]] = {}
+KITE_CONNECT_LOGIN_URL = os.getenv(
+    "KITE_CONNECT_LOGIN_URL",
+    "https://kite.zerodha.com/connect/login",
+).strip()
 
 
 def _resolve_default_broker_query() -> str:
     explicit = os.getenv("DEFAULT_BROKER", "").strip().lower()
     if explicit:
         return explicit
-    if config.USE_KITE:
-        return "kite"
-    if config.USE_TRADING212:
-        return "trading212"
-    # Kite is the preferred default for India deployments.
+    # India-only deployment default.
     return "kite"
 
 
@@ -192,11 +212,106 @@ def _load_effective_excluded_tickers() -> tuple[set[str], str]:
     return db_load_excluded_tickers(), "db"
 
 
+def _normalize_exchange_token(value: str | None) -> str | None:
+    token = str(value or "").strip().upper()
+    return token or None
+
+
+def _is_exchange_like(value: str | None) -> bool:
+    token = _normalize_exchange_token(value)
+    if not token:
+        return False
+    if token in {"NSE", "BSE", "NFO", "BFO", "MCX"}:
+        return True
+    return token.isalpha() and len(token) <= 5
+
+
+def _parse_ticker_exchange_pair(
+    raw_ticker: str | None,
+    raw_exchange: str | None = None,
+) -> tuple[str | None, str | None]:
+    ticker = _normalize_exchange_token(raw_ticker)
+    exchange = _normalize_exchange_token(raw_exchange)
+    if ticker and ":" in ticker:
+        left, right = ticker.split(":", 1)
+        left = _normalize_exchange_token(left)
+        right = _normalize_exchange_token(right)
+        if not exchange:
+            if _is_exchange_like(left) and right:
+                exchange, ticker = left, right
+            elif _is_exchange_like(right) and left:
+                exchange, ticker = right, left
+            else:
+                ticker, exchange = left, right
+    if exchange and ":" in exchange:
+        left, right = exchange.split(":", 1)
+        left = _normalize_exchange_token(left)
+        right = _normalize_exchange_token(right)
+        if _is_exchange_like(left):
+            exchange = left
+            if not ticker and right:
+                ticker = right
+        elif _is_exchange_like(right):
+            exchange = right
+            if not ticker and left:
+                ticker = left
+    return ticker, exchange
+
+
+def _force_base_currency(value: str | None) -> str:
+    if _INDIA_REGION:
+        return BASE_CURRENCY
+    token = str(value or "").strip().upper()
+    return token or BASE_CURRENCY
+
+
+def _apply_summary_currency_fields(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    if "broker_currency" in out:
+        out["broker_currency"] = _force_base_currency(out.get("broker_currency"))
+    return out
+
+
+def _apply_broker_summary_currency(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    if "currency" in out:
+        out["currency"] = _force_base_currency(out.get("currency"))
+    return out
+
+
+def _apply_broker_positions_currency(rows: list[dict]) -> list[dict]:
+    if not _INDIA_REGION:
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        if "account_currency" in item:
+            item["account_currency"] = BASE_CURRENCY
+        out.append(item)
+    return out
+
+
+def _apply_broker_orders_currency(rows: list[dict]) -> list[dict]:
+    if not _INDIA_REGION:
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        if "currency" in item:
+            item["currency"] = BASE_CURRENCY
+        out.append(item)
+    return out
+
+
 class AdjustmentRequest(BaseModel):
     cash_amount: float = 0.0
     cash_note: str = "app"
     tickers: Optional[List[str]] = None
-    ticker_exchanges: Optional[dict[str, str]] = None
+    ticker_exchanges: Optional[dict[str, str] | List[str]] = None
     source: str = "app"
 
 
@@ -345,6 +460,93 @@ def _normalize_summary_fields(raw_fields: str | None) -> list[str] | None:
     return normalized
 
 
+def _normalize_regime_mapping(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {str(k): str(v) for k, v in ENTRY_DEFAULT_REGIME_MAPPING.items()}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid regime_mapping JSON: {exc}")
+    if not isinstance(parsed, dict) or not parsed:
+        raise HTTPException(status_code=400, detail="regime_mapping must be a non-empty JSON object.")
+    normalized = {
+        str(k).strip(): str(v).strip()
+        for k, v in parsed.items()
+        if str(k).strip() and str(v).strip()
+    }
+    if not normalized:
+        raise HTTPException(status_code=400, detail="regime_mapping must contain non-empty keys/values.")
+    return normalized
+
+
+def _entry_indicator_cache_key(
+    *,
+    strategy_roots: list[str],
+    strategies: list[str],
+    regime_mapping: dict[str, str],
+    start_date: str,
+    end_date: str | None,
+    as_of_date: str | None,
+    lookahead_days: int,
+    confirm_days: int,
+    confirm_days_sideways: int,
+    rebalance_every: int,
+    ignore_stock_filters: bool,
+) -> tuple:
+    return (
+        tuple(strategy_roots),
+        tuple(strategies),
+        tuple(sorted(regime_mapping.items())),
+        str(start_date),
+        str(end_date) if end_date else None,
+        str(as_of_date) if as_of_date else None,
+        int(lookahead_days),
+        int(confirm_days),
+        int(confirm_days_sideways),
+        int(rebalance_every),
+        bool(ignore_stock_filters),
+    )
+
+
+def _load_kite_auth_state() -> dict[str, object]:
+    state = db_load_broker_auth_state("kite")
+    if isinstance(state, dict):
+        return state
+    return {}
+
+
+def _resolve_kite_redirect_url(request: Request) -> str:
+    configured = str(getattr(config, "KITE_REDIRECT_URL", "") or "").strip()
+    if configured:
+        return configured
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/kite/auth/callback"
+
+
+def _read_kite_access_token_file() -> str:
+    token_file = str(getattr(config, "KITE_ACCESS_TOKEN_FILE", "") or "").strip()
+    if not token_file:
+        return ""
+    path = config.resolve_path(token_file)
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return str(handle.read()).strip()
+    except OSError:
+        return ""
+
+
+def _utc_from_epoch(epoch_value: int | None) -> str | None:
+    if epoch_value is None:
+        return None
+    try:
+        epoch_int = int(epoch_value)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(epoch_int, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _require_api_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None, alias="Authorization"),
@@ -366,6 +568,181 @@ app = FastAPI(title="Trading Production API", version="0.1.0")
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/kite/auth/login", dependencies=[Depends(_require_api_key)])
+def kite_auth_login(request: Request):
+    api_key = os.getenv("KITE_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="KITE_API_KEY is not configured.")
+
+    redirect_url = _resolve_kite_redirect_url(request)
+    state = secrets.token_urlsafe(24)
+    now_epoch = int(time.time())
+    expires_epoch = now_epoch + int(getattr(config, "KITE_AUTH_STATE_TTL_SECONDS", 900))
+
+    db_upsert_broker_auth_state(
+        "kite",
+        api_key=api_key,
+        pending_state=state,
+        pending_state_expires_at_epoch=expires_epoch,
+    )
+
+    login_params = {
+        "v": "3",
+        "api_key": api_key,
+        "redirect_url": redirect_url,
+        "state": state,
+    }
+    login_url = f"{KITE_CONNECT_LOGIN_URL}?{urlencode(login_params)}"
+
+    return {
+        "broker": "kite",
+        "login_url": login_url,
+        "redirect_url": redirect_url,
+        "state": state,
+        "state_expires_at_epoch": expires_epoch,
+        "state_expires_at_utc": _utc_from_epoch(expires_epoch),
+    }
+
+
+@app.get("/kite/auth/callback")
+def kite_auth_callback(
+    request_token: str | None = None,
+    status: str | None = None,
+    action: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_type: str | None = None,
+):
+    error_value = str(error or "").strip()
+    if error_value:
+        detail = str(error_type or "kite_auth_error").strip()
+        raise HTTPException(status_code=400, detail=f"Kite auth failed ({detail}): {error_value}")
+
+    request_token_value = str(request_token or "").strip()
+    if not request_token_value:
+        raise HTTPException(status_code=400, detail="Missing request_token in Kite callback.")
+
+    auth_state = _load_kite_auth_state()
+    expected_state = str(auth_state.get("pending_state") or "").strip()
+    expected_expiry = auth_state.get("pending_state_expires_at_epoch")
+    if expected_state:
+        callback_state = str(state or "").strip()
+        if not callback_state or callback_state != expected_state:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid callback state. Start a fresh login via "
+                    "/kite/auth/login and retry."
+                ),
+            )
+        try:
+            expiry_epoch = int(expected_expiry) if expected_expiry is not None else None
+        except (TypeError, ValueError):
+            expiry_epoch = None
+        if expiry_epoch is not None and int(time.time()) > expiry_epoch:
+            raise HTTPException(
+                status_code=400,
+                detail="Kite login state has expired. Start a fresh login via /kite/auth/login.",
+            )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="No pending Kite login state found. Start via /kite/auth/login first.",
+        )
+
+    api_key = os.getenv("KITE_API_KEY", "").strip()
+    api_secret = os.getenv("KITE_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="KITE_API_KEY and KITE_API_SECRET must be configured before callback exchange.",
+        )
+
+    credentials = KiteCredentials(
+        api_key=api_key,
+        api_secret=api_secret,
+        access_token="",
+        request_token=request_token_value,
+    )
+    client = KiteClient(credentials=credentials, auto_auth=False)
+    try:
+        session = client.generate_session(request_token_value)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Kite session exchange failed: {type(exc).__name__}: {exc}",
+        )
+
+    access_token = str(session.get("access_token") or client.credentials.access_token or "").strip()
+    if not access_token:
+        raise HTTPException(
+            status_code=502,
+            detail="Kite session exchange did not return an access_token.",
+        )
+
+    db_upsert_broker_auth_state(
+        "kite",
+        access_token=access_token,
+        request_token=request_token_value,
+        api_key=api_key,
+        user_id=str(session.get("user_id") or "").strip() or None,
+        session_payload=session if isinstance(session, dict) else {"raw_session": str(session)},
+        pending_state=None,
+        pending_state_expires_at_epoch=None,
+    )
+
+    return {
+        "ok": True,
+        "broker": "kite",
+        "status": "authenticated",
+        "kite_status": str(status or "").strip() or None,
+        "kite_action": str(action or "").strip() or None,
+        "user_id": str(session.get("user_id") or "").strip() or None,
+        "has_access_token": True,
+        "updated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+@app.get("/kite/auth/status", dependencies=[Depends(_require_api_key)])
+def kite_auth_status():
+    auth_state = _load_kite_auth_state()
+    db_access_token = str(auth_state.get("access_token") or "").strip()
+    env_access_token = os.getenv("KITE_ACCESS_TOKEN", "").strip()
+    file_access_token = _read_kite_access_token_file()
+
+    token_source = "none"
+    if db_access_token:
+        token_source = "db"
+    elif env_access_token:
+        token_source = "env"
+    elif file_access_token:
+        token_source = "file"
+
+    pending_state = str(auth_state.get("pending_state") or "").strip()
+    pending_expiry_raw = auth_state.get("pending_state_expires_at_epoch")
+    try:
+        pending_expiry = int(pending_expiry_raw) if pending_expiry_raw is not None else None
+    except (TypeError, ValueError):
+        pending_expiry = None
+    now_epoch = int(time.time())
+
+    return {
+        "broker": "kite",
+        "has_access_token": bool(db_access_token or env_access_token or file_access_token),
+        "access_token_source": token_source,
+        "db_token_present": bool(db_access_token),
+        "env_token_present": bool(env_access_token),
+        "file_token_present": bool(file_access_token),
+        "user_id": str(auth_state.get("user_id") or "").strip() or None,
+        "pending_login": bool(pending_state),
+        "pending_state_expires_at_epoch": pending_expiry,
+        "pending_state_expires_at_utc": _utc_from_epoch(pending_expiry),
+        "pending_state_is_expired": bool(
+            pending_state and pending_expiry is not None and pending_expiry < now_epoch
+        ),
+    }
 
 
 @app.get("/fx-rate", dependencies=[Depends(_require_api_key)])
@@ -418,7 +795,7 @@ def latest_summary():
     payload = db_latest_summary()
     if not payload:
         raise HTTPException(status_code=404, detail="Latest summary not found.")
-    return payload
+    return _apply_summary_currency_fields(payload)
 
 
 @app.get("/summaries", dependencies=[Depends(_require_api_key)])
@@ -441,12 +818,13 @@ def summaries(
         fields=requested_fields,
     )
 
+    normalized = [_apply_summary_currency_fields(item) for item in filtered]
     return {
         "total": total,
-        "count": len(filtered),
+        "count": len(normalized),
         "limit": limit,
         "offset": offset,
-        "summaries": filtered,
+        "summaries": normalized,
     }
 
 
@@ -491,6 +869,136 @@ def cagr_summary():
 
     summaries = db_list_run_summaries()
     return compute_cagr_summary(summaries)
+
+
+@app.get("/entry-indicator", dependencies=[Depends(_require_api_key)])
+def entry_indicator(
+    strategy_roots: str | None = None,
+    strategies: str | None = None,
+    regime_mapping: str | None = None,
+    start_date: str = "2013-01-01",
+    end_date: str | None = None,
+    as_of_date: str | None = None,
+    lookahead_days: int = 126,
+    confirm_days: int = config.CONFIRM_DAYS,
+    confirm_days_sideways: int = config.CONFIRM_DAYS_SIDEWAYS,
+    rebalance_every: int = config.REBALANCE_EVERY,
+    ignore_stock_filters: bool = False,
+    refresh: bool = False,
+):
+    if lookahead_days < 20:
+        raise HTTPException(status_code=400, detail="lookahead_days must be >= 20.")
+
+    start_date_value = _normalize_iso_date(start_date, field_name="start_date")
+    end_date_value = _normalize_iso_date(end_date, field_name="end_date") if end_date else None
+    as_of_date_value = _normalize_iso_date(as_of_date, field_name="as_of_date") if as_of_date else None
+
+    strategy_roots_list = _parse_csv_values(strategy_roots) or list(config.DEFAULT_STRATEGY_ROOTS)
+    strategies_list = _parse_csv_values(strategies) or list(ENTRY_DEFAULT_BASE_STRATEGIES)
+    mapping = _normalize_regime_mapping(regime_mapping)
+
+    cache_key = _entry_indicator_cache_key(
+        strategy_roots=strategy_roots_list,
+        strategies=strategies_list,
+        regime_mapping=mapping,
+        start_date=start_date_value,
+        end_date=end_date_value,
+        as_of_date=as_of_date_value,
+        lookahead_days=int(lookahead_days),
+        confirm_days=int(confirm_days),
+        confirm_days_sideways=int(confirm_days_sideways),
+        rebalance_every=int(rebalance_every),
+        ignore_stock_filters=bool(ignore_stock_filters),
+    )
+    now_epoch = time.time()
+    ttl = max(0, int(ENTRY_INDICATOR_CACHE_TTL_SECONDS))
+    if not refresh and ttl > 0:
+        cached = _entry_indicator_cache.get(cache_key)
+        if cached:
+            fetched_at = _to_float(cached.get("fetched_at_epoch"))
+            cached_payload = cached.get("payload")
+            if (
+                fetched_at is not None
+                and isinstance(cached_payload, dict)
+                and (now_epoch - fetched_at) <= ttl
+            ):
+                payload = dict(cached_payload)
+                payload["cache"] = {"hit": True, "ttl_seconds": ttl}
+                return payload
+
+    is_default_request = (
+        strategy_roots is None
+        and strategies is None
+        and regime_mapping is None
+        and end_date is None
+        and as_of_date is None
+        and int(lookahead_days) == 126
+        and int(confirm_days) == int(config.CONFIRM_DAYS)
+        and int(confirm_days_sideways) == int(config.CONFIRM_DAYS_SIDEWAYS)
+        and int(rebalance_every) == int(config.REBALANCE_EVERY)
+        and (not bool(ignore_stock_filters))
+    )
+    if not refresh and is_default_request:
+        snapshot = db_latest_entry_indicator_snapshot()
+        if snapshot and isinstance(snapshot.get("payload"), dict):
+            payload = dict(snapshot.get("payload") or {})
+            payload["generated_at_utc"] = payload.get("generated_at_utc") or (
+                str(snapshot.get("generated_at_utc") or "").strip() or None
+            )
+            payload["cache"] = {"hit": True, "source": "db"}
+            return payload
+
+    try:
+        payload = compute_entry_indicator_payload(
+            strategy_roots=strategy_roots_list,
+            strategies=strategies_list,
+            regime_mapping=mapping,
+            start_date=start_date_value,
+            end_date=end_date_value,
+            as_of_date=as_of_date_value,
+            lookahead_days=int(lookahead_days),
+            confirm_days=int(confirm_days),
+            confirm_days_sideways=int(confirm_days_sideways),
+            rebalance_every=int(rebalance_every),
+            ignore_stock_filters=bool(ignore_stock_filters),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to compute entry indicator: {type(exc).__name__}: {exc}",
+        )
+
+    if ttl > 0:
+        _entry_indicator_cache[cache_key] = {
+            "fetched_at_epoch": now_epoch,
+            "payload": dict(payload),
+        }
+    try:
+        db_upsert_entry_indicator_snapshot(
+            payload=dict(payload),
+            start_date=start_date_value,
+            end_date=end_date_value,
+            as_of_date=as_of_date_value,
+            lookahead_days=int(lookahead_days),
+            confirm_days=int(confirm_days),
+            confirm_days_sideways=int(confirm_days_sideways),
+            rebalance_every=int(rebalance_every),
+            strategy_roots=strategy_roots_list,
+            strategies=strategies_list,
+            regime_mapping=mapping,
+        )
+    except Exception:
+        # Avoid failing API calls on snapshot persistence issues.
+        pass
+    payload["cache"] = {"hit": False, "ttl_seconds": ttl}
+    payload["generated_at_utc"] = payload.get("generated_at_utc") or datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return payload
 
 
 @app.get("/portfolio", dependencies=[Depends(_require_api_key)])
@@ -681,7 +1189,7 @@ def broker_summary(
         fields=requested_fields,
     )
     if summary:
-        return summary
+        return _apply_broker_summary_currency(summary)
     raise HTTPException(status_code=404, detail="Broker summary not found.")
 
 
@@ -707,12 +1215,13 @@ def broker_positions(
         fields=requested_fields,
     )
     if total > 0:
+        normalized_positions = _apply_broker_positions_currency(positions)
         return {
             "total": total,
-            "count": len(positions),
+            "count": len(normalized_positions),
             "limit": limit,
             "offset": offset,
-            "positions": positions,
+            "positions": normalized_positions,
         }
     raise HTTPException(status_code=404, detail="Broker positions not found.")
 
@@ -750,12 +1259,13 @@ def broker_orders(
         fields=requested_fields,
     )
     if total > 0:
+        normalized_records = _apply_broker_orders_currency(records)
         return {
             "total": total,
-            "count": len(records),
+            "count": len(normalized_records),
             "limit": limit,
             "offset": offset,
-            "orders": records,
+            "orders": normalized_records,
         }
     return {"total": 0, "count": 0, "limit": limit, "offset": offset, "orders": []}
 
@@ -797,12 +1307,13 @@ def latest_broker_orders(
         fields=requested_fields,
     )
     if total > 0:
+        normalized_records = _apply_broker_orders_currency(records)
         return {
             "total": total,
-            "count": len(records),
+            "count": len(normalized_records),
             "limit": limit,
             "offset": offset,
-            "orders": records,
+            "orders": normalized_records,
         }
     raise HTTPException(status_code=404, detail="Broker orders not found.")
 
@@ -998,18 +1509,43 @@ def queue_adjustments(payload: AdjustmentRequest):
                 "created_at": timestamp,
             }
         )
-    tickers = [t.strip().upper() for t in (payload.tickers or []) if t and t.strip()]
+    tickers: list[str] = []
     exchange_map: dict[str, str] = {}
+    for token in (payload.tickers or []):
+        ticker, exchange = _parse_ticker_exchange_pair(str(token), None)
+        if not ticker:
+            continue
+        tickers.append(ticker)
+        if exchange:
+            exchange_map[ticker] = exchange
     if payload.ticker_exchanges:
-        for ticker, exchange in payload.ticker_exchanges.items():
-            t = str(ticker).strip().upper()
-            ex = str(exchange).strip().upper()
-            if t:
-                exchange_map[t] = ex or "UNKNOWN"
+        if isinstance(payload.ticker_exchanges, dict):
+            for ticker_key, exchange_value in payload.ticker_exchanges.items():
+                ticker, exchange = _parse_ticker_exchange_pair(
+                    str(ticker_key),
+                    exchange_value if exchange_value is not None else None,
+                )
+                if not ticker:
+                    continue
+                tickers.append(ticker)
+                if exchange:
+                    exchange_map[ticker] = exchange
+        elif isinstance(payload.ticker_exchanges, list):
+            for item in payload.ticker_exchanges:
+                ticker, exchange = _parse_ticker_exchange_pair(str(item), None)
+                if not ticker:
+                    continue
+                tickers.append(ticker)
+                if exchange:
+                    exchange_map[ticker] = exchange
     if exchange_map:
         tickers.extend(exchange_map.keys())
-        tickers = [t for t in tickers if t and t.strip()]
-        tickers = sorted(set(tickers))
+    tickers = sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
+    exchange_map = {
+        str(ticker).strip().upper(): str(exchange).strip().upper() or "UNKNOWN"
+        for ticker, exchange in exchange_map.items()
+        if str(ticker).strip()
+    }
     if tickers:
         entry = {
             "type": "tickers",

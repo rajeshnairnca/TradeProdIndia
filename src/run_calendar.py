@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
 
 RUN_CALENDAR_ACTION_SKIP = "skip"
 RUN_CALENDAR_ACTION_FORCE_RUN = "force_run"
@@ -34,26 +36,103 @@ def _normalize_date(value: str | pd.Timestamp) -> pd.Timestamp:
 
 
 @lru_cache(maxsize=32)
-def _us_federal_holidays_for_year(year: int) -> frozenset[pd.Timestamp]:
-    holidays = USFederalHolidayCalendar().holidays(
-        start=f"{year}-01-01",
-        end=f"{year}-12-31",
-    )
-    return frozenset(pd.Timestamp(ts).tz_localize(None).normalize() for ts in holidays)
+def _market_holidays_for_year(year: int) -> frozenset[pd.Timestamp]:
+    all_holidays = _load_market_holidays()
+    return frozenset(ts for ts in all_holidays if ts.year == int(year))
+
+
+def _parse_holiday_date(value: object) -> pd.Timestamp | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _normalize_date(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_holiday_dates(payload: object) -> set[pd.Timestamp]:
+    parsed: set[pd.Timestamp] = set()
+    if isinstance(payload, dict):
+        for _, values in payload.items():
+            if isinstance(values, list):
+                parsed.update(_extract_holiday_dates(values))
+            else:
+                item = _parse_holiday_date(values)
+                if item is not None:
+                    parsed.add(item)
+        return parsed
+    if isinstance(payload, list):
+        for item in payload:
+            parsed.update(_extract_holiday_dates(item))
+        return parsed
+    item = _parse_holiday_date(payload)
+    if item is not None:
+        parsed.add(item)
+    return parsed
+
+
+def _candidate_holiday_file_paths() -> list[Path]:
+    explicit = os.getenv("RUN_CALENDAR_MARKET_HOLIDAYS_FILE", "").strip()
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    else:
+        project_root = Path(__file__).resolve().parent.parent
+        candidates.append(project_root / "data" / "india_market_holidays.json")
+    return candidates
+
+
+@lru_cache(maxsize=1)
+def _load_market_holidays() -> frozenset[pd.Timestamp]:
+    holidays: set[pd.Timestamp] = set()
+
+    csv_env = os.getenv("RUN_CALENDAR_MARKET_HOLIDAYS", "").strip()
+    if csv_env:
+        for item in csv_env.split(","):
+            parsed = _parse_holiday_date(item)
+            if parsed is not None:
+                holidays.add(parsed)
+
+    json_env = os.getenv("RUN_CALENDAR_MARKET_HOLIDAYS_JSON", "").strip()
+    if json_env:
+        try:
+            payload = json.loads(json_env)
+        except json.JSONDecodeError:
+            payload = None
+        holidays.update(_extract_holiday_dates(payload))
+
+    for candidate in _candidate_holiday_file_paths():
+        path = candidate if candidate.is_absolute() else Path.cwd() / candidate
+        if not path.exists():
+            continue
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".json":
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                holidays.update(_extract_holiday_dates(payload))
+            else:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    parsed = _parse_holiday_date(line)
+                    if parsed is not None:
+                        holidays.add(parsed)
+        except OSError:
+            continue
+    return frozenset(holidays)
 
 
 def is_us_federal_holiday(value: str | pd.Timestamp) -> bool:
     run_date = _normalize_date(value)
-    return run_date in _us_federal_holidays_for_year(run_date.year)
+    return run_date in _market_holidays_for_year(run_date.year)
 
 
 def list_us_federal_holidays(year: int) -> list[str]:
-    return sorted(ts.strftime("%Y-%m-%d") for ts in _us_federal_holidays_for_year(int(year)))
+    return sorted(ts.strftime("%Y-%m-%d") for ts in _market_holidays_for_year(int(year)))
 
 
 def resolve_schedule_date(
     explicit_date: str | None,
-    timezone_name: str = "America/New_York",
+    timezone_name: str = "Asia/Kolkata",
 ) -> pd.Timestamp:
     if explicit_date:
         return _normalize_date(explicit_date)
@@ -109,8 +188,9 @@ def evaluate_run_day(
         return {
             "date": date_str,
             "should_run": False,
+            # Keep legacy reason_code for backward compatibility with existing clients.
             "reason_code": "us_federal_holiday",
-            "reason": "US federal holiday is blocked by run-calendar settings.",
+            "reason": "Market holiday is blocked by run-calendar settings.",
             "source": "default",
             "override_action": None,
         }
